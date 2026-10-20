@@ -171,6 +171,13 @@ pub fn render_caption_at(c: &Caption, style: &CaptionStyle, t: Tick, w: usize, h
 }
 
 fn render(c: &Caption, style: &CaptionStyle, t: Option<Tick>, w: usize, h: usize) -> Option<Overlay> {
+    // word animation: only with word timings that spell the text
+    let anim = t.filter(|_| !style.animation.is_none() && c.words_match_text());
+    draw(c, style, anim, w, h)
+}
+
+/// Draw `c`, animated at `anim` when given (the caller has checked the words).
+fn draw(c: &Caption, style: &CaptionStyle, anim: Option<Tick>, w: usize, h: usize) -> Option<Overlay> {
     if w == 0 || h == 0 {
         return None;
     }
@@ -214,20 +221,36 @@ fn render(c: &Caption, style: &CaptionStyle, t: Option<Tick>, w: usize, h: usize
         })
         .collect();
     let outline = (style.outline * scale).max(0.0);
-    // word animation: only with word timings that spell the text
-    let anim = t.filter(|_| !style.animation.is_none() && c.words_match_text());
     let (pop, box_pad) = if anim.is_some() { anim_params(style.animation) } else { (1.0, 0.0) };
     let box_pad = (box_pad * scale).round();
-    // room for a popped or boxed word, the same for the whole caption so the overlay never jumps
-    let extra = (px * (pop - 1.0)).max(0.0) + box_pad;
-    let grow = outline.ceil() + 1.0 + extra.ceil();
-    let bx0 = xs.iter().zip(&widths).map(|(x, _)| x - pad_x - grow).fold(f32::MAX, f32::min).floor();
-    let bx1 = xs.iter().zip(&widths).map(|(x, lw)| x + lw + pad_x + grow).fold(f32::MIN, f32::max).ceil();
-    let by0 = (top - grow).floor();
-    let by1 = (top + block_h + grow).ceil();
+    // room for a popped or boxed word, the same for the whole caption so the overlay never jumps:
+    // a popped word grows by a share of its own width (never wider than its line) and of the
+    // font's height, a boxed word by the pad
+    let grow_pop = (pop - 1.0).max(0.0);
+    let widest = widths.iter().copied().fold(0.0f32, f32::max);
+    let extra_x = widest * grow_pop / 2.0 + box_pad;
+    let extra_y = (asc + desc) * grow_pop + box_pad;
+    let grow_x = outline.ceil() + 1.0 + extra_x.ceil();
+    let grow_y = outline.ceil() + 1.0 + extra_y.ceil();
+    // the overlay covers the caption, clipped to the frame plus that room (nothing outside it can
+    // show), with a hard cap on its size
+    let (fw, fh) = (w as f32, h as f32);
+    let bx0 = xs.iter().map(|x| x - pad_x - grow_x).fold(f32::MAX, f32::min).max(-grow_x).floor();
+    let bx1 = xs.iter().zip(&widths).map(|(x, lw)| x + lw + pad_x + grow_x).fold(f32::MIN, f32::max).min(fw + grow_x).ceil();
+    let by0 = (top - grow_y).max(-grow_y).floor();
+    let by1 = (top + block_h + grow_y).min(fh + grow_y).ceil();
+    if !(bx1 > bx0 && by1 > by0) {
+        return None;
+    }
     let (ox, oy) = (bx0 as i32, by0 as i32);
-    let ow = (bx1 - bx0).max(1.0) as usize;
-    let oh = (by1 - by0).max(1.0) as usize;
+    let (ow, oh) = ((bx1 - bx0) as usize, (by1 - by0) as usize);
+    let cap = w.saturating_mul(h).saturating_mul(4);
+    let fits = ow.checked_mul(oh).filter(|&n| n <= cap).and_then(|n| n.checked_mul(4)).is_some();
+    if !fits {
+        // an animated caption retries statically (less room); a static one that does not fit is
+        // not drawn
+        return if anim.is_some() { draw(c, style, None, w, h) } else { None };
+    }
     let mut cover = vec![0.0f32; ow * oh];
     let mut bg = vec![0.0f32; ow * oh];
     // karaoke: words already spoken; boxed: the box behind the word being spoken
@@ -241,28 +264,57 @@ fn render(c: &Caption, style: &CaptionStyle, t: Option<Tick>, w: usize, h: usize
         render::draw(l, m, &mut mk, (ox, oy));
         *mask = mk.a;
     };
+    let (vis0, vis1) = (oy as f32 - extra_y - lh, (oy as f32) + oh as f32 + extra_y);
     for (i, line) in lines.iter().enumerate() {
         let lt = top + lh * i as f32;
+        let (Some(&lx), Some(&lw)) = (xs.get(i), widths.get(i)) else { break };
+        if lt < vis0 || lt > vis1 {
+            // off the overlay: nothing to draw, but its words still count
+            if anim.is_some() {
+                word = word.saturating_add(word_spans(line).len());
+            }
+            continue;
+        }
         if style.background && style.background_color[3] > 0 {
-            fill_rect(&mut bg, ow, oh, ox, oy, xs[i] - pad_x, xs[i] + widths[i] + pad_x, lt, lt + lh);
+            fill_rect(&mut bg, ow, oh, ox, oy, lx - pad_x, lx + lw + pad_x, lt, lt + lh);
         }
         let baseline = lt + (lh - (asc + desc)) / 2.0 + asc;
         let l = layout(line, &ts, &ParagraphStyle::default());
-        let at = render::at(xs[i], baseline.round());
+        let at = render::at(lx, baseline.round());
         let Some(now) = anim else {
             draw_into(&mut cover, &l, &at);
             continue;
         };
+        // one pass: glyphs in cluster order walked against the words (byte ranges, ascending);
+        // glyph positions sorted once to find each word's right edge
+        let mut by_cluster: Vec<&filmcraft_text::Glyph> = l.glyphs.iter().collect();
+        by_cluster.sort_by_key(|g| g.cluster);
+        let mut gx: Vec<f32> = l.glyphs.iter().map(|g| g.x).collect();
+        gx.sort_by(f32::total_cmp);
+        let mut next = 0usize;
         for (a, b) in word_spans(line) {
-            let Some(wt) = c.words.get(word) else { break };
+            while by_cluster.get(next).is_some_and(|g| g.cluster < a) {
+                next += 1;
+            }
+            let from = next;
+            while by_cluster.get(next).is_some_and(|g| g.cluster < b) {
+                next += 1;
+            }
+            let glyphs: Vec<filmcraft_text::Glyph> = by_cluster.get(from..next).unwrap_or(&[]).iter().map(|g| **g).collect();
+            let Some(g0) = glyphs.first().copied() else { continue };
+            // the word spans from its leftmost glyph to the next glyph to its right (the space
+            // after it) or the line end; glyph order is visual order only for left-to-right text
+            let left = glyphs.iter().map(|g| g.x).fold(g0.x, f32::min);
+            let last = glyphs.iter().map(|g| g.x).fold(g0.x, f32::max);
+            let right = gx.get(gx.partition_point(|&x| x <= last)).copied().unwrap_or(lw).min(lw).max(last);
+            let tw = (right - left).max(0.0);
+            let part = filmcraft_text::Layout { glyphs, vertical: l.vertical, ..Default::default() };
+            let Some(wt) = c.words.get(word) else {
+                // no timing for this word: draw it as a static caption would
+                draw_into(&mut cover, &part, &at);
+                continue;
+            };
             word += 1;
-            let mut part = filmcraft_text::Layout { glyphs: l.glyphs.iter().filter(|g| (a..b).contains(&g.cluster)).copied().collect(), ..Default::default() };
-            let Some(g0) = part.glyphs.first().copied() else { continue };
-            part.vertical = l.vertical;
-            // the word's left edge is its leftmost glyph (glyph order is visual order only for
-            // left-to-right text)
-            let left = part.glyphs.iter().map(|g| g.x).fold(g0.x, f32::min);
-            let tw = filmcraft_text::measure(line.get(a..b).unwrap_or(""), &ts);
             let spoken = wt.start <= now;
             let active = spoken && now < wt.end();
             match style.animation {
@@ -270,11 +322,11 @@ fn render(c: &Caption, style: &CaptionStyle, t: Option<Tick>, w: usize, h: usize
                 CaptionAnimation::WordPop { .. } if active => {
                     // scale about the word's centre on its baseline
                     let cx = left + tw / 2.0;
-                    let m = [pop, 0.0, 0.0, pop, xs[i] + cx * (1.0 - pop), baseline.round() + g0.y * (1.0 - pop)];
+                    let m = [pop, 0.0, 0.0, pop, lx + cx * (1.0 - pop), baseline.round() + g0.y * (1.0 - pop)];
                     draw_into(&mut cover, &part, &m);
                 }
                 CaptionAnimation::Boxed { .. } if active => {
-                    let x0 = xs[i] + left;
+                    let x0 = lx + left;
                     fill_rect(&mut boxm, ow, oh, ox, oy, x0 - box_pad, x0 + tw + box_pad, lt, lt + lh);
                     draw_into(&mut cover, &part, &at);
                 }
@@ -677,6 +729,117 @@ mod tests {
         let b = track_overlay(&tr, Tick(55), 1920, 1080).unwrap();
         assert_ne!(a, b);
         assert_eq!(a, render_caption_at(&timed(), &tr.style, Tick(5), 1920, 1080).unwrap());
+    }
+
+    /// `text` with one 10-tick word every 20 ticks, every word timed.
+    fn spelled(text: &str) -> Caption {
+        let mut c = cap(text);
+        c.words = filmcraft_project::caption_words(text).into_iter().enumerate().map(|(i, w)| WordTiming::new(Tick(i as i64 * 20), Tick(10), w)).collect();
+        c.duration = Tick(c.words.len() as i64 * 20 + 20);
+        c
+    }
+
+    /// No ink within `n` pixels of the overlay's edges.
+    fn clear_edges(o: &Overlay, n: usize) -> bool {
+        (0..o.h).all(|y| {
+            (0..o.w).all(|x| {
+                let edge = x < n || y < n || x + n >= o.w || y + n >= o.h;
+                !edge || o.px.get((y * o.w + x) * 4 + 3).is_none_or(|a| *a < 0.01)
+            })
+        })
+    }
+
+    #[test]
+    fn huge_captions_render_in_bounded_memory_or_decline() {
+        let (w, h) = (1080usize, 1920usize);
+        let words20k = (0..20_000).map(|i| format!("w{i}")).collect::<Vec<_>>().join("\n");
+        let one_line_words = "ab ".repeat(33_333);
+        let one_word = "x".repeat(100_000);
+        for text in [words20k.as_str(), one_line_words.as_str(), one_word.as_str()] {
+            let c = spelled(text);
+            for animation in [
+                CaptionAnimation::None,
+                CaptionAnimation::KaraokeHighlight { highlight_color: YELLOW },
+                CaptionAnimation::WordPop { scale: 3.0 },
+                CaptionAnimation::Boxed { box_color: [255, 0, 0, 255], pad: 200.0 },
+            ] {
+                let st = CaptionStyle { animation, outline: 4.0, ..Default::default() };
+                let started = std::time::Instant::now();
+                let r = std::panic::catch_unwind(|| render_caption_at(&c, &st, Tick(30), w, h));
+                let o = r.unwrap_or_else(|_| panic!("{animation:?} panicked"));
+                // generous: the text engine's first shaping of a 100k-character run takes seconds
+                // on its own (cached afterwards), as it did before animations existed
+                assert!(started.elapsed() < std::time::Duration::from_secs(60), "{animation:?}: {:?}", started.elapsed());
+                if let Some(o) = o {
+                    // never larger than 4 frames, and only around the frame
+                    assert!(o.w * o.h <= 4 * w * h, "{animation:?}: {}x{}", o.w, o.h);
+                    assert!(o.px.len() == o.w * o.h * 4);
+                    let grow_x = w as i32 + 2; // the most any animation may add (pop 3 on a line as wide as the frame)
+                    assert!(o.x >= -grow_x && o.x + o.w as i32 <= w as i32 + grow_x, "{animation:?}: x {} w {}", o.x, o.w);
+                }
+            }
+        }
+        // a static caption is clipped to the frame plus the outline room
+        let st = CaptionStyle { outline: 4.0, ..Default::default() };
+        let o = render_caption(&spelled(&words20k), &st, w, h).unwrap();
+        // the outline is 4 px at 1080 lines, so 7.1 px at 1920: 8 px of room plus 1
+        let grow = (4.0f32 * h as f32 / 1080.0).ceil() as i32 + 1;
+        assert!(o.x >= -grow && o.y >= -grow && o.x + o.w as i32 <= w as i32 + grow && o.y + o.h as i32 <= h as i32 + grow, "{} {} {} {}", o.x, o.y, o.w, o.h);
+    }
+
+    #[test]
+    fn word_pop_never_clips_a_long_word() {
+        // one long word per line, the usual 9:16 short-video layout
+        let c = spelled("Unbelievable\nIncredible\nExtraordinary");
+        for scale in [1.25, 3.0] {
+            let st = style(CaptionAnimation::WordPop { scale });
+            let still = render_caption_at(&c, &st, Tick(-1), 1080, 1920).unwrap();
+            for t in [5, 25, 45] {
+                let o = render_caption_at(&c, &st, Tick(t), 1080, 1920).unwrap();
+                assert_eq!((o.x, o.y, o.w, o.h), (still.x, still.y, still.w, still.h), "the overlay never moves");
+                assert!(clear_edges(&o, 1), "pop {scale} at {t}: ink on the overlay edge");
+                // the popped word really is larger
+                let ink = |o: &Overlay| o.px.chunks(4).filter(|p| p[3] > 0.5).count();
+                assert!(ink(&o) > ink(&still), "pop {scale} at {t}");
+            }
+        }
+    }
+
+    #[test]
+    fn words_left_without_timings_draw_statically() {
+        // bypass the word check: three words shown, two timed
+        let mut c = timed();
+        c.text = "aaaa bbbb cccc".into();
+        let white = CaptionAnimation::KaraokeHighlight { highlight_color: [255, 255, 255, 255] };
+        let st = CaptionStyle { animation: white, ..Default::default() };
+        let stat = render_caption(&c, &CaptionStyle::default(), 1920, 1080).unwrap();
+        for t in [-1, 5, 55] {
+            let o = draw(&c, &st, Some(Tick(t)), 1920, 1080).unwrap();
+            assert_eq!((o.x, o.y, o.w, o.h), (stat.x, stat.y, stat.w, stat.h));
+            let diff = o.px.iter().zip(&stat.px).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            assert!(diff < 1e-5, "t {t}: the untimed word must still be drawn ({diff})");
+        }
+        // and a word list longer than the text never reaches past the words that are shown
+        let mut c = timed();
+        c.words.push(WordTiming::new(Tick(70), Tick(10), "extra"));
+        assert!(std::panic::catch_unwind(|| draw(&c, &st, Some(Tick(75)), 1920, 1080)).is_ok());
+    }
+
+    #[test]
+    fn word_extents_from_glyphs_match_measured_widths() {
+        // the boxed word's box is the measured word plus the pad on each side, for an inner word
+        // and for the last word of a line
+        let c = spelled("alpha bravo charlie");
+        let st = style(CaptionAnimation::Boxed { box_color: [255, 0, 0, 255], pad: 0.0 });
+        let ts = caption_style("Inter", 54.0);
+        for (k, word) in ["bravo", "charlie"].iter().enumerate() {
+            let o = render_caption_at(&c, &st, Tick((k as i64 + 1) * 20 + 5), 1920, 1080).unwrap();
+            let red: Vec<usize> = o.px.chunks(4).enumerate().filter(|(_, p)| p[3] > 0.5 && p[0] > 0.5 && p[1] < 0.1).map(|(j, _)| j % o.w).collect();
+            let (x0, x1) = (red.iter().min().copied().unwrap(), red.iter().max().copied().unwrap());
+            let box_w = (x1 - x0 + 1) as f32;
+            let want = filmcraft_text::measure(word, &ts);
+            assert!((box_w - want).abs() <= 2.0, "{word}: box {box_w} vs measured {want}");
+        }
     }
 
     #[test]

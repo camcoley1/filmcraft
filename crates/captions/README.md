@@ -75,8 +75,15 @@ overlays of visible caption tracks over the finished frame (Program monitor and 
 `burn::render_caption_at` adds the track style's word animation at a timeline time (karaoke
 highlight, word pop, boxed word) for captions whose `words` spell their text. Each line is laid
 out once, exactly as for a static caption, and its glyphs are split per word by their cluster
-offsets, so words never shift between frames; the overlay's size is fixed for the whole caption.
-Captions without matching word timings, or tracks with no animation, draw statically.
+offsets in one pass (glyphs sorted by cluster, walked against the words), so words never shift
+between frames. Each word's width comes from the laid-out glyph positions, not a second
+measurement. The overlay's size is fixed for the whole caption: it leaves room for a popped word
+from the widest line (`(pop - 1) / 2` of its width each side, `(pop - 1)` of the font height) and
+for the box pad. It is clipped to the frame plus that room and capped at four frames of pixels,
+with checked arithmetic; past the cap an animated caption is drawn statically and a static one is
+not drawn. Lines outside the overlay are skipped (their words still count). Captions without
+matching word timings, or tracks with no animation, draw statically, and a word left without a
+timing is drawn as a static caption would draw it.
 `sequence_overlays` (used by both the Program monitor and export) always draws at the frame's time.
 
 **Styled and animated captions export as burn-in only.** The SRT, WebVTT, SCC, MCC, STL and TTML
