@@ -75,60 +75,70 @@ pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format) -> Resu
             _ => None,
         })
         .collect();
+    // A Premiere Pro project also gives each file's path relative to the project: tried when the
+    // stored path does not open (a project moved between machines).
+    let relative = |s: &Session, id: ItemId| -> Option<String> {
+        (format == Format::Prproj).then(|| s.project.item(id).and_then(|i| i.metadata.get(filmcraft_interchange::prproj::RELATIVE_PATH_KEY).cloned())).flatten()
+    };
+    let alternates: Vec<String> = new_media.iter().filter_map(|(id, _)| relative(s, *id)).collect();
     // The document's media paths are opened as stored paths of the document.
-    s.media.add_stored_paths(new_media.iter().map(|(_, p)| p.clone()), Some(path));
+    s.media.add_stored_paths(new_media.iter().map(|(_, p)| p.clone()).chain(alternates), Some(path));
     let mut linked = 0;
     let mut offline = Vec::new();
-    for (id, mpath) in new_media {
-        let file = match s.media.follow(&mpath) {
-            Ok(file) => file,
-            Err(why) => {
-                log::warn!("{mpath} is not opened: {why}");
-                offline.push(mpath);
-                continue;
+    let mut notes = Vec::new();
+    for (id, stored) in new_media {
+        let mut opened = None;
+        for candidate in std::iter::once(stored.clone()).chain(relative(s, id)) {
+            let file = match s.media.follow(&candidate) {
+                Ok(file) => file,
+                Err(why) => {
+                    log::warn!("{candidate} is not opened: {why}");
+                    continue;
+                }
+            };
+            if let Ok(src) = s.media.open_file(&file, &*s.services) {
+                opened = Some((candidate, file, src));
+                break;
             }
-        };
-        match s.media.open_file(&file, &*s.services).ok() {
-            Some(src) => {
-                let info = src.info().clone();
-                let identity = crate::relink::identity_of(&*s.services, &file).ok();
-                // EDL source times are absolute timecode. A Premiere Pro project's in points are
-                // too when every use of the file is at or after its start timecode.
-                let rebase = match format {
-                    Format::Edl => info.start_timecode,
-                    Format::Prproj => info.start_timecode.filter(|&tc| {
-                        info.video.as_ref().is_some_and(|v| {
-                            let off = v.frame_rate.tick_of(tc);
-                            s.project
-                                .items
-                                .values()
-                                .filter_map(|i| i.as_sequence())
-                                .all(|q| q.all_tracks().all(|t| t.items.iter().all(|c| c.item != id || c.source_in >= off)))
-                        })
-                    }),
-                    _ => None,
-                };
-                s.edit("Link Media", |proj, _| {
-                    if let Some(item) = proj.items.get_mut(&id)
-                        && let ItemKind::Media(m) = &mut item.kind
-                    {
-                        let rate = info.video.as_ref().map(|v| v.frame_rate);
-                        m.info = info.clone();
-                        m.offline = false;
-                        m.identity = identity;
-                        if let (Some(tc), Some(rate)) = (rebase, rate) {
-                            filmcraft_interchange::rebase_source_timecode(proj, id, tc, rate);
-                        }
-                    }
-                    // the picture size is now the file's own: centre the anchors of its clips in it
-                    proj.resolve_placed_auto_points(|seq| !before.contains(&seq), |source| source.id == id);
-                    Ok(())
-                })?;
-                s.media.insert_file(id, &mpath, src);
-                linked += 1;
-            }
-            None => offline.push(mpath),
         }
+        let Some((mpath, file, src)) = opened else {
+            offline.push(stored);
+            continue;
+        };
+        if mpath != stored {
+            notes.push(format!("{stored} was not found; linked to {mpath} (its path relative to the project)"));
+        }
+        let info = src.info().clone();
+        let identity = crate::relink::identity_of(&*s.services, &file).ok();
+        // EDL source times are absolute timecode. A Premiere Pro project's in points are
+        // kept as written: the prproj-format notes (06-timing.md, "`Start`/`End` vs
+        // `InPoint`/`OutPoint`") say only that they count from "an arbitrary zero point in the
+        // source file's own timeline", not whether that is the file's start timecode.
+        let rebase = (format == Format::Edl).then_some(info.start_timecode).flatten();
+        if let Some(note) = prproj_timecode_note(format, &mpath, info.start_timecode) {
+            notes.push(note);
+        }
+        s.edit("Link Media", |proj, _| {
+            if let Some(item) = proj.items.get_mut(&id)
+                && let ItemKind::Media(m) = &mut item.kind
+            {
+                let rate = info.video.as_ref().map(|v| v.frame_rate);
+                if mpath != stored {
+                    m.media = MediaRef::File { path: mpath.clone() };
+                }
+                m.info = info.clone();
+                m.offline = false;
+                m.identity = identity;
+                if let (Some(tc), Some(rate)) = (rebase, rate) {
+                    filmcraft_interchange::rebase_source_timecode(proj, id, tc, rate);
+                }
+            }
+            // the picture size is now the file's own: centre the anchors of its clips in it
+            proj.resolve_placed_auto_points(|seq| !before.contains(&seq), |source| source.id == id);
+            Ok(())
+        })?;
+        s.media.insert_file(id, &mpath, src);
+        linked += 1;
     }
     if let Some(&first) = seqs.first() {
         s.state.active_sequence = Some(first);
@@ -141,8 +151,18 @@ pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format) -> Resu
         "sequences": seqs.iter().map(|i| i.0).collect::<Vec<_>>(),
         "linkedMedia": linked,
         "offlineMedia": offline,
-        "report": report_json(&report),
+        "report": report_json(&report).into_iter().chain(notes).collect::<Vec<_>>(),
     }))
+}
+
+/// For a Premiere Pro project, a report line naming a linked file whose start timecode is not
+/// zero: its clips' in points were kept as written, and a real project has to show whether they
+/// count from that timecode.
+pub(crate) fn prproj_timecode_note(format: Format, path: &str, start_timecode: Option<i64>) -> Option<String> {
+    let tc = start_timecode.filter(|tc| *tc != 0)?;
+    (format == Format::Prproj).then(|| {
+        format!("{path} starts at timecode frame {tc}; its source in points were kept as Premiere Pro wrote them (not shifted by the timecode; unverified)")
+    })
 }
 
 /// `file.exportInterchange {format: "edl"|"xml"|"fcpxml"|"otio"|"aaf"|"omf" = "xml", path, sequence?}`

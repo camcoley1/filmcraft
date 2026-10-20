@@ -1930,6 +1930,7 @@ dependencies = [
  "filmcraft-text",
  "filmcraft-time",
  "filmcraft-tts",
+ "flate2",
  "image",
  "log",
  "serde",

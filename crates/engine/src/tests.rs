@@ -778,6 +778,79 @@ fn import_premiere_project_creates_its_sequence() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A gzipped Premiere Pro project through `file.import`: its media's stored absolute path is
+/// missing, so the path relative to the project is tried and links the real file next to it.
+#[test]
+fn import_gzipped_premiere_project_relinks_by_relative_path() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("fc-prproj-gz-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("Audio")).unwrap();
+    // one second of 48 kHz stereo silence, next to the project
+    let wav = filmcraft_interchange::wav::wav_file(&vec![0u8; 48_000 * 4], 2, 48_000, 16);
+    std::fs::write(dir.join("Audio").join("tone.wav"), wav).unwrap();
+    let doc = r#"<?xml version="1.0" encoding="UTF-8" ?>
+<PremiereData Version="3">
+	<Project ObjectRef="1"/>
+	<Project ObjectID="1" Version="43"/>
+	<Sequence ObjectUID="seq"><TrackGroups>
+		<TrackGroup Index="0"><Second ObjectRef="10"/></TrackGroup>
+		<TrackGroup Index="1"><Second ObjectRef="11"/></TrackGroup>
+	</TrackGroups><Name>Radio</Name></Sequence>
+	<VideoTrackGroup ObjectID="10"><TrackGroup><FrameRate>10160640000</FrameRate></TrackGroup><FrameRect>0,0,1920,1080</FrameRect></VideoTrackGroup>
+	<AudioTrackGroup ObjectID="11"><TrackGroup><Tracks><Track Index="0" ObjectURef="a1"/></Tracks><FrameRate>5292000</FrameRate></TrackGroup></AudioTrackGroup>
+	<AudioClipTrack ObjectUID="a1"><ClipTrack><ClipItems><TrackItems><TrackItem Index="0" ObjectRef="20"/></TrackItems></ClipItems></ClipTrack></AudioClipTrack>
+	<AudioClipTrackItem ObjectID="20"><ClipTrackItem><TrackItem><Start>0</Start><End>127008000000</End></TrackItem><SubClip ObjectRef="30"/></ClipTrackItem></AudioClipTrackItem>
+	<SubClip ObjectID="30"><Clip ObjectRef="40"/><Name>tone.wav</Name></SubClip>
+	<AudioClip ObjectID="40"><Clip><Source ObjectRef="50"/><InPoint>0</InPoint></Clip></AudioClip>
+	<AudioMediaSource ObjectID="50"><MediaSource><Media ObjectURef="m"/></MediaSource></AudioMediaSource>
+	<Media ObjectUID="m"><FilePath>/nonexistent/old-machine/Audio/tone.wav</FilePath><RelativePath>.\Audio\tone.wav</RelativePath><Title>tone.wav</Title></Media>
+</PremiereData>
+"#;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(doc.as_bytes()).unwrap();
+    let path = dir.join("radio.prproj").to_string_lossy().to_string();
+    std::fs::write(&path, gz.finish().unwrap()).unwrap();
+    let mut s = demo();
+    let r = s.execute("file.import", json!({"paths": [path]})).unwrap();
+    let seq = ItemId(r["sequences"][0].as_u64().unwrap_or_else(|| panic!("no sequence in {r}")));
+    assert_eq!(s.state.active_sequence, Some(seq));
+    assert_eq!(s.project.item(seq).map(|i| i.name.as_str()), Some("Radio"));
+    let q = s.active_sequence().unwrap();
+    q.check().unwrap();
+    q.check_bounds().unwrap();
+    let clip = &q.audio_tracks[0].items[0];
+    let doc_report = &r["documents"][0];
+    assert_eq!(doc_report["linkedMedia"], 1, "{r}");
+    assert!(doc_report["report"].as_array().unwrap().iter().any(|e| e.as_str().unwrap_or("").contains("relative to the project")), "{r}");
+    let linked = match &s.project.item(clip.item).unwrap().kind {
+        filmcraft_project::ItemKind::Media(m) => {
+            assert!(!m.offline);
+            match &m.media {
+                filmcraft_project::MediaRef::File { path } => path.clone(),
+                other => panic!("{other:?}"),
+            }
+        }
+        k => panic!("{k:?}"),
+    };
+    assert!(linked.ends_with("tone.wav") && linked.contains("Audio") && !linked.contains("old-machine"), "{linked}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Premiere Pro in points are never shifted by a file's start timecode (the format notes don't
+/// say they count from it); the import report names each such file instead.
+#[test]
+fn premiere_in_points_are_not_rebased_but_timecoded_files_are_reported() {
+    use crate::interchange::prproj_timecode_note;
+    use filmcraft_interchange::Format;
+    let note = prproj_timecode_note(Format::Prproj, "/m/a.mov", Some(90_000)).unwrap();
+    assert!(note.contains("/m/a.mov") && note.contains("90000") && note.contains("not shifted"), "{note}");
+    assert_eq!(prproj_timecode_note(Format::Prproj, "/m/a.mov", Some(0)), None);
+    assert_eq!(prproj_timecode_note(Format::Prproj, "/m/a.mov", None), None);
+    for f in [Format::Edl, Format::Fcp7Xml, Format::Otio, Format::Aaf] {
+        assert_eq!(prproj_timecode_note(f, "/m/a.mov", Some(90_000)), None);
+    }
+}
+
 /// `file.exportInterchange {format: "<unknown>"}` used to write FCP7 XML without a word.
 #[test]
 fn export_interchange_refuses_an_unknown_format() {

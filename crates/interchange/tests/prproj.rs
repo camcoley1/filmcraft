@@ -335,6 +335,24 @@ fn import(bytes: &[u8]) -> filmcraft_interchange::Result<(Imported, Report)> {
     import_with(bytes, Format::Prproj, &opts())
 }
 
+/// What a saved project must satisfy to load again (`Sequence::check_bounds`, used by the project
+/// loader) and the structural invariants (`Sequence::check`: no overlaps, positive durations), for
+/// every sequence of an import.
+fn valid(im: &Imported) -> Result<(), String> {
+    for it in im.project.items.values() {
+        if let Some(q) = it.as_sequence() {
+            q.check_bounds().map_err(|e| format!("{}: bounds: {e}", it.name))?;
+            q.check().map_err(|e| format!("{}: {e}", it.name))?;
+        }
+    }
+    Ok(())
+}
+
+/// Import and, when it succeeds, the validity of the result (`None` = fine or an error).
+fn import_invalid(bytes: &[u8]) -> Option<String> {
+    import(bytes).ok().and_then(|(im, _)| valid(&im).err())
+}
+
 /// The whole import, field by field. `PartialEq` can't compare imports: the intrinsic Motion
 /// effect's "auto" parameters are NaN, which never equals itself.
 fn dump(r: &(Imported, Report)) -> String {
@@ -358,6 +376,7 @@ fn media_path(im: &Imported, c: &TrackItem) -> Option<String> {
 #[test]
 fn full_project_maps_sequences_tracks_clips_markers_and_bins() {
     let (im, report) = import(FULL.as_bytes()).unwrap();
+    valid(&im).unwrap();
     let (main_id, main) = seq_named(&im, "Main");
     let (nest_id, nest) = seq_named(&im, "Nest");
     assert_eq!(im.sequences, vec![main_id], "the nested sequence is not a top-level one");
@@ -649,12 +668,25 @@ fn hostile_numbers_are_rejected_or_defaulted() {
         (r#""mType":"Comment"}}"#, r#""mType":"Comment"}"#),
         (r#"<Track Index="0" ObjectURef="vt1"/>"#, r#"<Track Index="-9223372036854775808" ObjectURef="vt1"/>"#),
         (r#"Version="43""#, r#"Version="99999999999999999999""#),
+        // beyond the project's own bounds (Tick::MAX, 384 kHz, the frame-size cap, 32-bit rates)
+        ("<End>254016000000</End>", "<End>4611686018427387000</End>"),
+        ("<Start>254016000000</Start><End>508032000000</End>", "<Start>2305843009213693900</Start><End>2305843009213693950</End>"),
+        ("<FrameRate>5292000</FrameRate>", "<FrameRate>330750</FrameRate>"),
+        ("<FrameRect>0,0,1080,1920</FrameRect>", "<FrameRect>0,0,32768,32768</FrameRect>"),
+        ("<FrameRect>0,0,1920,1080</FrameRect>", "<FrameRect>0,0,32768,32768</FrameRect>"),
+        ("<FrameRate>10160640000</FrameRate>", "<FrameRate>254016001</FrameRate>"),
+        ("<FrameRect>0,0,1080,1920</FrameRect>", "<FrameRect>0,0,1080,1920</FrameRect><PixelAspectRatio>0,0</PixelAspectRatio>"),
+        ("<FrameRect>0,0,1080,1920</FrameRect>", "<FrameRect>0,0,1080,1920</FrameRect><PixelAspectRatio>4294967295,1</PixelAspectRatio>"),
     ];
     for (from, to) in cases {
         assert!(FULL.contains(from), "{from}");
         let doc = FULL.replace(from, to);
-        let r = std::panic::catch_unwind(|| import(doc.as_bytes()));
-        assert!(r.is_ok(), "panicked on {to}");
+        let r = std::panic::catch_unwind(|| import_invalid(doc.as_bytes()));
+        match r {
+            Ok(None) => {}
+            Ok(Some(e)) => panic!("{to}: the import would not reload: {e}"),
+            Err(_) => panic!("panicked on {to}"),
+        }
     }
     let doc = FULL.replace("<PlaybackSpeed>2</PlaybackSpeed>", "<PlaybackSpeed>-2</PlaybackSpeed>");
     let (im, report) = import(doc.as_bytes()).unwrap();
@@ -664,16 +696,199 @@ fn hostile_numbers_are_rejected_or_defaulted() {
     let doc = FULL.replace("<End>254016000000</End>", "<End>-5</End>");
     let (_, report) = import(doc.as_bytes()).unwrap();
     assert!(report.mentions("ends before it starts"), "{report}");
+    // out-of-range settings fall back to the defaults, and say so
+    for (from, to) in [
+        ("<FrameRate>5292000</FrameRate>", "<FrameRate>330750</FrameRate>"),
+        ("<FrameRate>10160640000</FrameRate>", "<FrameRate>254016001</FrameRate>"),
+        ("<FrameRect>0,0,1080,1920</FrameRect>", "<FrameRect>0,0,32768,32768</FrameRect>"),
+    ] {
+        let doc = FULL.replace(from, to);
+        let (im, report) = import(doc.as_bytes()).unwrap();
+        valid(&im).unwrap();
+        assert!(report.mentions("Main"), "{to}: {report}");
+    }
+    // a clip beyond Tick::MAX is skipped, not stored
+    let doc = FULL.replace("<End>254016000000</End>", "<End>4611686018427387000</End>");
+    let (_, report) = import(doc.as_bytes()).unwrap();
+    assert!(report.mentions("end time"), "{report}");
+}
+
+/// No two clips on any track of any sequence overlap.
+fn assert_no_overlaps(im: &Imported) {
+    for it in im.project.items.values() {
+        let Some(seq) = it.as_sequence() else { continue };
+        for (ti, t) in seq.all_tracks().enumerate() {
+            for (i, a) in t.items.iter().enumerate() {
+                for b in t.items.iter().skip(i + 1) {
+                    assert!(
+                        a.end() <= b.start || b.end() <= a.start,
+                        "{}: track {ti}: {:?}..{:?} overlaps {:?}..{:?}",
+                        it.name,
+                        a.start,
+                        a.end(),
+                        b.start,
+                        b.end()
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A project of one sequence whose video tracks hold clips at `(start, end)` seconds.
+fn tracks_doc(tracks: &[&[(i64, i64)]]) -> String {
+    let mut track_list = String::new();
+    let mut objects = String::new();
+    let mut n = 1000;
+    for (ti, clips) in tracks.iter().enumerate() {
+        track_list.push_str(&format!(r#"<Track Index="{ti}" ObjectURef="t{ti}"/>"#));
+        let mut refs = String::new();
+        for (ci, (a, b)) in clips.iter().enumerate() {
+            n += 1;
+            refs.push_str(&format!(r#"<TrackItem Index="{ci}" ObjectRef="{n}"/>"#));
+            objects.push_str(&format!(
+                r#"<VideoClipTrackItem ObjectID="{n}"><ClipTrackItem><TrackItem><Start>{}</Start><End>{}</End></TrackItem><SubClip ObjectRef="sc"/></ClipTrackItem></VideoClipTrackItem>"#,
+                a * SEC,
+                b * SEC
+            ));
+        }
+        objects.push_str(&format!(
+            r#"<VideoClipTrack ObjectUID="t{ti}"><ClipTrack><ClipItems><TrackItems>{refs}</TrackItems></ClipItems></ClipTrack></VideoClipTrack>"#
+        ));
+    }
+    format!(
+        r#"<?xml version="1.0"?><PremiereData Version="3"><Project ObjectID="1" Version="43"/>
+<Sequence ObjectUID="s"><TrackGroups><TrackGroup Index="0"><Second ObjectRef="g"/></TrackGroup></TrackGroups><Name>S</Name></Sequence>
+<VideoTrackGroup ObjectID="g"><TrackGroup><Tracks>{track_list}</Tracks><FrameRate>10160640000</FrameRate></TrackGroup></VideoTrackGroup>
+<SubClip ObjectID="sc"><Clip ObjectRef="c"/><Name>shot</Name></SubClip>
+<VideoClip ObjectID="c"><Clip><Source ObjectRef="src"/></Clip></VideoClip>
+<VideoMediaSource ObjectID="src"><MediaSource><Media ObjectURef="m"/></MediaSource></VideoMediaSource>
+<Media ObjectUID="m"><FilePath>/media/shot.mov</FilePath></Media>
+{objects}</PremiereData>"#
+    )
 }
 
 #[test]
-fn overlapping_clips_move_to_a_new_track() {
+fn overlapping_clips_move_to_a_free_track() {
+    // the b-roll now starts at 0.5 s, over the first V1 clip; V2 holds the nest from 0 to 2 s
     let doc = FULL.replace("<Start>254016000000</Start><End>508032000000</End>", "<Start>127008000000</Start><End>508032000000</End>");
     let (im, report) = import(doc.as_bytes()).unwrap();
     assert!(report.mentions("overlapping"), "{report}");
+    assert_no_overlaps(&im);
+    valid(&im).unwrap();
     let (_, main) = seq_named(&im, "Main");
     assert_eq!(main.video_tracks[0].items.len(), 1);
-    assert_eq!(main.video_tracks[1].items.len(), 2, "moved up next to the nest (they do not overlap there)");
+    assert_eq!(main.video_tracks[1].items.len(), 1, "V2 keeps only its own nest");
+    assert_eq!(main.video_tracks.len(), 3);
+    assert_eq!(main.video_tracks[2].items[0].name, "fast b-roll", "the moved clip goes above the nest");
+    assert!(main.video_tracks[1].locked && !main.video_tracks[2].locked, "the new track is unlocked, whatever is below it");
+    // from a locked V1 too
+    let locked = doc.replacen("<IsLocked>false</IsLocked><Index>0</Index>", "<IsLocked>true</IsLocked><Index>0</Index>", 1);
+    let (im, _) = import(locked.as_bytes()).unwrap();
+    let (_, main) = seq_named(&im, "Main");
+    assert!(main.video_tracks[0].locked && !main.video_tracks[2].locked);
+    // the moved clip keeps its link bookkeeping: still unlinked, the first clip still linked
+    assert!(main.video_tracks[0].items[0].link.is_some());
+}
+
+#[test]
+fn overflow_from_several_tracks_never_overlaps_anything() {
+    let v1: &[(i64, i64)] = &[(0, 4), (1, 3), (2, 5), (2, 6), (8, 9)];
+    let v2: &[(i64, i64)] = &[(0, 2), (3, 7), (6, 8)];
+    let v3: &[(i64, i64)] = &[(1, 9)];
+    let doc = tracks_doc(&[v1, v2, v3]);
+    let (im, _) = import(doc.as_bytes()).unwrap();
+    assert_no_overlaps(&im);
+    valid(&im).unwrap();
+    let (_, seq) = seq_named(&im, "S");
+    // overflow only goes on new tracks above the three native ones
+    assert!(seq.video_tracks.len() > 3);
+    for t in &seq.video_tracks[3..] {
+        assert!(!t.locked);
+    }
+    let total: usize = seq.video_tracks.iter().map(|t| t.items.len()).sum();
+    assert_eq!(total, v1.len() + v2.len() + v3.len(), "nothing is lost");
+    // every track keeps its own first clip
+    assert_eq!(seq.video_tracks[0].items[0].start, Tick(0));
+    assert_eq!(seq.video_tracks[2].items[0].start, Tick(SEC));
+    // hundreds of clips stacked on one instant: tracks stop at the cap, the rest are reported
+    let stacked: Vec<(i64, i64)> = (0..300).map(|_| (0, 1)).collect();
+    let doc = tracks_doc(&[&stacked]);
+    let (im, report) = import(doc.as_bytes()).unwrap();
+    assert_no_overlaps(&im);
+    assert!(report.mentions("left out"), "{report}");
+    let (_, seq) = seq_named(&im, "S");
+    assert!(seq.video_tracks.len() <= 256);
+}
+
+#[test]
+fn unreadable_or_reversed_source_points_are_reported() {
+    let doc = FULL.replace("<InPoint>25401600000</InPoint>", "<InPoint>abc</InPoint>");
+    let (im, report) = import(doc.as_bytes()).unwrap();
+    assert!(report.mentions("in point could not be read"), "{report}");
+    assert_eq!(seq_named(&im, "Main").1.video_tracks[0].items[0].source_in, Tick(0));
+    // out before in: the in point is kept, and said
+    let doc =
+        FULL.replace("<InPoint>25401600000</InPoint><OutPoint>279417600000</OutPoint>", "<InPoint>1270080000000</InPoint><OutPoint>254016000000</OutPoint>");
+    let (im, report) = import(doc.as_bytes()).unwrap();
+    assert!(report.mentions("out point is before its in point"), "{report}");
+    assert_eq!(seq_named(&im, "Main").1.video_tracks[0].items[0].source_in, Tick(5 * SEC));
+    let doc = FULL.replace("<OutPoint>279417600000</OutPoint>", "<OutPoint>x</OutPoint>");
+    let (_, report) = import(doc.as_bytes()).unwrap();
+    assert!(report.mentions("out point could not be read"), "{report}");
+    // an absent in point (as version 45 may write) is the start of the source, silently
+    let doc = FULL.replace("<InPoint>25401600000</InPoint>", "");
+    let (im, report) = import(doc.as_bytes()).unwrap();
+    assert!(!report.mentions("in point"), "{report}");
+    assert_eq!(seq_named(&im, "Main").1.video_tracks[0].items[0].source_in, Tick(0));
+}
+
+#[test]
+fn unsupported_master_clip_sources_are_counted() {
+    let doc = FULL.replace(
+        r#"<VideoMediaSource ObjectID="624" Version="2"><MediaSource Version="4"><Media ObjectURef="media-unused"/></MediaSource></VideoMediaSource>"#,
+        r#"<MulticamSequenceSource ObjectID="624" Version="1"/>"#,
+    );
+    let (im, report) = import(doc.as_bytes()).unwrap();
+    let e = report.entries.iter().find(|e| e.message.contains("MulticamSequenceSource")).unwrap_or_else(|| panic!("{report}"));
+    assert_eq!(e.count, 1);
+    assert!(!im.project.items.values().any(|i| i.name == "unused.mov"));
+}
+
+/// Bins deeper than the limit are flattened, not dropped: media in the deepest bin still comes in.
+#[test]
+fn very_deep_bins_are_flattened_not_lost() {
+    let depth = 100;
+    let mut doc = String::from(
+        r#"<?xml version="1.0"?><PremiereData Version="3"><Project ObjectID="1" Version="43"><RootProjectItem ObjectURef="root"/></Project>
+<RootProjectItem ObjectUID="root"><ProjectItemContainer><Items><Item Index="0" ObjectURef="b0"/></Items></ProjectItemContainer></RootProjectItem>"#,
+    );
+    for i in 0..depth {
+        let inner = if i + 1 < depth { format!(r#"<Item Index="0" ObjectURef="b{}"/>"#, i + 1) } else { r#"<Item Index="0" ObjectURef="cpi"/>"#.to_string() };
+        doc.push_str(&format!(r#"<BinProjectItem ObjectUID="b{i}"><ProjectItem><Name>Bin {i}</Name></ProjectItem><ProjectItemContainer><Items>{inner}<Item Index="1" ObjectURef="cpi{i}"/></Items></ProjectItemContainer></BinProjectItem>"#));
+        doc.push_str(&format!(r#"<ClipProjectItem ObjectUID="cpi{i}"><MasterClip ObjectURef="mc{i}"/></ClipProjectItem><MasterClip ObjectUID="mc{i}"><Clips><Clip ObjectRef="c{i}"/></Clips><Name>f{i}.mov</Name></MasterClip><VideoClip ObjectID="c{i}"><Clip><Source ObjectRef="s{i}"/></Clip></VideoClip><VideoMediaSource ObjectID="s{i}"><MediaSource><Media ObjectURef="m{i}"/></MediaSource></VideoMediaSource><Media ObjectUID="m{i}"><FilePath>/media/f{i}.mov</FilePath></Media>"#));
+    }
+    doc.push_str(r#"<ClipProjectItem ObjectUID="cpi"><MasterClip ObjectURef="mcd"/></ClipProjectItem><MasterClip ObjectUID="mcd"><Clips><Clip ObjectRef="cd"/></Clips><Name>deepest.mov</Name></MasterClip><VideoClip ObjectID="cd"><Clip><Source ObjectRef="sd"/></Clip></VideoClip><VideoMediaSource ObjectID="sd"><MediaSource><Media ObjectURef="md"/></MediaSource></VideoMediaSource><Media ObjectUID="md"><FilePath>/media/deepest.mov</FilePath></Media></PremiereData>"#);
+    let (im, report) = import(doc.as_bytes()).unwrap();
+    assert!(report.mentions("flattened"), "{report}");
+    let media = im.project.items.values().filter(|i| i.as_media().is_some()).count();
+    assert_eq!(media, depth + 1, "every file in every bin comes in");
+    // bin depth is capped
+    fn deepest(b: &filmcraft_project::Bin) -> usize {
+        b.children
+            .iter()
+            .filter_map(|c| match c {
+                filmcraft_project::BinEntry::Bin(sub) => Some(1 + deepest(sub)),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+    assert_eq!(deepest(&im.project.root), 64);
+    // the deepest file lands in the deepest kept bin
+    let mut items = Vec::new();
+    im.project.root.all_items(&mut items);
+    assert!(items.iter().any(|i| im.project.item(*i).is_some_and(|x| x.name == "deepest.mov")));
 }
 
 /// Truncation at every point and random byte flips, plain and compressed: never a panic.
@@ -686,9 +901,9 @@ fn mutations_never_panic() {
         for cut in (0..doc.len()).step_by(step) {
             let r = std::panic::catch_unwind(|| {
                 let _ = detect(&doc[..cut], Some("prproj"));
-                let _ = import(&doc[..cut]);
+                import_invalid(&doc[..cut])
             });
-            assert!(r.is_ok(), "panic at truncation {cut}");
+            assert!(matches!(r, Ok(None)), "truncation {cut}: {r:?}");
         }
         let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
         for round in 0..300 {
@@ -700,17 +915,17 @@ fn mutations_never_panic() {
             }
             let r = std::panic::catch_unwind(|| {
                 let _ = detect(&m, Some("prproj"));
-                let _ = import(&m);
+                import_invalid(&m)
             });
-            assert!(r.is_ok(), "panic in mutation round {round}");
+            assert!(matches!(r, Ok(None)), "mutation round {round}: {r:?}");
         }
     }
     // structural mutations: digits swapped into every number
     for (i, _) in FULL.match_indices(|c: char| c.is_ascii_digit()).step_by(7) {
         let mut s = FULL.to_string();
         s.replace_range(i..i + 1, "9");
-        let r = std::panic::catch_unwind(|| import(s.as_bytes()));
-        assert!(r.is_ok(), "panic with a digit changed at {i}");
+        let r = std::panic::catch_unwind(|| import_invalid(s.as_bytes()));
+        assert!(matches!(r, Ok(None)), "digit changed at {i}: {r:?}");
     }
 }
 
@@ -753,4 +968,65 @@ fn premiere_projects_are_import_only() {
     assert!(e.to_string().contains("imported but not exported"), "{e}");
     assert!(Format::Prproj.is_import_only());
     assert!(Format::ALL.iter().filter(|f| **f != Format::Prproj).all(|f| !f.is_import_only()));
+}
+
+#[test]
+fn pixel_aspect_ratio_is_read_or_reported() {
+    let doc = FULL.replace("<FrameRect>0,0,1080,1920</FrameRect>", "<FrameRect>0,0,1080,1920</FrameRect><PixelAspectRatio>4,3</PixelAspectRatio>");
+    let (im, _) = import(doc.as_bytes()).unwrap();
+    assert_eq!(seq_named(&im, "Main").1.settings.par, (4, 3));
+    let doc = FULL.replace("<FrameRect>0,0,1080,1920</FrameRect>", "<FrameRect>0,0,1080,1920</FrameRect><PixelAspectRatio>0,0</PixelAspectRatio>");
+    let (im, report) = import(doc.as_bytes()).unwrap();
+    assert_eq!(seq_named(&im, "Main").1.settings.par, (1, 1));
+    assert!(report.mentions("pixel aspect"), "{report}");
+}
+
+#[test]
+fn unverified_or_incomplete_data_is_reported_not_dropped() {
+    // a clip-level <Reverse> setting
+    let doc = FULL.replace("<PlaybackSpeed>2</PlaybackSpeed>", "<PlaybackSpeed>2</PlaybackSpeed><Reverse>true</Reverse>");
+    let (_, report) = import(doc.as_bytes()).unwrap();
+    assert!(report.mentions("<Reverse>"), "{report}");
+    // a marker without its data, and one before the start
+    let doc = FULL
+        .replace(
+            r#"<Marker ObjectID="912" Version="3"><DVAMarker>{"DVAMarker":{"mStartTime":{"ticks":50803200000},"mType":"Comment"}}</DVAMarker></Marker>"#,
+            r#"<Marker ObjectID="912" Version="3"/>"#,
+        )
+        .replace(r#""mStartTime":{"ticks":127008000000}"#, r#""mStartTime":{"ticks":-127008000000}"#);
+    let (im, report) = import(doc.as_bytes()).unwrap();
+    assert!(report.mentions("without marker data"), "{report}");
+    assert!(report.mentions("before the start"), "{report}");
+    assert_eq!(seq_named(&im, "Main").1.markers[0].start, Tick(0));
+    // a reference element without ObjectRef / ObjectURef
+    let doc = FULL.replace(r#"<SubClip ObjectRef="601"/>"#, "<SubClip/>");
+    let (_, report) = import(doc.as_bytes()).unwrap();
+    assert!(report.mentions("has no object reference"), "{report}");
+    // track volume / pan
+    let doc = FULL.replace(
+        r#"<IsMuted>false</IsMuted><ID>3</ID></Track>"#,
+        r#"<IsMuted>false</IsMuted><ID>3</ID></Track><AudioTrack><Panner ObjectRef="1072"/></AudioTrack>"#,
+    );
+    let (_, report) = import(doc.as_bytes()).unwrap();
+    let e = report.entries.iter().find(|e| e.message.contains("track-level effects")).unwrap_or_else(|| panic!("{report}"));
+    assert_eq!(e.count, 1);
+}
+
+#[test]
+fn multi_member_gzip_is_read_whole() {
+    let (a, b) = FULL.split_at(FULL.len() / 2);
+    let mut two = gzip(a.as_bytes());
+    two.extend(gzip(b.as_bytes()));
+    assert_eq!(detect(&two, Some("prproj")), Some(Format::Prproj));
+    assert_eq!(dump(&import(&two).unwrap()), dump(&import(FULL.as_bytes()).unwrap()));
+}
+
+#[test]
+fn a_bin_that_contains_itself_is_reported() {
+    let doc =
+        FULL.replace(r#"<Item Index="2" ObjectURef="cpi-unused"/>"#, r#"<Item Index="2" ObjectURef="cpi-unused"/><Item Index="3" ObjectURef="bin-footage"/>"#);
+    let (im, report) = import(doc.as_bytes()).unwrap();
+    assert!(report.mentions("contains itself"), "{report}");
+    valid(&im).unwrap();
+    assert_eq!(im.project.root.children.iter().filter(|c| matches!(c, filmcraft_project::BinEntry::Bin(_))).count(), 1);
 }

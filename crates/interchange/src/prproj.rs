@@ -20,8 +20,8 @@
 //! Reported, not imported (a warning per occurrence, merged with a count): transitions, effects
 //! (including the fixed Motion, Opacity and Volume settings and their keyframes), speed ramps (time
 //! remapping), captions, adjustment layers, titles and graphics, and clip sources of any other
-//! kind (multicam). Source in points are stored as Premiere wrote them; the engine moves them onto
-//! a media file's own time when the file carries a start timecode they are all at or after.
+//! kind (multicam). Source in points are stored as Premiere wrote them; the notes do not say whether
+//! they count from a file's start timecode, so the engine reports files that have one.
 //!
 //! Hostile input: the decompressed document is capped at [`MAX_DECOMPRESSED`] bytes and
 //! [`MAX_NODES`] XML nodes, a truncated gzip stream or invalid UTF-8 is an error, a reference to an
@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 
 use filmcraft_media::{Generator, MediaKind};
-use filmcraft_project::{BinId, ClipId, ItemId, Label, Marker, MarkerId, MarkerKind, Sequence, TrackItem, TrackKind};
+use filmcraft_project::{BinId, ClipId, ItemId, Label, Marker, MarkerId, MarkerKind, Sequence, TrackItem, TrackKind, checked_par, validate_frame_size};
 use filmcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
 use roxmltree::{Node, NodeId};
 
@@ -41,11 +41,22 @@ use crate::common::{Builder, MediaSpec, empty_sequence, file_name, kind_from_ext
 use crate::xml::{child, child_bool, child_text, children, elements};
 use crate::{Error, Format, ImportOptions, Imported, Report, Result};
 
-/// Largest decompressed document read (512 MiB).
+/// Project item metadata key holding a media file's path relative to the project (resolved against
+/// the project's folder) when it differs from the stored path: the engine tries it when the stored
+/// path does not open.
+pub const RELATIVE_PATH_KEY: &str = "Premiere Relative Path";
+
+/// Largest decompressed document read (512 MiB; 128 MiB on the web, where memory is tighter).
+#[cfg(not(target_arch = "wasm32"))]
 pub const MAX_DECOMPRESSED: u64 = 512 * 1024 * 1024;
-/// Largest number of XML nodes (elements, text, attributes' owners) parsed.
-pub const MAX_NODES: u32 = 40_000_000;
-/// Deepest XML element nesting parsed (the XML parser recurses once per level).
+#[cfg(target_arch = "wasm32")]
+pub const MAX_DECOMPRESSED: u64 = 128 * 1024 * 1024;
+/// Largest number of XML nodes parsed into the document tree (8 million; 2 million on the web).
+#[cfg(not(target_arch = "wasm32"))]
+pub const MAX_NODES: u32 = 8_000_000;
+#[cfg(target_arch = "wasm32")]
+pub const MAX_NODES: u32 = 2_000_000;
+/// Deepest XML element nesting parsed (the parser's tokenizer recurses once per level).
 const MAX_XML_DEPTH: usize = 1_000;
 /// Deepest chain of nested sequences followed.
 const MAX_NEST_DEPTH: usize = 64;
@@ -53,10 +64,15 @@ const MAX_NEST_DEPTH: usize = 64;
 const MAX_BIN_DEPTH: usize = 64;
 /// Most tracks of one kind a sequence gets (overlapping clips move to new tracks).
 const MAX_TRACKS: usize = 256;
+/// Most clip items one import creates (a damaged file can reference one clip many times).
+const MAX_ITEMS: usize = 200_000;
+/// Most markers one import creates.
+const MAX_MARKERS: usize = 200_000;
 /// Distinct report entries before the rest are summarised in one line.
 const MAX_REPORT_ENTRIES: usize = 500;
-/// Largest tick value accepted (about 210 days); anything larger is a damaged number.
-const MAX_TICK: i64 = 1 << 62;
+/// Largest tick value accepted: the project's own bound ([`Tick::MAX`]), so whatever is imported
+/// also saves and loads again. Anything larger is a damaged number.
+const MAX_TICK: i64 = Tick::MAX.0;
 /// How much of a document detection looks at.
 const SNIFF_BYTES: u64 = 64 * 1024;
 /// Project versions the format notes describe.
@@ -76,7 +92,7 @@ pub(crate) fn sniff(bytes: &[u8]) -> bool {
     if is_gzip(bytes) {
         let mut head = Vec::new();
         // A prefix is enough to see the root; a damaged tail is the importer's error to report.
-        let _ = flate2::read::GzDecoder::new(bytes).take(SNIFF_BYTES).read_to_end(&mut head);
+        let _ = flate2::read::MultiGzDecoder::new(bytes).take(SNIFF_BYTES).read_to_end(&mut head);
         root_is_premiere(&head)
     } else {
         root_is_premiere(bytes.get(..SNIFF_BYTES as usize).unwrap_or(bytes))
@@ -107,7 +123,8 @@ fn root_is_premiere(head: &[u8]) -> bool {
 fn decode(bytes: &[u8], max: u64) -> Result<Cow<'_, str>> {
     let data: Cow<'_, [u8]> = if is_gzip(bytes) {
         let mut out = Vec::new();
-        flate2::read::GzDecoder::new(bytes)
+        // every member of a multi-member stream, not just the first
+        flate2::read::MultiGzDecoder::new(bytes)
             .take(max.saturating_add(1))
             .read_to_end(&mut out)
             .map_err(|e| perr(format!("the compressed project is damaged or truncated ({e})")))?;
@@ -132,8 +149,9 @@ fn decode(bytes: &[u8], max: u64) -> Result<Cow<'_, str>> {
     }
 }
 
-/// Refuse documents whose elements nest deeper than `max` before the recursive XML parser sees
-/// them. Counts the way the parser recurses: an open tag goes one level down, a close tag one up,
+/// Refuse documents whose elements nest deeper than `max` before the XML parser sees them: its
+/// tokenizer recurses once per element level (the tree itself is built iteratively), so a very
+/// deep document overflows the stack. Counts the way the tokenizer recurses: an open tag goes one level down, a close tag one up,
 /// and comments, CDATA, declarations and quoted attribute values are skipped.
 fn check_depth(b: &[u8], max: usize) -> Result<()> {
     let find = |from: usize, pat: &[u8]| b.get(from..).and_then(|r| r.windows(pat.len()).position(|w| w == pat)).map(|p| from + p + pat.len());
@@ -191,13 +209,21 @@ fn check_depth(b: &[u8], max: usize) -> Result<()> {
 
 /// Import a `.prproj` document (plain or gzip).
 pub(crate) fn import(bytes: &[u8], opts: &ImportOptions) -> Result<(Imported, Report)> {
-    import_limited(bytes, opts, MAX_NODES)
+    import_limited(bytes, opts, Limits { nodes: MAX_NODES, items: MAX_ITEMS, markers: MAX_MARKERS })
 }
 
-fn import_limited(bytes: &[u8], opts: &ImportOptions, nodes_limit: u32) -> Result<(Imported, Report)> {
+/// Work budget of one import.
+#[derive(Clone, Copy)]
+struct Limits {
+    nodes: u32,
+    items: usize,
+    markers: usize,
+}
+
+fn import_limited(bytes: &[u8], opts: &ImportOptions, limits: Limits) -> Result<(Imported, Report)> {
     let text = decode(bytes, MAX_DECOMPRESSED)?;
     check_depth(text.as_bytes(), MAX_XML_DEPTH)?;
-    let po = roxmltree::ParsingOptions { allow_dtd: false, nodes_limit, ..Default::default() };
+    let po = roxmltree::ParsingOptions { allow_dtd: false, nodes_limit: limits.nodes, ..Default::default() };
     let doc = roxmltree::Document::parse_with_options(&text, po).map_err(|e| perr(e.to_string()))?;
     let root = doc.root_element();
     if root.tag_name().name() != "PremiereData" {
@@ -225,6 +251,12 @@ fn import_limited(bytes: &[u8], opts: &ImportOptions, nodes_limit: u32) -> Resul
         master_items: HashMap::new(),
         clip_refs: HashMap::new(),
         nested: HashSet::new(),
+        marker_lists: HashMap::new(),
+        limits,
+        items_made: 0,
+        markers_made: 0,
+        warned: HashSet::new(),
+        track_effects: false,
     };
     imp.index(root);
     let sequences: Vec<Node> = elements(root).filter(|n| n.has_tag_name("Sequence")).collect();
@@ -272,6 +304,15 @@ struct Imp<'a, 'i, 'r> {
     clip_refs: HashMap<&'a str, (ItemId, ClipId)>,
     /// Sequences used as clips inside other sequences.
     nested: HashSet<ItemId>,
+    /// Parsed marker lists, so a list referenced many times is read once.
+    marker_lists: HashMap<NodeId, Vec<Marker>>,
+    limits: Limits,
+    items_made: usize,
+    markers_made: usize,
+    /// Messages already in the report (bounds the report's own linear merge).
+    warned: HashSet<String>,
+    /// Track-level effects were seen (reported once).
+    track_effects: bool,
 }
 
 /// Parse a tick value; `None` when absent, unparsable or out of range.
@@ -285,7 +326,9 @@ fn rate_from_ticks(ticks_per_frame: i64) -> Option<FrameRate> {
     if !(TICKS_PER_SECOND / 1000..=TICKS_PER_SECOND).contains(&ticks_per_frame) {
         return None;
     }
-    Some(FrameRate::new(TICKS_PER_SECOND, ticks_per_frame))
+    // A sequence's rate must reduce to 32-bit terms (`SequenceSettings::validate`).
+    let r = FrameRate::new(TICKS_PER_SECOND, ticks_per_frame);
+    (r.num <= i64::from(u32::MAX) && r.den <= i64::from(u32::MAX)).then_some(r)
 }
 
 /// A sample rate from ticks per sample (`AudioTrackGroup` `<FrameRate>`).
@@ -298,7 +341,13 @@ fn sample_rate_from_ticks(ticks_per_sample: i64) -> Option<u32> {
     } else {
         (TICKS_PER_SECOND as f64 / ticks_per_sample as f64).round() as i64
     };
-    u32::try_from(sr).ok().filter(|r| (1_000..=768_000).contains(r))
+    u32::try_from(sr).ok().filter(|r| (1_000..=384_000).contains(r))
+}
+
+/// `num,den` (`<PixelAspectRatio>`).
+fn parse_par(s: &str) -> Option<(u32, u32)> {
+    let (n, d) = s.split_once(',')?;
+    Some((n.trim().parse().ok()?, d.trim().parse().ok()?))
 }
 
 /// `left,top,right,bottom` → (width, height).
@@ -307,7 +356,7 @@ fn frame_rect(s: &str) -> Option<(u32, u32)> {
     let [l, t, r, b] = v.as_slice() else { return None };
     let w = u32::try_from(r.checked_sub(*l)?).ok()?;
     let h = u32::try_from(b.checked_sub(*t)?).ok()?;
-    ((1..=32_768).contains(&w) && (1..=32_768).contains(&h)).then_some((w, h))
+    validate_frame_size(w, h).is_ok().then_some((w, h))
 }
 
 /// Children named `tag` of `list`, ordered by their `Index` attribute (document order otherwise).
@@ -339,12 +388,25 @@ fn json_ticks(v: Option<&serde_json::Value>) -> Option<i64> {
     n.checked_abs().is_some_and(|a| a <= MAX_TICK).then_some(n)
 }
 
+/// Whether `c` overlaps none of `items` (sorted by start, not overlapping each other).
+fn fits(items: &[TrackItem], c: &TrackItem) -> bool {
+    let i = items.partition_point(|o| o.start < c.end());
+    i == 0 || items.get(i - 1).is_none_or(|o| o.end() <= c.start)
+}
+
+/// Insert `c` into `items`, keeping them sorted by start.
+fn insert_sorted(items: &mut Vec<TrackItem>, c: TrackItem) {
+    let i = items.partition_point(|o| o.start <= c.start);
+    items.insert(i, c);
+}
+
 impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
     fn warn(&mut self, message: impl Into<String>) {
         let m = message.into();
-        if self.report.entries.len() >= MAX_REPORT_ENTRIES && !self.report.entries.iter().any(|e| e.message == m) {
+        if self.warned.len() >= MAX_REPORT_ENTRIES && !self.warned.contains(&m) {
             self.report.warn("more problems were found than this report lists");
         } else {
+            self.warned.insert(m.clone());
             self.report.warn(m);
         }
     }
@@ -378,6 +440,7 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         } else if let Some(uid) = r.attribute("ObjectURef") {
             self.by_uid.get(uid).copied()
         } else {
+            self.warn(format!("{what} has no object reference; it was skipped"));
             return None;
         };
         if hit.is_none() {
@@ -434,19 +497,32 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
             None => (1920, 1080),
         };
         let mut settings = settings_for(rate, width, height, false);
-        if let Some(sr) =
-            audio.and_then(|a| child(a, "TrackGroup")).and_then(|t| child_text(t, "FrameRate")).and_then(tick_value).and_then(sample_rate_from_ticks)
-        {
-            settings.sample_rate = sr;
+        if let Some(t) = audio.and_then(|a| child(a, "TrackGroup")).and_then(|t| child_text(t, "FrameRate")) {
+            match tick_value(t).and_then(sample_rate_from_ticks) {
+                Some(sr) => settings.sample_rate = sr,
+                None => self.warn(format!("sequence \"{name}\" has an unusable audio sample rate; 48000 Hz was used")),
+            }
+        }
+        if let Some(par) = video.and_then(|v| child_text(v, "PixelAspectRatio")) {
+            match parse_par(par).and_then(checked_par) {
+                Some(p) => settings.par = p,
+                None => self.warn(format!("sequence \"{name}\" has an unusable pixel aspect ratio; square pixels were used")),
+            }
+        }
+        // What the project itself accepts on load: anything else would import, then fail to reopen.
+        if let Err(e) = settings.validate() {
+            self.warn(format!("sequence \"{name}\" settings are out of range ({e}); the defaults were used"));
+            settings = settings_for(FrameRate::default(), 1920, 1080, false);
         }
         let id = self.b.reserve_sequence(&name, settings.clone(), None);
         self.seq_items.insert(n.id(), id);
         let mut seq = empty_sequence(settings);
         seq.markers = self.markers_of(n);
-        let frame = Frame { width, height, rate };
+        let frame = Frame { width: seq.settings.width, height: seq.settings.height, rate: seq.settings.frame_rate };
         for (kind, group) in [(TrackKind::Video, video), (TrackKind::Audio, audio)] {
             let tracks = indexed(group.and_then(|g| child(g, "TrackGroup")).and_then(|t| child(t, "Tracks")), "Track");
             let mut ti = 0usize;
+            let mut clips = Vec::new();
             for t in tracks {
                 let Some(tn) = self.follow(Some(t), "track list entry") else { continue };
                 if ti >= MAX_TRACKS {
@@ -454,9 +530,10 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                     break;
                 }
                 self.b.ensure_tracks(&mut seq, kind, ti + 1);
-                self.track(&mut seq, id, kind, ti, tn, frame, depth);
+                self.track(&mut seq, kind, ti, tn, frame, depth, &mut clips);
                 ti += 1;
             }
+            self.place_clips(&mut seq, id, kind, clips);
         }
         if let Some(d) = data {
             for t in indexed(child(d, "TrackGroup").and_then(|t| child(t, "Tracks")), "Track") {
@@ -479,7 +556,16 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn track(&mut self, seq: &mut Sequence, seq_id: ItemId, kind: TrackKind, ti: usize, tn: Node<'a, 'i>, frame: Frame, depth: usize) {
+    fn track(
+        &mut self,
+        seq: &mut Sequence,
+        kind: TrackKind,
+        ti: usize,
+        tn: Node<'a, 'i>,
+        frame: Frame,
+        depth: usize,
+        clips: &mut Vec<(usize, Option<&'a str>, TrackItem)>,
+    ) {
         let ct = child(tn, "ClipTrack");
         if let (Some(meta), Some(t)) = (ct.and_then(|c| child(c, "Track")), seq.tracks_mut(kind).get_mut(ti)) {
             t.locked = child_bool(meta, "IsLocked").unwrap_or(false);
@@ -493,42 +579,27 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                 t.name = name.to_string();
             }
         }
-        // Clips, in time order; one that overlaps the previous moves to a track above.
+        // Track volume, pan and track effects hang off the track object; none are imported.
+        if !self.track_effects
+            && tn
+                .descendants()
+                .any(|d| matches!(d.tag_name().name(), "Panner" | "Components" | "ComponentOwner" | "ComponentChain") && (is_ref(d) || d.has_children()))
+        {
+            self.track_effects = true;
+            self.warn("track-level effects (track volume, pan and track effects) were not imported");
+        }
+        // Clips are placed once every track of this kind is read (`place_clips`).
         let refs = indexed(ct.and_then(|c| child(c, "ClipItems")).and_then(|c| child(c, "TrackItems")), "TrackItem");
-        let mut clips: Vec<(Option<&'a str>, TrackItem)> = Vec::new();
         for r in refs {
             let Some(it) = self.follow(Some(r), "track item") else { continue };
             match it.tag_name().name() {
                 "VideoClipTrackItem" | "AudioClipTrackItem" => {
                     if let Some(c) = self.clip_item(it, kind, frame, depth) {
-                        clips.push((it.attribute("ObjectID"), c));
+                        clips.push((ti, it.attribute("ObjectID"), c));
                     }
                 }
                 other => self.warn(format!("{other} track items are not supported and were skipped")),
             }
-        }
-        clips.sort_by_key(|(_, c)| c.start);
-        let mut last_end = Tick::ZERO;
-        for (obj, c) in clips {
-            let clip_id = c.id;
-            if c.start >= last_end {
-                last_end = c.end();
-                if let Some(t) = seq.tracks_mut(kind).get_mut(ti) {
-                    t.items.push(c);
-                }
-            } else if seq.tracks(kind).len() >= MAX_TRACKS {
-                self.warn("overlapping clip items on one track; one was left out (too many tracks)");
-                continue;
-            } else {
-                self.warn("overlapping clip items on one track; the later one was moved to a new track");
-                self.b.place(seq, kind, ti + 1, c);
-            }
-            if let Some(o) = obj {
-                self.clip_refs.insert(o, (seq_id, clip_id));
-            }
-        }
-        if let Some(t) = seq.tracks_mut(kind).get_mut(ti) {
-            t.sort();
         }
         for r in indexed(ct.and_then(|c| child(c, "TransitionItems")).and_then(|c| child(c, "TrackItems")), "TrackItem") {
             let Some(tr) = self.follow(Some(r), "transition") else { continue };
@@ -539,6 +610,52 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                 .or_else(|| inner.and_then(|t| child_text(t, "MatchName")))
                 .unwrap_or("?");
             self.warn(format!("transition \"{name}\" was not imported"));
+        }
+    }
+
+    /// Put the clips of every track of `kind` on the sequence: each on its own track first (in
+    /// time order); a clip that overlaps one already there goes to the lowest new track above all
+    /// the native ones where it overlaps nothing.
+    fn place_clips(&mut self, seq: &mut Sequence, seq_id: ItemId, kind: TrackKind, mut clips: Vec<(usize, Option<&'a str>, TrackItem)>) {
+        clips.sort_by_key(|(ti, _, c)| (*ti, c.start));
+        let mut overflow = Vec::new();
+        for (ti, obj, c) in clips {
+            match seq.tracks_mut(kind).get_mut(ti) {
+                Some(t) if fits(&t.items, &c) => {
+                    if let Some(o) = obj {
+                        self.clip_refs.insert(o, (seq_id, c.id));
+                    }
+                    insert_sorted(&mut t.items, c);
+                }
+                _ => overflow.push((ti, obj, c)),
+            }
+        }
+        // Overflow goes on new tracks above every native one (unlocked, as Track::new makes them),
+        // so it never lands among another Premiere track's clips or inherits its lock.
+        let native = seq.tracks(kind).len();
+        for (_, obj, c) in overflow {
+            let mut target = None;
+            for i in native..MAX_TRACKS {
+                match seq.tracks(kind).get(i) {
+                    Some(t) if !fits(&t.items, &c) => continue,
+                    _ => {
+                        target = Some(i);
+                        break;
+                    }
+                }
+            }
+            let Some(i) = target else {
+                self.warn(format!("overlapping clip items; one was left out (more than {MAX_TRACKS} tracks would be needed)"));
+                continue;
+            };
+            self.warn("overlapping clip items on one track; the later one was moved to a new track above the others");
+            self.b.ensure_tracks(seq, kind, i + 1);
+            if let Some(t) = seq.tracks_mut(kind).get_mut(i) {
+                if let Some(o) = obj {
+                    self.clip_refs.insert(o, (seq_id, c.id));
+                }
+                insert_sorted(&mut t.items, c);
+            }
         }
     }
 
@@ -561,6 +678,13 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
     }
 
     fn clip_item(&mut self, it: Node<'a, 'i>, kind: TrackKind, frame: Frame, depth: usize) -> Option<TrackItem> {
+        if self.items_made >= self.limits.items {
+            if self.items_made == self.limits.items {
+                self.items_made += 1;
+                self.warn(format!("the project has more than {} clip items; the rest were left out", self.limits.items));
+            }
+            return None;
+        }
         let Some(cti) = child(it, "ClipTrackItem") else {
             self.warn("a track item without clip data was skipped");
             return None;
@@ -607,8 +731,27 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
             },
         };
         let c = clip_el.and_then(|c| child(c, "Clip"));
-        let in_point = c.and_then(|c| child_text(c, "InPoint")).and_then(tick_value).unwrap_or(0);
-        let out_point = c.and_then(|c| child_text(c, "OutPoint")).and_then(tick_value);
+        // An absent in point is the start of the source; one that is there but unreadable is reported.
+        let in_point = match c.and_then(|c| child_text(c, "InPoint")) {
+            None => 0,
+            Some(t) => tick_value(t).unwrap_or_else(|| {
+                self.warn("a source in point could not be read; the start of the source was used");
+                0
+            }),
+        };
+        let out_point = match c.and_then(|c| child_text(c, "OutPoint")) {
+            None => None,
+            Some(t) => {
+                let v = tick_value(t);
+                if v.is_none() {
+                    self.warn("a source out point could not be read and was ignored");
+                }
+                v
+            }
+        };
+        if out_point.is_some_and(|o| o < in_point) {
+            self.warn("a clip's source out point is before its in point; the in point was kept");
+        }
         let mut speed = 1.0;
         let mut reverse = false;
         if let Some(s) = c.and_then(|c| child_text(c, "PlaybackSpeed")) {
@@ -622,6 +765,9 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         }
         if reverse {
             self.warn("a negative clip speed was read as reverse playback (unverified against Premiere Pro files)");
+        }
+        if c.is_some_and(|c| child(c, "Reverse").is_some()) {
+            self.warn("a clip <Reverse> setting was not imported (its meaning is unverified)");
         }
         if c.is_some_and(|c| child(c, "TimeRemapping").is_some()) {
             self.warn("speed ramps (time remapping) were not imported; the clip plays at a constant speed");
@@ -663,8 +809,8 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                 self.offline(&name, kind, frame)
             }
         };
-        let source_in = Tick(out_point.map_or(in_point, |o| o.min(in_point)));
-        let mut ti = self.b.clip(item, kind, &name, Tick(start), Tick(duration), source_in);
+        let mut ti = self.b.clip(item, kind, &name, Tick(start), Tick(duration), Tick(in_point));
+        self.items_made += 1;
         ti.speed = speed;
         ti.reverse = reverse;
         ti.markers = self.markers_of(cti);
@@ -766,18 +912,41 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
             .or_else(|| child_text(m, "RelativePath").filter(|s| non_empty(s)));
         let name = title.or(path.map(file_name)).filter(|s| non_empty(s)).unwrap_or(fallback_name).to_string();
         let mut spec = MediaSpec::default();
+        // Stream values go through the same bounds as sequence settings; unusable ones are said.
+        let mut unusable = false;
         if let Some(vs) = self.follow(child(m, "VideoStream"), "media") {
-            let rate = child_text(vs, "FrameRate").and_then(tick_value).and_then(rate_from_ticks).unwrap_or_default();
-            let (w, h) = child_text(vs, "FrameRect").and_then(frame_rect).unwrap_or((1920, 1080));
+            let rate = match child_text(vs, "FrameRate") {
+                None => FrameRate::default(),
+                Some(t) => tick_value(t).and_then(rate_from_ticks).unwrap_or_else(|| {
+                    unusable = true;
+                    FrameRate::default()
+                }),
+            };
+            let (w, h) = match child_text(vs, "FrameRect") {
+                None => (1920, 1080),
+                Some(r) => frame_rect(r).unwrap_or_else(|| {
+                    unusable = true;
+                    (1920, 1080)
+                }),
+            };
             spec.video = Some((w, h, rate));
             spec.duration = child_text(vs, "Duration").and_then(tick_value).filter(|d| *d > 0).map(Tick);
         }
         if let Some(a) = self.follow(child(m, "AudioStream"), "media") {
-            let sr = child_text(a, "FrameRate").and_then(tick_value).and_then(sample_rate_from_ticks).unwrap_or(48_000);
+            let sr = match child_text(a, "FrameRate") {
+                None => 48_000,
+                Some(t) => tick_value(t).and_then(sample_rate_from_ticks).unwrap_or_else(|| {
+                    unusable = true;
+                    48_000
+                }),
+            };
             spec.audio = Some((sr, 2));
             if spec.duration.is_none() {
                 spec.duration = child_text(a, "Duration").and_then(tick_value).filter(|d| *d > 0).map(Tick);
             }
+        }
+        if unusable {
+            self.warn("a media file's frame rate, frame size or sample rate is out of range; defaults were used until the file is linked");
         }
         if spec.video.is_none() && spec.audio.is_none() {
             // No stream description: guess from the extension (and the track the clip is on).
@@ -795,7 +964,15 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         match path {
             Some(p) => {
                 let p = resolve_path(p, self.base_dir);
-                self.b.file_media(&format!("file:{p}"), &name, &p, &spec, None)
+                let id = self.b.file_media(&format!("file:{p}"), &name, &p, &spec, None);
+                // The path relative to the project, for relinking when the absolute one is missing
+                // (a project moved between machines).
+                if let Some(rel) = child_text(m, "RelativePath").filter(|s| non_empty(s)).map(|r| resolve_path(r, self.base_dir)).filter(|r| *r != p)
+                    && let Some(item) = self.b.p.item_mut(id)
+                {
+                    item.metadata.entry(RELATIVE_PATH_KEY.to_string()).or_insert(rel);
+                }
+                id
             }
             None => {
                 self.warn("a media file without a path was imported offline");
@@ -825,46 +1002,90 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
             if !seen.insert(list.id()) {
                 continue;
             }
-            let entries: Vec<Node<'a, 'i>> = list.descendants().filter(|d| d.has_tag_name("Marker")).collect();
-            for e in entries {
-                let mk = if is_ref(e) { self.follow(Some(e), "marker") } else { Some(e) };
-                let Some(json) = mk.and_then(|m| child_text(m, "DVAMarker")) else { continue };
-                match self.marker(json) {
-                    Some(m) => out.push(m),
-                    None => self.warn("a marker could not be read and was skipped"),
-                }
+            if !self.marker_lists.contains_key(&list.id()) {
+                let parsed = self.parse_marker_list(list);
+                self.marker_lists.insert(list.id(), parsed);
+            }
+            let Some(cached) = self.marker_lists.get(&list.id()) else { continue };
+            let room = self.limits.markers.saturating_sub(self.markers_made);
+            let take = cached.len().min(room);
+            let mut copied: Vec<Marker> = cached.iter().take(take).cloned().collect();
+            for m in &mut copied {
+                m.id = MarkerId(self.b.alloc());
+            }
+            self.markers_made = self.markers_made.saturating_add(copied.len());
+            out.extend(copied);
+            if take < self.marker_lists.get(&list.id()).map_or(0, Vec::len) && self.markers_made == self.limits.markers {
+                self.markers_made += 1;
+                self.warn(format!("the project has more than {} markers; the rest were left out", self.limits.markers));
             }
         }
         out.sort_by_key(|m| m.start);
         out
     }
 
-    fn marker(&mut self, json: &str) -> Option<Marker> {
-        let v: serde_json::Value = serde_json::from_str(json).ok()?;
-        let m = v.get("DVAMarker").unwrap_or(&v);
-        let start = json_ticks(m.get("mStartTime"))?;
-        let duration = json_ticks(m.get("mDuration")).unwrap_or(0).max(0);
-        let text = |k: &str| m.get(k).and_then(|s| s.as_str()).unwrap_or("").to_string();
-        let kind = match m.get("mType").and_then(|t| t.as_str()).unwrap_or("") {
-            "Chapter" => MarkerKind::Chapter,
-            "Segmentation" => MarkerKind::Segmentation,
-            "WebLink" => MarkerKind::WebLink,
-            "FlashCuePoint" | "FlashCue" => MarkerKind::FlashCue,
-            _ => MarkerKind::Comment,
-        };
-        Some(Marker {
-            id: MarkerId(self.b.alloc()),
-            start: Tick(start),
-            duration: Tick(duration),
-            name: text("mName"),
-            comment: text("mComment"),
-            kind,
-            color: Label::Green,
-        })
+    /// The markers of one `Markers` list object, read once (ids are given when copied out).
+    fn parse_marker_list(&mut self, list: Node<'a, 'i>) -> Vec<Marker> {
+        let mut out = Vec::new();
+        let entries: Vec<Node<'a, 'i>> = list.descendants().filter(|d| d.has_tag_name("Marker")).collect();
+        for e in entries {
+            if out.len() >= self.limits.markers {
+                break;
+            }
+            let mk = if is_ref(e) { self.follow(Some(e), "marker") } else { Some(e) };
+            let Some(mk) = mk else { continue };
+            let Some(json) = child_text(mk, "DVAMarker") else {
+                self.warn("a marker without marker data (<DVAMarker>) was skipped");
+                continue;
+            };
+            match marker_from_json(json) {
+                Some(mut m) => {
+                    if m.start < Tick::ZERO {
+                        self.warn("a marker before the start was moved to the start");
+                        m.start = Tick::ZERO;
+                    }
+                    out.push(m);
+                }
+                None => self.warn("a marker could not be read and was skipped"),
+            }
+        }
+        out
     }
+}
 
+/// A marker from a `DVAMarker` JSON blob (id 0: the caller gives it one).
+fn marker_from_json(json: &str) -> Option<Marker> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let m = v.get("DVAMarker").unwrap_or(&v);
+    let start = json_ticks(m.get("mStartTime"))?;
+    let duration = json_ticks(m.get("mDuration")).unwrap_or(0).max(0);
+    let text = |k: &str| m.get(k).and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let kind = match m.get("mType").and_then(|t| t.as_str()).unwrap_or("") {
+        "Chapter" => MarkerKind::Chapter,
+        "Segmentation" => MarkerKind::Segmentation,
+        "WebLink" => MarkerKind::WebLink,
+        "FlashCuePoint" | "FlashCue" => MarkerKind::FlashCue,
+        _ => MarkerKind::Comment,
+    };
+    Some(Marker { id: MarkerId(0), start: Tick(start), duration: Tick(duration), name: text("mName"), comment: text("mComment"), kind, color: Label::Green })
+}
+
+impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
     /// `Link` objects tie a video clip item to its audio: give their clips one link id.
     fn links(&mut self, root: Node<'a, 'i>) {
+        // where each clip is: (sequence, video?, track, index), built once
+        let mut at: HashMap<ClipId, (ItemId, bool, usize, usize)> = HashMap::new();
+        let seqs: HashSet<ItemId> = self.clip_refs.values().map(|(s, _)| *s).collect();
+        for seq in seqs {
+            let Some(q) = self.b.p.sequence(seq) else { continue };
+            for (video, tracks) in [(true, &q.video_tracks), (false, &q.audio_tracks)] {
+                for (ti, t) in tracks.iter().enumerate() {
+                    for (ci, c) in t.items.iter().enumerate() {
+                        at.insert(c.id, (seq, video, ti, ci));
+                    }
+                }
+            }
+        }
         for l in elements(root).filter(|n| n.has_tag_name("Link")) {
             let members: Vec<(ItemId, ClipId)> = l
                 .descendants()
@@ -876,12 +1097,12 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                 continue;
             }
             let link = self.b.link_id();
-            for (seq, clip) in members {
+            for (_, clip) in members {
+                let Some(&(seq, video, ti, ci)) = at.get(&clip) else { continue };
                 let Some(s) = self.b.p.sequence_mut(seq) else { continue };
-                for t in s.all_tracks_mut() {
-                    for c in t.items.iter_mut().filter(|c| c.id == clip) {
-                        c.link = Some(link);
-                    }
+                let tracks = if video { &mut s.video_tracks } else { &mut s.audio_tracks };
+                if let Some(c) = tracks.get_mut(ti).and_then(|t| t.items.get_mut(ci)) {
+                    c.link = Some(link);
                 }
             }
         }
@@ -911,7 +1132,10 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                     let s = child(src, "SequenceSource").and_then(|q| child(q, "Sequence"));
                     self.follow(s, "nested sequence clip").filter(|s| s.has_tag_name("Sequence")).and_then(|s| self.sequence(s, 0))
                 }
-                _ => None,
+                other => {
+                    self.warn(format!("Project panel clips with a {other} source are not supported and were not imported"));
+                    None
+                }
             };
             if found.is_some() {
                 break;
@@ -921,43 +1145,52 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         found
     }
 
+    /// The Project panel tree, walked with an explicit stack. Bins deeper than
+    /// [`MAX_BIN_DEPTH`] are flattened: their contents go into the deepest bin kept.
     fn bins(&mut self, project: Node<'a, 'i>) {
         let Some(root_item) = self.follow(child(project, "RootProjectItem"), "project") else { return };
         let mut seen = HashSet::new();
         seen.insert(root_item.id());
-        self.bin_children(root_item, None, 0, &mut seen);
-    }
-
-    fn bin_children(&mut self, container: Node<'a, 'i>, bin: Option<BinId>, depth: usize, seen: &mut HashSet<NodeId>) {
-        if depth > MAX_BIN_DEPTH {
-            self.warn(format!("bins are nested more than {MAX_BIN_DEPTH} deep; the deeper ones were flattened"));
-            return;
-        }
-        let items = child(container, "ProjectItemContainer").and_then(|c| child(c, "Items"));
-        for r in indexed(items, "Item") {
-            let Some(n) = self.follow(Some(r), "bin") else { continue };
-            if !seen.insert(n.id()) {
-                self.warn("a bin lists an item twice or contains itself; the repeat was skipped");
-                continue;
-            }
-            match n.tag_name().name() {
-                "BinProjectItem" => {
-                    let name = child(n, "ProjectItem").and_then(|p| child_text(p, "Name")).filter(|s| non_empty(s)).unwrap_or("Bin");
-                    let b = self.b.bin(name, bin);
-                    self.bin_children(n, Some(b), depth + 1, seen);
+        // (container, its bin, its depth); children are pushed in reverse to keep document order
+        let mut stack: Vec<(Node<'a, 'i>, Option<BinId>, usize)> = vec![(root_item, None, 0)];
+        let mut flattened = false;
+        while let Some((container, bin, depth)) = stack.pop() {
+            let items = child(container, "ProjectItemContainer").and_then(|c| child(c, "Items"));
+            let mut sub_bins = Vec::new();
+            for r in indexed(items, "Item") {
+                let Some(n) = self.follow(Some(r), "bin") else { continue };
+                if !seen.insert(n.id()) {
+                    self.warn("a bin lists an item twice or contains itself; the repeat was skipped");
+                    continue;
                 }
-                "ClipProjectItem" => {
-                    let Some(mc) = self.follow(child(n, "MasterClip"), "project panel clip") else { continue };
-                    let Some(id) = self.master_item(mc) else { continue };
-                    // An item goes to the first bin that lists it.
-                    if let Some(b) = bin
-                        && self.b.p.root.parent_of(id) == Some(self.b.p.root.id)
-                    {
-                        self.b.p.move_to_bin(&[id], Some(b));
+                match n.tag_name().name() {
+                    "BinProjectItem" => {
+                        if depth >= MAX_BIN_DEPTH {
+                            flattened = true;
+                            sub_bins.push((n, bin, depth));
+                        } else {
+                            let name = child(n, "ProjectItem").and_then(|p| child_text(p, "Name")).filter(|s| non_empty(s)).unwrap_or("Bin");
+                            let b = self.b.bin(name, bin);
+                            sub_bins.push((n, Some(b), depth + 1));
+                        }
                     }
+                    "ClipProjectItem" => {
+                        let Some(mc) = self.follow(child(n, "MasterClip"), "project panel clip") else { continue };
+                        let Some(id) = self.master_item(mc) else { continue };
+                        // An item goes to the first bin that lists it.
+                        if let Some(b) = bin
+                            && self.b.p.root.parent_of(id) == Some(self.b.p.root.id)
+                        {
+                            self.b.p.move_to_bin(&[id], Some(b));
+                        }
+                    }
+                    other => self.warn(format!("{other} entries in the Project panel were not imported")),
                 }
-                other => self.warn(format!("{other} entries in the Project panel were not imported")),
             }
+            stack.extend(sub_bins.into_iter().rev());
+        }
+        if flattened {
+            self.warn(format!("bins nested more than {MAX_BIN_DEPTH} deep were flattened into the deepest bin kept"));
         }
     }
 }
@@ -1009,10 +1242,47 @@ mod tests {
         assert!(check_depth(b"", 0).is_ok());
     }
 
+    /// One clip item referenced 30 times, with a marker list of six (one unreadable) that every
+    /// reference shares: the item and marker budgets stop the copies, each warns once, and the
+    /// list is parsed once (the unreadable marker is reported once, not per reference).
+    #[test]
+    fn item_and_marker_budgets_bound_repeated_references() {
+        let refs: String = (0..30).map(|i| format!(r#"<TrackItem Index="{i}" ObjectRef="ti"/>"#)).collect();
+        let marks: String =
+            (0..5).map(|i| format!(r#"<Marker ObjectID="mk{i}"><DVAMarker>{{"DVAMarker":{{"mStartTime":{{"ticks":{i}}}}}}}</DVAMarker></Marker>"#)).collect();
+        let doc = format!(
+            r#"<?xml version="1.0"?><PremiereData Version="3"><Project ObjectID="1" Version="43"/>
+<Sequence ObjectUID="s"><TrackGroups><TrackGroup Index="0"><Second ObjectRef="g"/></TrackGroup></TrackGroups><Name>S</Name></Sequence>
+<VideoTrackGroup ObjectID="g"><TrackGroup><Tracks><Track Index="0" ObjectURef="t"/></Tracks><FrameRate>10160640000</FrameRate></TrackGroup></VideoTrackGroup>
+<VideoClipTrack ObjectUID="t"><ClipTrack><ClipItems><TrackItems>{refs}</TrackItems></ClipItems></ClipTrack></VideoClipTrack>
+<VideoClipTrackItem ObjectID="ti"><ClipTrackItem><TrackItem><End>254016000000</End></TrackItem><Owner><Markers ObjectRef="ml"/></Owner></ClipTrackItem></VideoClipTrackItem>
+{marks}<Marker ObjectID="bad"><DVAMarker>not json</DVAMarker></Marker>
+<Markers ObjectID="ml"><L><Marker ObjectRef="mk0"/><Marker ObjectRef="mk1"/><Marker ObjectRef="mk2"/><Marker ObjectRef="mk3"/><Marker ObjectRef="mk4"/><Marker ObjectRef="bad"/></L></Markers>
+</PremiereData>"#
+        );
+        let limits = Limits { nodes: MAX_NODES, items: 10, markers: 25 };
+        let (im, report) = import_limited(doc.as_bytes(), &ImportOptions::default(), limits).unwrap();
+        let seq = im.project.items.values().find_map(|i| i.as_sequence()).unwrap();
+        let clips: Vec<&TrackItem> = seq.video_tracks.iter().flat_map(|t| &t.items).collect();
+        assert_eq!(clips.len(), 10);
+        let markers: usize = clips.iter().map(|c| c.markers.len()).sum();
+        assert_eq!(markers, 25);
+        let count = |needle: &str| report.entries.iter().filter(|e| e.message.contains(needle)).map(|e| e.count).sum::<u32>();
+        assert_eq!(count("more than 10 clip items"), 1, "{report}");
+        assert_eq!(count("more than 25 markers"), 1, "{report}");
+        assert_eq!(count("marker could not be read"), 1, "the shared list is parsed once: {report}");
+        assert_eq!(count("not in the project file"), 0, "{report}");
+        // every marker copy has its own id
+        let mut ids: Vec<u64> = clips.iter().flat_map(|c| c.markers.iter().map(|m| m.id.0)).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 25);
+    }
+
     #[test]
     fn node_cap_is_an_error() {
-        assert!(import_limited(SMALL.as_bytes(), &ImportOptions::default(), MAX_NODES).is_ok());
-        let e = import_limited(SMALL.as_bytes(), &ImportOptions::default(), 5).unwrap_err();
+        assert!(import_limited(SMALL.as_bytes(), &ImportOptions::default(), Limits { nodes: MAX_NODES, items: MAX_ITEMS, markers: MAX_MARKERS }).is_ok());
+        let e = import_limited(SMALL.as_bytes(), &ImportOptions::default(), Limits { nodes: 5, items: MAX_ITEMS, markers: MAX_MARKERS }).unwrap_err();
         assert!(matches!(e, Error::Parse { .. }), "{e:?}");
     }
 

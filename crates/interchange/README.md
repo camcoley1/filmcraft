@@ -37,20 +37,26 @@ checks expected Unicode paths through the public converter, resolver and EDL imp
 root, gzip magic alone is not enough). Mapped: sequences (name, frame rate, frame size, sample
 rate), video and audio tracks (name, lock, sync lock, mute), clip items (timeline start / end and
 source in point in exact ticks, constant speed, a negative speed as reverse), media paths
-(`FilePath`, else `ActualMediaFilePath`, else `RelativePath` against the document's folder),
+(`FilePath`, else `ActualMediaFilePath`, else `RelativePath` against the document's folder; when
+both are given the relative one is kept in the item's metadata and the engine links it if the
+stored path does not open),
 generated media (Black Video, Color Matte, Bars and Tone, Transparent Video, counting leader),
 nested sequences at any depth, sequence and clip markers, linked video / audio, and the bin tree.
 Reported as warnings with counts, not imported: transitions, effects (including the fixed Motion /
 Opacity / Volume settings and keyframes), speed ramps, captions, adjustment layers, titles and
 graphics (Transparent Video in their place), other clip sources (multicam). Export is refused.
 
-Hostile input: at most 512 MiB of decompressed XML, 40 million nodes and 1,000 levels of element
-nesting; a truncated gzip stream or invalid UTF-8 is an error; a reference to a missing object is
-a report entry; nested sequences (64 deep) and bins (64 deep) are walked with seen-sets.
+Hostile input: at most 512 MiB of decompressed XML and 8 million nodes (128 MiB and 2 million on
+wasm32), 1,000 levels of element
+nesting, 200,000 clip items and 200,000 markers (a marker list is parsed once however often it is
+referenced); times, frame rates, frame sizes and sample rates are kept within what a saved project
+reloads with (`Sequence::check_bounds`), else defaults with a report entry; overlapping clips move
+to new unlocked tracks above the native ones; a truncated gzip stream or invalid UTF-8 is an error; a reference to a missing object is
+a report entry; nested sequences (64 deep) are walked with a seen-set, and bins deeper than 64 are flattened into the deepest bin kept.
 
 Open questions for real files: where Premiere stores track names and clip enable state, whether
-source in points count from the file's start timecode (the engine rebases them only when every
-use of the file is at or after it), and the reverse-speed encoding.
+source in points count from the file's start timecode (they are kept as written, and the import
+report names each linked file whose start timecode is not zero), and the reverse-speed encoding.
 
 ## AAF and OMF
 
