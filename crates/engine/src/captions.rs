@@ -82,7 +82,7 @@ fn style_animation(current: CaptionAnimation, p: &Value) -> Result<CaptionAnimat
     let err = |m: String| bad("captions.setStyle", m);
     let mut a = current;
     if let Some(v) = p.get("animation") {
-        let name = v.as_str().unwrap_or_default();
+        let name = v.as_str().ok_or_else(|| err(format!("animation must be a string (none, karaoke, pop or boxed), got {v}")))?;
         let picked = CaptionAnimation::from_name(name).ok_or_else(|| err(format!("unknown animation {v} (none, karaoke, pop or boxed)")))?;
         if picked.name() != a.name() {
             a = picked;
@@ -388,7 +388,9 @@ pub fn commands() -> Vec<CommandSpec> {
                                 o => return Err(bad("captions.setStyle", format!("unknown safeArea `{o}` (top, middle or bottom)"))),
                             };
                             y.anchor = a;
-                            y.margin = vertical_safe_margin(a);
+                            if let Some(m) = vertical_safe_margin(a) {
+                                y.margin = m;
+                            }
                         }
                         None if p.get("safeArea").is_some() => return Err(bad("captions.setStyle", "safeArea must be \"top\", \"middle\" or \"bottom\"")),
                         None => {}

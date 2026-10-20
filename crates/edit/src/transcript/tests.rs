@@ -327,3 +327,29 @@ fn created_captions_carry_the_transcript_word_timings() {
     assert!(caps[0].words.is_empty());
     assert!(caps[1].words_match_text());
 }
+
+#[test]
+fn transcript_words_with_spaces_or_no_text_keep_captions_animated() {
+    // a recogniser token holding two words, and an empty token
+    let word = |text: &str, a: f64, b: f64| SeqWord {
+        text: text.into(),
+        start: s(a),
+        end: s(b),
+        clip: ClipId(1),
+        item: MEDIA,
+        index: 0,
+        track: 0,
+        speaker: None,
+        confidence: 1.0,
+    };
+    let w = vec![word("I", 0.0, 0.2), word("love", 0.2, 0.5), word("New York", 0.5, 1.1), word("", 1.1, 1.2), word("pizza.", 1.2, 1.7)];
+    let b = caption_blocks(&w, &CaptionRules::default(), R);
+    assert_eq!(b.len(), 1, "{b:?}");
+    let mut next = 1000;
+    let mut ctx = EditCtx { next_id: &mut next, media_duration: &media_dur, media_start: &|_| Tick::ZERO, min_duration: R.frame_duration() };
+    let caps = blocks_to_captions(&b, &w, &mut ctx);
+    let c = &caps[0];
+    assert!(c.words_match_text(), "{c:?}");
+    let got: Vec<(&str, Tick, Tick)> = c.words.iter().map(|x| (x.text.as_str(), x.start, x.end())).collect();
+    assert_eq!(got, [("I", s(0.0), s(0.2)), ("love", s(0.2), s(0.5)), ("New", s(0.5), s(0.8)), ("York", s(0.8), s(1.1)), ("pizza.", s(1.2), s(1.7))]);
+}

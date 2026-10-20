@@ -391,6 +391,33 @@ mod tests {
     }
 
     #[test]
+    fn a_word_split_keeps_entities_and_overrides_in_exported_files() {
+        use filmcraft_project::WordTiming;
+        let ms = |v: i64| Tick(v * TICKS_PER_MS);
+        let mut c = Caption {
+            id: ClipId(1),
+            start: ms(0),
+            duration: ms(3000),
+            text: "{\\an8}Fish &amp; <i>chips today</i>".into(),
+            speaker: None,
+            cue_id: None,
+            settings: String::new(),
+            words: [(0, "Fish"), (500, "&"), (1000, "chips"), (2000, "today")].iter().map(|(s, w)| WordTiming::new(ms(*s), ms(400), *w)).collect(),
+        };
+        let (text, words) = c.split_words_at(ms(1500)).unwrap();
+        c.duration = ms(1500);
+        let right = Caption { id: ClipId(2), start: ms(1500), duration: ms(1500), text, words, ..c.clone() };
+        let mut t = CaptionTrack::new(TrackId(1), "S".into(), CaptionFormat::Subtitle);
+        t.captions = vec![c, right];
+        let doc = document_from_track(&t, Tick::ZERO);
+        assert_eq!(
+            vtt::write(&doc),
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.500\n{\\an8}Fish &amp; <i>chips</i>\n\n00:00:01.500 --> 00:00:03.000\n{\\an8}<i>today</i>\n\n"
+        );
+        assert!(srt::write(&doc).contains("{\\an8}<i>today</i>"));
+    }
+
+    #[test]
     fn word_timings_and_animations_do_not_change_caption_files() {
         let animated = animated_track();
         // the same track as it was before word timing existed

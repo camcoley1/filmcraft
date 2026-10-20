@@ -188,12 +188,18 @@ fn set_style_animation_presets_and_safe_area() {
         json!({"track": "C1", "safeArea": "left"}),
         json!({"track": "C1", "safeArea": 3}),
     ] {
-        assert!(s.execute("captions.setStyle", bad.clone()).is_err(), "{bad}");
+        let e = s.execute("captions.setStyle", bad.clone()).unwrap_err().to_string();
+        if bad["animation"].is_number() {
+            assert!(e.contains("animation must be a string"), "{e}");
+        }
         assert_eq!(style(&s), before, "{bad}");
     }
     // 9:16 safe-area presets write the ordinary anchor and margin; explicit values win
     s.execute("captions.setStyle", json!({"track": "C1", "safeArea": "bottom"})).unwrap();
-    assert_eq!((style(&s).anchor, style(&s).margin), (CaptionAnchor::Bottom, filmcraft_project::vertical_safe_margin(CaptionAnchor::Bottom)));
+    assert_eq!((style(&s).anchor, style(&s).margin), (CaptionAnchor::Bottom, 0.22));
+    // the middle preset centres the caption and keeps the margin, so T or B later are unchanged
+    s.execute("captions.setStyle", json!({"track": "C1", "safeArea": "middle"})).unwrap();
+    assert_eq!((style(&s).anchor, style(&s).margin), (CaptionAnchor::Middle, 0.22));
     s.execute("captions.setStyle", json!({"track": "C1", "safeArea": "top", "margin": 0.3})).unwrap();
     assert_eq!((style(&s).anchor, style(&s).margin), (CaptionAnchor::Top, 0.3));
     // back to static; undo restores the animation

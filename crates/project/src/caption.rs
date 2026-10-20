@@ -136,11 +136,13 @@ fn lenient_animation<'de, D: serde::Deserializer<'de>>(d: D) -> Result<CaptionAn
 /// Margin (fraction of the frame height) that keeps a caption anchored at `anchor` clear of the
 /// buttons and text that short-video apps lay over a 9:16 picture. A guide value for the
 /// `captions.setStyle` `safeArea` preset, written into the ordinary `anchor` and `margin` fields.
-pub fn vertical_safe_margin(anchor: CaptionAnchor) -> f32 {
+/// `None` for the middle anchor, which ignores the margin (the preset leaves it unchanged).
+pub fn vertical_safe_margin(anchor: CaptionAnchor) -> Option<f32> {
     match anchor {
-        CaptionAnchor::Top => 0.12,
-        CaptionAnchor::Middle => 0.0,
-        CaptionAnchor::Bottom => 0.22,
+        CaptionAnchor::Top => Some(0.12),
+        // centred captions ignore the margin, so the middle preset leaves it as it is
+        CaptionAnchor::Middle => None,
+        CaptionAnchor::Bottom => Some(0.22),
     }
 }
 
@@ -288,7 +290,9 @@ impl Caption {
     }
     /// Split the caption's words at `t` for a split edit. When the words spell the text and fall
     /// on both sides of `t`, returns the right half's text and words and leaves the left half's
-    /// in `self` (the text is cut at that word boundary, line breaks kept). Otherwise returns `None`
+    /// in `self`. The raw text is cut at that word boundary with its markup kept: line breaks,
+    /// entities, a leading `{\an8}`-style override on both halves, and inline tags open across
+    /// the cut closed on the left and reopened on the right. Otherwise returns `None`
     /// and changes nothing: both halves then keep the whole text and every word, clamped into
     /// each half by the caller.
     pub fn split_words_at(&mut self, t: Tick) -> Option<(String, Vec<WordTiming>)> {
@@ -300,31 +304,20 @@ impl Caption {
         if k == 0 || self.words.iter().skip(k).any(|w| w.start < t) {
             return None;
         }
-        let plain = plain_text(&self.text);
-        let cut = token_offset(&plain, k)?;
-        let (left, right) = (plain.get(..cut)?.trim_end().to_string(), plain.get(cut..)?.trim_start().to_string());
+        let (left, right) = split_raw_at_word(&self.text, k)?;
+        // both halves must still spell their words, or the split falls back to the whole text
+        let (lw, rw) = self.words.split_at(k);
+        let spells = |text: &str, ws: &[WordTiming]| {
+            let tokens = caption_words(text);
+            tokens.len() == ws.len() && tokens.iter().zip(ws).all(|(a, w)| a == w.text.trim())
+        };
+        if !spells(&left, lw) || !spells(&right, rw) {
+            return None;
+        }
         let right_words = self.words.split_off(k);
         self.text = left;
         Some((right, right_words))
     }
-}
-
-/// Byte offset of the start of the `k`-th whitespace-separated token of `s`.
-fn token_offset(s: &str, k: usize) -> Option<usize> {
-    let mut n = 0;
-    let mut in_word = false;
-    for (i, ch) in s.char_indices() {
-        if ch.is_whitespace() {
-            in_word = false;
-        } else if !in_word {
-            in_word = true;
-            if n == k {
-                return Some(i);
-            }
-            n += 1;
-        }
-    }
-    None
 }
 
 /// A caption track (shown in the caption area above the video tracks).
@@ -413,60 +406,143 @@ impl CaptionTrack {
     }
 }
 
-/// Strip `<…>` tags and decode the common HTML/WebVTT entities.
-pub fn plain_text(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '<' => {
-                // a tag runs to the next '>' (if none, keep the '<' literally)
-                let rest: String = chars.clone().collect();
-                if let Some(end) = rest.find('>') {
-                    for _ in 0..rest[..=end].chars().count() {
-                        chars.next();
-                    }
-                } else {
-                    out.push('<');
+/// One piece of raw caption text.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Piece<'a> {
+    /// A character that is drawn (an entity decodes to one).
+    Char(char),
+    /// An inline `<...>` tag; the text between the angle brackets.
+    Tag(&'a str),
+    /// An SSA override block (`{\an8}`) or a carriage return: markup that is not drawn.
+    Hidden,
+}
+
+const ENTITIES: [(&str, char); 8] =
+    [("amp;", '&'), ("lt;", '<'), ("gt;", '>'), ("nbsp;", '\u{a0}'), ("quot;", '"'), ("apos;", '\''), ("lrm;", '\u{200e}'), ("rlm;", '\u{200f}')];
+
+/// Walk raw caption text into pieces with their byte ranges, by the rules of [`plain_text`]: a
+/// `<` up to the next `>` is a tag (with no `>` after it, a literal `<`), `{\` up to the next `}`
+/// is an override block, the common entities decode to one character, `\r` is dropped.
+fn pieces(s: &str) -> Vec<(std::ops::Range<usize>, Piece<'_>)> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    // once no `>` or `}` follows, none follows any later position either (keeps this linear)
+    let (mut no_gt, mut no_brace) = (false, false);
+    while let Some(rest) = s.get(i..) {
+        let Some(c) = rest.chars().next() else { break };
+        let n = c.len_utf8();
+        let (len, piece) = match c {
+            '<' if !no_gt => match rest.find('>') {
+                Some(e) => (e + 1, Piece::Tag(rest.get(1..e).unwrap_or(""))),
+                None => {
+                    no_gt = true;
+                    (n, Piece::Char('<'))
                 }
-            }
-            '{' if chars.peek() == Some(&'\\') => {
-                // SSA-style override blocks some SRT files carry: {\an8}
-                let rest: String = chars.clone().collect();
-                if let Some(end) = rest.find('}') {
-                    for _ in 0..rest[..=end].chars().count() {
-                        chars.next();
-                    }
-                } else {
-                    out.push('{');
+            },
+            '{' if !no_brace && rest.get(1..).is_some_and(|r| r.starts_with('\\')) => match rest.find('}') {
+                Some(e) => (e + 1, Piece::Hidden),
+                None => {
+                    no_brace = true;
+                    (n, Piece::Char('{'))
                 }
-            }
-            '&' => {
-                let rest: String = chars.clone().take(8).collect();
-                let ents = [
-                    ("amp;", '&'),
-                    ("lt;", '<'),
-                    ("gt;", '>'),
-                    ("nbsp;", '\u{a0}'),
-                    ("quot;", '"'),
-                    ("apos;", '\''),
-                    ("lrm;", '\u{200e}'),
-                    ("rlm;", '\u{200f}'),
-                ];
-                if let Some((name, ch)) = ents.iter().find(|(n, _)| rest.starts_with(n)) {
-                    for _ in 0..name.len() {
-                        chars.next();
-                    }
-                    out.push(*ch);
-                } else {
-                    out.push('&');
-                }
-            }
-            '\r' => {}
-            _ => out.push(c),
-        }
+            },
+            '&' => match rest.get(1..).and_then(|r| ENTITIES.iter().find(|(name, _)| r.starts_with(name))) {
+                Some((name, ch)) => (1 + name.len(), Piece::Char(*ch)),
+                None => (n, Piece::Char('&')),
+            },
+            '\r' => (n, Piece::Hidden),
+            _ => (n, Piece::Char(c)),
+        };
+        out.push((i..i + len, piece));
+        i += len;
     }
     out
+}
+
+/// Strip `<…>` tags and decode the common HTML/WebVTT entities.
+pub fn plain_text(s: &str) -> String {
+    pieces(s)
+        .into_iter()
+        .filter_map(|(_, p)| match p {
+            Piece::Char(c) => Some(c),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The name of an inline tag that opens a span (`i`, `b`, `u`, `v`, `c`, `lang`, `ruby`...), from
+/// the text between its angle brackets; `None` for closing tags, timestamps and empty tags.
+fn opening_tag_name(tag: &str) -> Option<&str> {
+    let t = tag.trim();
+    if t.starts_with('/') || t.ends_with('/') || t.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let name = t.split(|c: char| c.is_whitespace() || c == '.').next().unwrap_or("");
+    (!name.is_empty()).then_some(name)
+}
+
+/// Cut raw caption text before its `k`-th word (counted in the drawn text, as [`caption_words`]
+/// does), keeping the markup on both halves: a leading override block (`{\an8}`) starts both, and
+/// an inline tag open across the cut is closed on the left and reopened on the right. `None`
+/// when the cut cannot be placed.
+fn split_raw_at_word(raw: &str, k: usize) -> Option<(String, String)> {
+    let ps = pieces(raw);
+    let mut words = 0usize;
+    let mut in_word = false;
+    // end of the whitespace before the current position, and the tags open there
+    let mut cut = None;
+    let mut open: Vec<(&str, &str)> = Vec::new();
+    let mut open_at_cut: Vec<(&str, &str)> = Vec::new();
+    for (range, p) in &ps {
+        match *p {
+            Piece::Char(c) if c.is_whitespace() => {
+                in_word = false;
+                cut = Some(range.end);
+                open_at_cut.clone_from(&open);
+            }
+            Piece::Char(_) => {
+                if !in_word {
+                    in_word = true;
+                    if words == k {
+                        break;
+                    }
+                    words += 1;
+                }
+            }
+            Piece::Tag(t) => match opening_tag_name(t) {
+                Some(name) => open.push((name, t)),
+                None => {
+                    let closing = t.trim().strip_prefix('/').map(str::trim);
+                    if let Some(name) = closing
+                        && let Some(at) = open.iter().rposition(|(n, _)| *n == name)
+                    {
+                        open.remove(at);
+                    }
+                }
+            },
+            Piece::Hidden => {}
+        }
+    }
+    if words != k || !in_word {
+        return None;
+    }
+    let cut = cut?;
+    let mut left = raw.get(..cut)?.trim_end().to_string();
+    for (name, _) in open_at_cut.iter().rev() {
+        left.push_str(&format!("</{name}>"));
+    }
+    let mut right = String::new();
+    // a leading override block ({\an8}: position) applies to both halves
+    if let Some((range, Piece::Hidden)) = ps.iter().find(|(_, p)| !matches!(p, Piece::Char(c) if c.is_whitespace()))
+        && raw.get(range.clone()).is_some_and(|b| b.starts_with('{'))
+    {
+        right.push_str(raw.get(range.clone())?);
+    }
+    for (_, tag) in &open_at_cut {
+        right.push_str(&format!("<{tag}>"));
+    }
+    right.push_str(raw.get(cut..)?.trim_start());
+    Some((left, right))
 }
 
 #[cfg(test)]
@@ -569,7 +645,7 @@ mod tests {
     fn split_words_cuts_text_at_the_word_boundary() {
         let mut c = timed_caption();
         let (right, words) = c.split_words_at(Tick(55)).unwrap();
-        assert_eq!((c.text.as_str(), right.as_str()), ("Hello big", "world"));
+        assert_eq!((c.text.as_str(), right.as_str()), ("Hello <i>big</i>", "world"), "markup and line break boundaries kept");
         assert_eq!(words.len(), 1);
         assert_eq!(c.words.len(), 2);
         // no word on one side, or no words at all: nothing to split
@@ -579,6 +655,56 @@ mod tests {
         assert_eq!(c, timed_caption());
         c.words.swap(0, 2);
         assert!(c.split_words_at(Tick(55)).is_none(), "words that do not spell the text are not split");
+    }
+
+    /// A caption over 0..100 with `text`, one 10-tick word every 20 ticks.
+    fn spelled(text: &str) -> Caption {
+        let words = caption_words(text).into_iter().enumerate().map(|(i, w)| WordTiming::new(Tick(i as i64 * 20), Tick(10), w)).collect();
+        Caption { text: text.into(), words, ..timed_caption() }
+    }
+
+    /// Split `text` before its `k`-th word: (left text, right text).
+    fn split_text(text: &str, k: usize) -> Option<(String, String)> {
+        let mut c = spelled(text);
+        let (right, words) = c.split_words_at(Tick(k as i64 * 20))?;
+        assert_eq!((c.words.len(), words.len()), (k, caption_words(text).len() - k));
+        Some((c.text, right))
+    }
+
+    #[test]
+    fn split_keeps_markup_on_both_halves() {
+        let pair = |a: &str, b: &str| Some((a.to_string(), b.to_string()));
+        // an inline tag across the cut is closed and reopened
+        assert_eq!(split_text("<i>hello world</i>", 1), pair("<i>hello</i>", "<i>world</i>"));
+        assert_eq!(split_text("<b><i>one two</i> three</b>", 1), pair("<b><i>one</i></b>", "<b><i>two</i> three</b>"));
+        assert_eq!(split_text("<v Bob>Hi there</v>", 1), pair("<v Bob>Hi</v>", "<v Bob>there</v>"));
+        // tags closed before the cut need nothing
+        assert_eq!(split_text("<i>hello</i> world", 1), pair("<i>hello</i>", "world"));
+        // a leading override block positions both halves
+        assert_eq!(split_text("{\\an8}a b", 1), pair("{\\an8}a", "{\\an8}b"));
+        // entities stay encoded
+        assert_eq!(split_text("a &amp; b", 2), pair("a &amp;", "b"));
+        assert_eq!(split_text("x &lt;b&gt; y", 1), pair("x", "&lt;b&gt; y"));
+        // plain text and line breaks behave as before
+        assert_eq!(split_text("one two\nthree four", 2), pair("one two", "three four"));
+        assert_eq!(split_text("one two\nthree four", 3), pair("one two\nthree", "four"));
+        // a tag inside a word is part of that word
+        assert_eq!(split_text("hel<b>lo</b> world", 1), pair("hel<b>lo</b>", "world"));
+        // every result still spells its words
+        for (text, k) in [("<i>hello world</i>", 1), ("{\\an8}a b", 1), ("a &amp; b", 2), ("<u>x\ny</u> z", 1)] {
+            let (l, r) = split_text(text, k).unwrap();
+            let all = caption_words(text);
+            assert_eq!((caption_words(&l), caption_words(&r)), (all[..k].to_vec(), all[k..].to_vec()), "{text}");
+        }
+    }
+
+    #[test]
+    fn plain_text_walker_is_linear_on_unclosed_markup() {
+        // many `<` and `{\` with nothing closing them: each is a literal character
+        let s = "<{\\".repeat(50_000);
+        let t = std::time::Instant::now();
+        assert_eq!(plain_text(&s).chars().count(), 150_000);
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
     }
 
     #[test]

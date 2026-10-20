@@ -10,7 +10,8 @@
 //! - trims keep the words where they are in sequence time and clamp them into the new range
 //!   (a word left outside becomes zero-length at that edge; words are never dropped, because the
 //!   text still shows them);
-//! - Set In/Out (`set_caption_times`) moves the words by the change of the in point, then clamps;
+//! - Set In/Out (`set_caption_times`) is a move when both edges change by the same amount (the
+//!   words move with it); otherwise it is a trim (words keep their sequence times, then clamp);
 //! - a split divides the word list at the split time: the words starting before it stay left,
 //!   the rest go right, and the text is cut at that word boundary. When the words do not fall
 //!   on both sides (or there are none), both halves keep the text and all words, clamped;
@@ -172,8 +173,14 @@ pub fn set_caption_times(seq: &mut Sequence, id: ClipId, start: Tick, end: Tick,
         return Err(EditError::Other("captions would overlap".into()));
     }
     let c = tr.caption_mut(id).ok_or(EditError::NoItem(id))?;
-    c.shift(start - c.start);
-    c.duration = end - start;
+    if end - start == c.duration {
+        // both edges moved by the same amount: a move
+        c.shift(start - c.start);
+    } else {
+        // a trim of one or both edges: words stay with the audio
+        c.start = start;
+        c.duration = end - start;
+    }
     c.clamp_words();
     tr.sort();
     Ok(())
@@ -513,15 +520,24 @@ mod tests {
     }
 
     #[test]
-    fn set_times_moves_words_with_the_in_point_then_clamps() {
+    fn set_times_moves_words_only_on_a_pure_move() {
         let (mut seq, _) = timed();
         let n = &mut 1;
-        // same length, later: a pure move
+        // same length, later: a pure move, the words move with it
         set_caption_times(&mut seq, ClipId(1000), Tick(1000), Tick(1100), &ctx(n)).unwrap();
         assert_eq!(words(&seq, ClipId(1000)), [w(1000, 1015, "one"), w(1020, 1035, "two"), w(1050, 1065, "three"), w(1070, 1085, "four")]);
-        // shorter: words follow the in point and the tail is clamped
-        set_caption_times(&mut seq, ClipId(1000), Tick(500), Tick(560), &ctx(n)).unwrap();
-        assert_eq!(words(&seq, ClipId(1000)), [w(500, 515, "one"), w(520, 535, "two"), w(550, 560, "three"), w(560, 560, "four")]);
+        // only the in point changes: like Trim In, the words keep their times and clamp
+        set_caption_times(&mut seq, ClipId(1000), Tick(1025), Tick(1100), &ctx(n)).unwrap();
+        assert_eq!(words(&seq, ClipId(1000)), [w(1025, 1025, "one"), w(1025, 1035, "two"), w(1050, 1065, "three"), w(1070, 1085, "four")]);
+        // both edges change by different amounts: also a trim
+        set_caption_times(&mut seq, ClipId(1000), Tick(1030), Tick(1060), &ctx(n)).unwrap();
+        assert_eq!(words(&seq, ClipId(1000)), [w(1030, 1030, "one"), w(1030, 1035, "two"), w(1050, 1060, "three"), w(1060, 1060, "four")]);
+        // the same as trimming the same edges
+        let (mut by_trim, _) = timed();
+        trim_caption(&mut by_trim, ClipId(1000), Edge::In, Tick(25), &ctx(n)).unwrap();
+        let (mut by_times, _) = timed();
+        set_caption_times(&mut by_times, ClipId(1000), Tick(25), Tick(100), &ctx(n)).unwrap();
+        assert_eq!(words(&by_trim, ClipId(1000)), words(&by_times, ClipId(1000)));
     }
 
     #[test]

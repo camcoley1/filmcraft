@@ -742,7 +742,7 @@ fn animation_rows(
         (CaptionAnchor::Middle, "middle", tl!("Safe middle")),
         (CaptionAnchor::Bottom, "bottom", tl!("Safe bottom")),
     ] {
-        let on = st.anchor == a && (st.margin - vertical_safe_margin(a)).abs() < 1e-4;
+        let on = st.anchor == a && vertical_safe_margin(a).is_none_or(|m| (st.margin - m).abs() < 1e-4);
         let resp = ui.selectable_label(on, label);
         register(app, ui, format!("text.captions.style.safeArea.{name}"), &resp, name);
         if resp.clicked() {

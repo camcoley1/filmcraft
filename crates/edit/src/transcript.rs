@@ -407,6 +407,29 @@ pub fn caption_blocks(words: &[SeqWord], rules: &CaptionRules, rate: FrameRate) 
     out
 }
 
+/// The caption word timings of one transcript word: one per whitespace-separated token (a
+/// recogniser token such as "New York" becomes two words sharing its time evenly), none for an
+/// empty token. This keeps the timings in step with the caption text, which shows every token.
+fn word_timings(w: &SeqWord) -> Vec<WordTiming> {
+    let tokens: Vec<&str> = w.text.split_whitespace().collect();
+    let Ok(n) = i64::try_from(tokens.len()) else { return Vec::new() };
+    if n == 0 {
+        return Vec::new();
+    }
+    let total = (w.end - w.start).max(Tick::ZERO);
+    let each = Tick(total.0 / n);
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let start = w.start + Tick(each.0.saturating_mul(i as i64));
+            // the last token takes the remainder so the word keeps its end
+            let duration = if i + 1 == tokens.len() { w.start + total - start } else { each };
+            WordTiming::new(start, duration, *t)
+        })
+        .collect()
+}
+
 /// Caption blocks as captions (ids from `ctx`). `words` are the words the blocks were made from
 /// (as passed to [`caption_blocks`]): each caption gets its words' timings for animated burn-in,
 /// clamped into the caption (blocks are frame-snapped). A block whose word range does not fit
@@ -424,7 +447,7 @@ pub fn blocks_to_captions(blocks: &[CaptionBlock], words: &[SeqWord], ctx: &mut 
                 speaker: b.speaker.clone(),
                 cue_id: None,
                 settings: String::new(),
-                words: timed.iter().map(|w| WordTiming::new(w.start, (w.end - w.start).max(Tick::ZERO), w.text.trim())).collect(),
+                words: timed.iter().flat_map(word_timings).collect(),
             };
             c.reconcile_words();
             c.clamp_words();

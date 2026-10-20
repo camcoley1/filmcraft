@@ -96,7 +96,8 @@ same way in the Program monitor and in export:
 | `pop` | the word being spoken is drawn larger around its centre and baseline | `popScale` (1.25) |
 | `boxed` | a filled box behind the word being spoken | `boxColor`, `boxPad` (10 px at 1080 lines) |
 
-Captions without word timings (typed, imported from files) always draw statically. Animations are
+A transcript token that holds several words (a recogniser may return "New York" as one token)
+becomes one timing per word, sharing its time evenly; empty tokens are skipped. Captions without word timings (typed, imported from files) always draw statically. Animations are
 burn-in only: SRT, WebVTT and the other caption files are written exactly as before, without word
 timing.
 
@@ -104,14 +105,21 @@ How word timings follow edits:
 
 - moving a caption (move, ripple delete, insert or extract after it) moves its words;
 - trimming keeps the words where they are and clamps them into the caption (a word outside it
-  becomes zero-length at that edge; words are never dropped while the text still shows them);
-- setting in/out moves the words by the change of the in point, then clamps them;
+  becomes zero-length at that edge; words are never dropped while the text still shows them).
+  A zero-length word is lit by karaoke from the moment the playhead reaches it, but word pop and
+  boxed never treat it as the word being spoken, so it is drawn plainly;
+- setting in/out is a move when both edges change by the same amount (the words move with it),
+  otherwise it acts like a trim (the words keep their times and are clamped);
 - splitting gives each half the words that start on its side and cuts the text at that word
-  boundary, keeping line breaks but dropping inline markup (if all words start on one side, both
-  halves keep the whole text and all words);
+  boundary with its markup kept: line breaks and entities stay, a leading `{\an8}`-style override
+  starts both halves, and an inline tag open across the cut is closed on the left and reopened on
+  the right (if all words start on one side, or the cut cannot be placed, both halves keep the
+  whole text and all words);
 - merging joins the word lists; editing the text keeps the words only while they still spell it
   word for word (line breaks and markup may change), otherwise they are cleared.
 
 `safeArea` sets the ordinary `anchor` and `margin` to keep a caption on a 9:16 picture clear of the
-buttons that short-video apps draw over it (top 0.12, middle centred, bottom 0.22 of the frame
-height); `anchor` or `margin` given in the same call win.
+buttons that short-video apps draw over it (top 0.12, bottom 0.22 of the frame height; middle
+centres the caption and leaves the margin as it is); `anchor` or `margin` given in the same call
+win. The presets clear the top and bottom app chrome only: lines still use the full 90 percent of
+the frame width.
