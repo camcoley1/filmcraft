@@ -48,9 +48,10 @@ graphics (Transparent Video in their place), other clip sources (multicam). Expo
 
 Hostile input: at most 512 MiB of decompressed XML and 8 million nodes (128 MiB and 2 million on
 wasm32), 1,000 levels of element
-nesting, 200,000 clip items, 200,000 markers and 16 MiB of marker text (a marker list is parsed
-once however often it is referenced, each marker object in it once, and no new list once the budget
-is spent; a list cut short is reported); times, frame rates, frame sizes and sample rates are kept within what a saved project
+nesting, 200,000 clip items, 200,000 markers and 16 MiB of marker text (counted separately for
+what the parsed-marker cache keeps and what is copied to the timeline), and 64 MiB of marker JSON
+parsed, rejected markers included (each marker object is parsed once per import and shared by
+every list that names it; a list cut short is reported); times, frame rates, frame sizes and sample rates are kept within what a saved project
 reloads with (`Sequence::check_bounds`), else defaults with a report entry; overlapping clips move
 to new unlocked tracks above the native ones; a truncated gzip stream or invalid UTF-8 is an error; a reference to a missing object is
 a report entry; nested sequences (64 deep) are walked with a seen-set, and bins deeper than 64 are flattened into the deepest bin kept.

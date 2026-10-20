@@ -31,6 +31,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
+use std::rc::Rc;
 
 use filmcraft_media::{Generator, MediaKind};
 use filmcraft_project::{BinId, ClipId, ItemId, Label, Marker, MarkerId, MarkerKind, Sequence, TrackItem, TrackKind, checked_par, validate_frame_size};
@@ -71,6 +72,11 @@ const MAX_MARKERS: usize = 200_000;
 /// Most marker text (names and comments) one import creates: a huge comment referenced many times
 /// must not multiply into the project.
 const MAX_MARKER_BYTES: usize = 16 * 1024 * 1024;
+/// Most marker JSON (`<DVAMarker>` text) one import parses, rejected markers included: the work
+/// bound when many lists name a few huge markers.
+const MAX_MARKER_JSON: usize = 64 * 1024 * 1024;
+/// Most marker objects whose outcome is remembered (each is parsed once).
+const MAX_MARKER_MEMO: usize = 1_000_000;
 /// Distinct report entries before the rest are summarised in one line.
 const MAX_REPORT_ENTRIES: usize = 500;
 /// Largest tick value accepted: the project's own bound ([`Tick::MAX`]), so whatever is imported
@@ -222,13 +228,37 @@ struct Limits {
     items: usize,
     markers: usize,
     marker_bytes: usize,
+    marker_json: usize,
+    marker_memo: usize,
 }
 
 impl Limits {
-    const DEFAULT: Limits = Limits { nodes: MAX_NODES, items: MAX_ITEMS, markers: MAX_MARKERS, marker_bytes: MAX_MARKER_BYTES };
+    const DEFAULT: Limits = Limits {
+        nodes: MAX_NODES,
+        items: MAX_ITEMS,
+        markers: MAX_MARKERS,
+        marker_bytes: MAX_MARKER_BYTES,
+        marker_json: MAX_MARKER_JSON,
+        marker_memo: MAX_MARKER_MEMO,
+    };
+}
+
+/// Work done by one import, for the tests of its budgets.
+#[cfg_attr(not(test), allow(dead_code))]
+struct Stats {
+    /// `DVAMarker` blobs handed to the JSON parser.
+    parse_attempts: usize,
+    /// Marker text held by the parsed-marker cache.
+    cached_bytes: usize,
+    /// Marker text copied out to the timeline.
+    marker_bytes: usize,
 }
 
 fn import_limited(bytes: &[u8], opts: &ImportOptions, limits: Limits) -> Result<(Imported, Report)> {
+    import_stats(bytes, opts, limits).map(|(im, report, _)| (im, report))
+}
+
+fn import_stats(bytes: &[u8], opts: &ImportOptions, limits: Limits) -> Result<(Imported, Report, Stats)> {
     let text = decode(bytes, MAX_DECOMPRESSED)?;
     check_depth(text.as_bytes(), MAX_XML_DEPTH)?;
     let po = roxmltree::ParsingOptions { allow_dtd: false, nodes_limit: limits.nodes, ..Default::default() };
@@ -266,6 +296,10 @@ fn import_limited(bytes: &[u8], opts: &ImportOptions, limits: Limits) -> Result<
         marker_bytes: 0,
         cached_markers: 0,
         cached_bytes: 0,
+        marker_memo: HashMap::new(),
+        json_used: 0,
+        json_spent: false,
+        parse_attempts: 0,
         warned: HashSet::new(),
         track_effects: false,
     };
@@ -285,12 +319,24 @@ fn import_limited(bytes: &[u8], opts: &ImportOptions, limits: Limits) -> Result<
         top = order;
     }
     top.dedup();
+    let stats = Stats { parse_attempts: imp.parse_attempts, cached_bytes: imp.cached_bytes, marker_bytes: imp.marker_bytes };
     let Imp { mut b, .. } = imp;
     if b.p.items.is_empty() {
         return Err(Error::Empty);
     }
     b.top = top;
-    Ok((b.finish(), report))
+    Ok((b.finish(), report, stats))
+}
+
+/// What reading one `Marker` object gave (remembered per object, so it is parsed once).
+#[derive(Clone)]
+enum MarkerOutcome {
+    /// The marker (shared, not copied, by every list naming it) and whether its duration was bad.
+    Parsed(Rc<Marker>, bool),
+    /// Read, but bigger than the marker text left in the budget: dropped, its text not kept.
+    TooBig,
+    NoData,
+    Unreadable,
 }
 
 /// One sequence's picture and sound settings, for the clips read into it.
@@ -316,7 +362,7 @@ struct Imp<'a, 'i, 'r> {
     /// Sequences used as clips inside other sequences.
     nested: HashSet<ItemId>,
     /// Parsed marker lists, so a list referenced many times is read once.
-    marker_lists: HashMap<NodeId, std::rc::Rc<Vec<Marker>>>,
+    marker_lists: HashMap<NodeId, Rc<Vec<Rc<Marker>>>>,
     limits: Limits,
     items_made: usize,
     markers_made: usize,
@@ -325,6 +371,12 @@ struct Imp<'a, 'i, 'r> {
     /// Markers and text bytes held in the parsed-list cache (charged against the same limits).
     cached_markers: usize,
     cached_bytes: usize,
+    /// What each marker object came to, so none is parsed twice (bounded by `limits.marker_memo`).
+    marker_memo: HashMap<NodeId, MarkerOutcome>,
+    /// Marker JSON parsed so far, rejected markers included; once over `limits.marker_json`, no more.
+    json_used: usize,
+    json_spent: bool,
+    parse_attempts: usize,
     /// Messages already in the report (bounds the report's own linear merge).
     warned: HashSet<String>,
     /// Track-level effects were seen (reported once).
@@ -1028,7 +1080,7 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
             let cached = match self.marker_lists.get(&list.id()) {
                 Some(c) => c.clone(),
                 None => {
-                    let parsed = std::rc::Rc::new(self.parse_marker_list(list));
+                    let parsed = Rc::new(self.parse_marker_list(list));
                     self.marker_lists.insert(list.id(), parsed.clone());
                     parsed
                 }
@@ -1042,7 +1094,7 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                 }
                 self.markers_made += 1;
                 self.marker_bytes += bytes;
-                let mut c = m.clone();
+                let mut c = Marker::clone(m);
                 c.id = MarkerId(self.b.alloc());
                 out.push(c);
             }
@@ -1062,20 +1114,18 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         ));
     }
 
-    /// The markers of one `Markers` list object, read once (ids are given when copied out). What
-    /// the cache keeps is charged against the marker limits too, so it reads no more than is left
-    /// of either the cache's or the output's share: nothing once one is spent, a marker that does
-    /// not fit is dropped (not kept), and each marker object is read once however often the list
-    /// names it.
-    fn parse_marker_list(&mut self, list: Node<'a, 'i>) -> Vec<Marker> {
+    /// The markers of one `Markers` list object, read once (ids are given when copied out). The
+    /// list holds shared markers: a marker object is parsed once per import, however many lists
+    /// name it, and its text is charged to the cache once. A list holds no more entries than is
+    /// left of the count limits; a marker whose text does not fit what is left of the text limits
+    /// is dropped (and remembered as such); marker JSON beyond `limits.marker_json` is not parsed.
+    fn parse_marker_list(&mut self, list: Node<'a, 'i>) -> Vec<Rc<Marker>> {
         let room = self.limits.markers.saturating_sub(self.markers_made).min(self.limits.markers.saturating_sub(self.cached_markers));
-        let byte_room = self.limits.marker_bytes.saturating_sub(self.marker_bytes).min(self.limits.marker_bytes.saturating_sub(self.cached_bytes));
         let mut out = Vec::new();
-        if room == 0 || byte_room == 0 {
+        if room == 0 {
             self.marker_budget_warning();
             return out;
         }
-        let mut bytes = 0usize;
         let mut cut = false;
         let mut targets = HashSet::new();
         // walked lazily: a list with more entries than there is room for is not collected first
@@ -1089,36 +1139,65 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
             if !targets.insert(mk.id()) {
                 continue;
             }
-            let Some(json) = child_text(mk, "DVAMarker") else {
-                self.warn("a marker without marker data (<DVAMarker>) was skipped");
-                continue;
-            };
-            match marker_from_json(json) {
-                Some((mut m, bad_duration)) => {
-                    let size = m.name.len().saturating_add(m.comment.len());
-                    if bytes.saturating_add(size) > byte_room {
+            let outcome = match self.marker_memo.get(&mk.id()) {
+                Some(o) => o.clone(),
+                None => {
+                    let Some(o) = self.read_marker(mk) else {
+                        // the JSON budget is spent: nothing more is parsed
                         cut = true;
-                        continue;
+                        break;
+                    };
+                    if self.marker_memo.len() < self.limits.marker_memo {
+                        self.marker_memo.insert(mk.id(), o.clone());
                     }
-                    if m.start < Tick::ZERO {
-                        self.warn("a marker before the start was moved to the start");
-                        m.start = Tick::ZERO;
-                    }
+                    o
+                }
+            };
+            match outcome {
+                MarkerOutcome::Parsed(m, bad_duration) => {
                     if bad_duration {
                         self.warn("a marker duration could not be read or was negative; the marker was given no duration");
                     }
-                    bytes += size;
                     out.push(m);
                 }
-                None => self.warn("a marker could not be read and was skipped"),
+                MarkerOutcome::TooBig => cut = true,
+                MarkerOutcome::NoData => self.warn("a marker without marker data (<DVAMarker>) was skipped"),
+                MarkerOutcome::Unreadable => self.warn("a marker could not be read and was skipped"),
             }
         }
         self.cached_markers = self.cached_markers.saturating_add(out.len());
-        self.cached_bytes = self.cached_bytes.saturating_add(bytes);
         if cut {
             self.marker_budget_warning();
         }
         out
+    }
+
+    /// Parse one `Marker` object, charging its JSON to the parse budget first (so a marker that
+    /// is then rejected still counts) and its kept text to the cache. `None` once the JSON budget
+    /// is spent.
+    fn read_marker(&mut self, mk: Node<'a, 'i>) -> Option<MarkerOutcome> {
+        let Some(json) = child_text(mk, "DVAMarker") else { return Some(MarkerOutcome::NoData) };
+        if self.json_spent || self.json_used.saturating_add(json.len()) > self.limits.marker_json {
+            if !self.json_spent {
+                self.json_spent = true;
+                self.warn(format!("marker data beyond {} MiB was not read; the remaining markers were left out", self.limits.marker_json / (1024 * 1024)));
+            }
+            return None;
+        }
+        self.json_used += json.len();
+        self.parse_attempts += 1;
+        let Some((mut m, bad_duration)) = marker_from_json(json) else { return Some(MarkerOutcome::Unreadable) };
+        let size = m.name.len().saturating_add(m.comment.len());
+        let byte_room = self.limits.marker_bytes.saturating_sub(self.marker_bytes).min(self.limits.marker_bytes.saturating_sub(self.cached_bytes));
+        if size > byte_room {
+            return Some(MarkerOutcome::TooBig);
+        }
+        if m.start < Tick::ZERO {
+            self.warn("a marker before the start was moved to the start");
+            m.start = Tick::ZERO;
+        }
+        self.cached_bytes = self.cached_bytes.saturating_add(size);
+        Some(MarkerOutcome::Parsed(Rc::new(m), bad_duration))
     }
 }
 
@@ -1455,31 +1534,98 @@ mod tests {
         assert!(report.mentions("not in the project file"), "{report}");
     }
 
-    /// Thirty lists, each naming one 1,000-byte comment (and then a marker that is not in the
-    /// file), owned by thirty clips, under a 10,000-byte budget: no more than ten lists are read
-    /// (the cache's share), no more than 10,000 bytes reach the timeline, and the report says so.
+    /// Thirty lists, each naming one 1,000-byte comment, owned by thirty clips, under a
+    /// 10,000-byte budget: the comment is parsed once and kept once (the lists share it), no more
+    /// than 10,000 bytes reach the timeline, and the report says so.
     #[test]
     fn the_byte_budget_bounds_what_is_cached_and_copied() {
         let comment = "c".repeat(1_000);
         let mut objects = marker_obj("big", 0, &comment);
         let lists: Vec<String> = (0..30).map(|i| format!("L{i}")).collect();
         for l in &lists {
-            objects.push_str(&list_obj(l, &["big".to_string(), "dangling".to_string()]));
+            objects.push_str(&list_obj(l, &["big".to_string()]));
         }
         let names: Vec<&str> = lists.iter().map(String::as_str).collect();
         let doc = marker_doc(30, &names, &objects);
         let limits = Limits { marker_bytes: 10_000, ..Limits::DEFAULT };
-        let (im, report) = import_limited(doc.as_bytes(), &ImportOptions::default(), limits).unwrap();
+        let (im, report, stats) = import_stats(doc.as_bytes(), &ImportOptions::default(), limits).unwrap();
         let text: usize = all_markers(&im).iter().map(|m| m.comment.len()).sum();
         assert!(text <= 10_000, "{text} bytes reached the timeline");
-        let parsed: u32 = report.entries.iter().filter(|e| e.message.contains("not in the project file")).map(|e| e.count).sum();
-        assert!(parsed <= 10, "{parsed} lists were read and cached: {report}");
+        assert_eq!(text, stats.marker_bytes);
+        assert_eq!(stats.parse_attempts, 1, "one marker object, parsed once");
+        assert_eq!(stats.cached_bytes, 1_000, "and kept once");
         assert!(report.mentions("cut short"), "{report}");
-        // a marker bigger than the whole budget is dropped, not kept
-        let doc = marker_doc(1, &["L0"], &(marker_obj("big", 0, &comment) + &list_obj("L0", &["big".to_string()])));
-        let (im, report) = import_limited(doc.as_bytes(), &ImportOptions::default(), Limits { marker_bytes: 999, ..Limits::DEFAULT }).unwrap();
+    }
+
+    /// Fifty distinct lists naming one marker bigger than the whole text budget: it is parsed
+    /// once, kept nowhere, copied nowhere, and the report says the lists were cut.
+    #[test]
+    fn an_oversized_marker_named_by_many_lists_is_parsed_once() {
+        let comment = "c".repeat(5_000);
+        let mut objects = marker_obj("huge", 0, &comment);
+        let lists: Vec<String> = (0..50).map(|i| format!("L{i}")).collect();
+        for l in &lists {
+            objects.push_str(&list_obj(l, &["huge".to_string()]));
+        }
+        let names: Vec<&str> = lists.iter().map(String::as_str).collect();
+        let doc = marker_doc(50, &names, &objects);
+        let limits = Limits { marker_bytes: 4_000, ..Limits::DEFAULT };
+        let (im, report, stats) = import_stats(doc.as_bytes(), &ImportOptions::default(), limits).unwrap();
+        assert!(stats.parse_attempts <= 1, "{} parses", stats.parse_attempts);
+        assert_eq!(stats.cached_bytes, 0);
+        assert_eq!(stats.marker_bytes, 0);
         assert!(all_markers(&im).is_empty());
         assert!(report.mentions("cut short"), "{report}");
+    }
+
+    /// The JSON parse budget counts every blob handed to the parser, rejected ones included, and
+    /// stops parsing (with one report entry) once spent.
+    #[test]
+    fn the_marker_json_budget_stops_parsing() {
+        let ids: Vec<String> = (0..20).map(|i| format!("m{i}")).collect();
+        // ten unreadable blobs first (each counts), then ten good ones
+        let mut objects = String::new();
+        for (i, id) in ids.iter().enumerate() {
+            if i < 10 {
+                objects.push_str(&format!(r#"<Marker ObjectID="{id}"><DVAMarker>{{"not": "a marker", "pad": "{}"}}</DVAMarker></Marker>"#, "p".repeat(80)));
+            } else {
+                objects.push_str(&marker_obj(id, i as i64, "x"));
+            }
+        }
+        objects.push_str(&list_obj("L", &ids));
+        let doc = marker_doc(1, &["L"], &objects);
+        let limits = Limits { marker_json: 1_000, ..Limits::DEFAULT };
+        let (im, report, stats) = import_stats(doc.as_bytes(), &ImportOptions::default(), limits).unwrap();
+        assert!(stats.parse_attempts < 20, "{} parses", stats.parse_attempts);
+        assert!(stats.parse_attempts >= 9, "the rejected blobs counted: {}", stats.parse_attempts);
+        assert!(all_markers(&im).is_empty(), "the budget went on the rejected blobs");
+        let e = report.entries.iter().find(|e| e.message.contains("marker data beyond")).unwrap_or_else(|| panic!("{report}"));
+        assert_eq!(e.count, 1);
+    }
+
+    /// The cache and the timeline are charged separately: the cache once per marker object it
+    /// keeps, the timeline once per copy. List A (one 1,000-byte marker) is owned by three clips:
+    /// kept once (1,000 bytes cached), copied twice before the 2,500-byte timeline share is spent
+    /// (2,000 bytes). List B's 600-byte marker still fits the cache's share (1,500 left) but not
+    /// the timeline's (500 left), so it is dropped rather than kept where it can never be used.
+    #[test]
+    fn cache_accounting_is_independent_of_output() {
+        let objects = marker_obj("a", 0, &"a".repeat(1_000))
+            + &marker_obj("b", 0, &"b".repeat(600))
+            + &list_obj("A", &["a".to_string()])
+            + &list_obj("B", &["b".to_string()]);
+        // clips 0, 1, 2 own list A; clip 3 owns list B
+        let doc = marker_doc(4, &["A", "A", "A", "B"], &objects);
+        let limits = Limits { marker_bytes: 2_500, ..Limits::DEFAULT };
+        let (im, report, stats) = import_stats(doc.as_bytes(), &ImportOptions::default(), limits).unwrap();
+        assert_eq!(stats.cached_bytes, 1_000, "A is kept once, however many clips own it");
+        assert_eq!(stats.marker_bytes, 2_000, "two copies of A fit the timeline's share");
+        assert_eq!(stats.parse_attempts, 2, "a and b were each parsed once");
+        let markers = all_markers(&im);
+        assert_eq!(markers.len(), 2);
+        assert!(markers.iter().all(|m| m.comment.starts_with('a')));
+        let cut: u32 = report.entries.iter().filter(|e| e.message.contains("cut short")).map(|e| e.count).sum();
+        assert_eq!(cut, 2, "the third copy of A and list B: {report}");
     }
 
     #[test]
