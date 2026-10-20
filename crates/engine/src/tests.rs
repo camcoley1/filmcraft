@@ -836,19 +836,87 @@ fn import_gzipped_premiere_project_relinks_by_relative_path() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A Broadcast WAV (16-bit stereo, 48 kHz, `samples` frames of silence) whose `bext`
+/// TimeReference is `time_reference` samples: a file with a start timecode, made without ffmpeg.
+fn bwf(samples: u32, time_reference: u64) -> Vec<u8> {
+    let data_len = samples * 4;
+    let mut bext = vec![0u8; 602];
+    bext[338..346].copy_from_slice(&time_reference.to_le_bytes());
+    let mut w = Vec::new();
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&(4 + (8 + 16) + (8 + bext.len() as u32) + (8 + data_len)).to_le_bytes());
+    w.extend_from_slice(b"WAVEfmt ");
+    w.extend_from_slice(&16u32.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    w.extend_from_slice(&2u16.to_le_bytes()); // channels
+    w.extend_from_slice(&48_000u32.to_le_bytes());
+    w.extend_from_slice(&(48_000u32 * 4).to_le_bytes());
+    w.extend_from_slice(&4u16.to_le_bytes());
+    w.extend_from_slice(&16u16.to_le_bytes());
+    w.extend_from_slice(b"bext");
+    w.extend_from_slice(&(bext.len() as u32).to_le_bytes());
+    w.extend_from_slice(&bext);
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&data_len.to_le_bytes());
+    w.resize(w.len() + data_len as usize, 0);
+    w
+}
+
 /// Premiere Pro in points are never shifted by a file's start timecode (the format notes don't
-/// say they count from it); the import report names each such file instead.
+/// say they count from it): a real import links a Broadcast WAV that starts at one hour, the
+/// clip's source in point stays as the project wrote it, and the report names the file.
 #[test]
 fn premiere_in_points_are_not_rebased_but_timecoded_files_are_reported() {
+    let dir = std::env::temp_dir().join(format!("fc-prproj-tc-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let wav_path = dir.join("bwf.wav").to_string_lossy().to_string();
+    std::fs::write(&wav_path, bwf(96_000, 48_000 * 3600)).unwrap();
+    // 0.5 s into the source, half a second long
+    let in_point: i64 = 127_008_000_000;
+    let doc = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+<PremiereData Version="3">
+	<Project ObjectRef="1"/>
+	<Project ObjectID="1" Version="43"/>
+	<Sequence ObjectUID="seq"><TrackGroups>
+		<TrackGroup Index="0"><Second ObjectRef="10"/></TrackGroup>
+		<TrackGroup Index="1"><Second ObjectRef="11"/></TrackGroup>
+	</TrackGroups><Name>TC</Name></Sequence>
+	<VideoTrackGroup ObjectID="10"><TrackGroup><FrameRate>10160640000</FrameRate></TrackGroup><FrameRect>0,0,1920,1080</FrameRect></VideoTrackGroup>
+	<AudioTrackGroup ObjectID="11"><TrackGroup><Tracks><Track Index="0" ObjectURef="a1"/></Tracks><FrameRate>5292000</FrameRate></TrackGroup></AudioTrackGroup>
+	<AudioClipTrack ObjectUID="a1"><ClipTrack><ClipItems><TrackItems><TrackItem Index="0" ObjectRef="20"/></TrackItems></ClipItems></ClipTrack></AudioClipTrack>
+	<AudioClipTrackItem ObjectID="20"><ClipTrackItem><TrackItem><Start>0</Start><End>127008000000</End></TrackItem><SubClip ObjectRef="30"/></ClipTrackItem></AudioClipTrackItem>
+	<SubClip ObjectID="30"><Clip ObjectRef="40"/><Name>bwf.wav</Name></SubClip>
+	<AudioClip ObjectID="40"><Clip><Source ObjectRef="50"/><InPoint>{in_point}</InPoint></Clip></AudioClip>
+	<AudioMediaSource ObjectID="50"><MediaSource><Media ObjectURef="m"/></MediaSource></AudioMediaSource>
+	<Media ObjectUID="m"><FilePath>{wav_path}</FilePath><Title>bwf.wav</Title></Media>
+</PremiereData>
+"#
+    );
+    let path = dir.join("tc.prproj").to_string_lossy().to_string();
+    std::fs::write(&path, doc).unwrap();
+    let mut s = demo();
+    let r = s.execute("file.import", json!({"paths": [path]})).unwrap();
+    let doc_report = &r["documents"][0];
+    assert_eq!(doc_report["linkedMedia"], 1, "{r}");
+    let q = s.active_sequence().unwrap();
+    let clip = q.audio_tracks[0].items[0].clone();
+    // the linked file really carries a non-zero start timecode
+    let tc = s.project.item(clip.item).and_then(|i| i.as_media()).and_then(|m| m.info.start_timecode);
+    assert!(tc.is_some_and(|t| t != 0), "the fixture has a start timecode: {tc:?}");
+    assert_eq!(clip.source_in, Tick(in_point), "the in point is not shifted by the timecode");
+    let lines: Vec<&str> = doc_report["report"].as_array().unwrap().iter().filter_map(|e| e.as_str()).collect();
+    assert!(lines.iter().any(|l| l.contains(&wav_path) && l.contains("timecode") && l.contains("not shifted")), "{r}");
+
+    // the message helper itself: only Premiere projects, only a non-zero timecode
     use crate::interchange::prproj_timecode_note;
     use filmcraft_interchange::Format;
-    let note = prproj_timecode_note(Format::Prproj, "/m/a.mov", Some(90_000)).unwrap();
-    assert!(note.contains("/m/a.mov") && note.contains("90000") && note.contains("not shifted"), "{note}");
     assert_eq!(prproj_timecode_note(Format::Prproj, "/m/a.mov", Some(0)), None);
     assert_eq!(prproj_timecode_note(Format::Prproj, "/m/a.mov", None), None);
     for f in [Format::Edl, Format::Fcp7Xml, Format::Otio, Format::Aaf] {
         assert_eq!(prproj_timecode_note(f, "/m/a.mov", Some(90_000)), None);
     }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `file.exportInterchange {format: "<unknown>"}` used to write FCP7 XML without a word.

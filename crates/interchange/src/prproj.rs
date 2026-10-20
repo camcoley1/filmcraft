@@ -68,6 +68,9 @@ const MAX_TRACKS: usize = 256;
 const MAX_ITEMS: usize = 200_000;
 /// Most markers one import creates.
 const MAX_MARKERS: usize = 200_000;
+/// Most marker text (names and comments) one import creates: a huge comment referenced many times
+/// must not multiply into the project.
+const MAX_MARKER_BYTES: usize = 16 * 1024 * 1024;
 /// Distinct report entries before the rest are summarised in one line.
 const MAX_REPORT_ENTRIES: usize = 500;
 /// Largest tick value accepted: the project's own bound ([`Tick::MAX`]), so whatever is imported
@@ -209,7 +212,7 @@ fn check_depth(b: &[u8], max: usize) -> Result<()> {
 
 /// Import a `.prproj` document (plain or gzip).
 pub(crate) fn import(bytes: &[u8], opts: &ImportOptions) -> Result<(Imported, Report)> {
-    import_limited(bytes, opts, Limits { nodes: MAX_NODES, items: MAX_ITEMS, markers: MAX_MARKERS })
+    import_limited(bytes, opts, Limits::DEFAULT)
 }
 
 /// Work budget of one import.
@@ -218,6 +221,11 @@ struct Limits {
     nodes: u32,
     items: usize,
     markers: usize,
+    marker_bytes: usize,
+}
+
+impl Limits {
+    const DEFAULT: Limits = Limits { nodes: MAX_NODES, items: MAX_ITEMS, markers: MAX_MARKERS, marker_bytes: MAX_MARKER_BYTES };
 }
 
 fn import_limited(bytes: &[u8], opts: &ImportOptions, limits: Limits) -> Result<(Imported, Report)> {
@@ -255,6 +263,7 @@ fn import_limited(bytes: &[u8], opts: &ImportOptions, limits: Limits) -> Result<
         limits,
         items_made: 0,
         markers_made: 0,
+        marker_bytes: 0,
         warned: HashSet::new(),
         track_effects: false,
     };
@@ -305,10 +314,12 @@ struct Imp<'a, 'i, 'r> {
     /// Sequences used as clips inside other sequences.
     nested: HashSet<ItemId>,
     /// Parsed marker lists, so a list referenced many times is read once.
-    marker_lists: HashMap<NodeId, Vec<Marker>>,
+    marker_lists: HashMap<NodeId, std::rc::Rc<Vec<Marker>>>,
     limits: Limits,
     items_made: usize,
     markers_made: usize,
+    /// Bytes of marker text (names and comments) created.
+    marker_bytes: usize,
     /// Messages already in the report (bounds the report's own linear merge).
     warned: HashSet<String>,
     /// Track-level effects were seen (reported once).
@@ -991,59 +1002,91 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
     // Markers, links, bins
     // -----------------------------------------------------------------------------------------
 
-    /// Markers of an object: every `<Markers>` reference inside its element, each a list of
-    /// `<Marker>` objects carrying a `DVAMarker` JSON blob.
+    /// Markers of an object: every `<Markers>` reference inside its element (or a `<Markers>`
+    /// list written inline), each a list of `<Marker>` objects carrying a `DVAMarker` JSON blob.
+    /// Every marker copied out counts against the import's marker budget (count and text bytes).
     fn markers_of(&mut self, owner: Node<'a, 'i>) -> Vec<Marker> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
-        let refs: Vec<Node<'a, 'i>> = owner.descendants().filter(|d| d.has_tag_name("Markers") && is_ref(*d)).collect();
-        for r in refs {
-            let Some(list) = self.follow(Some(r), "marker list") else { continue };
+        let lists: Vec<Node<'a, 'i>> = owner.descendants().filter(|d| d.has_tag_name("Markers")).collect();
+        for r in lists {
+            // an inline list holds its markers; anything else must be a reference (follow reports it)
+            let list = if !is_ref(r) && elements(r).next().is_some() { Some(r) } else { self.follow(Some(r), "marker list") };
+            let Some(list) = list else { continue };
             if !seen.insert(list.id()) {
                 continue;
             }
-            if !self.marker_lists.contains_key(&list.id()) {
-                let parsed = self.parse_marker_list(list);
-                self.marker_lists.insert(list.id(), parsed);
-            }
-            let Some(cached) = self.marker_lists.get(&list.id()) else { continue };
-            let room = self.limits.markers.saturating_sub(self.markers_made);
-            let take = cached.len().min(room);
-            let mut copied: Vec<Marker> = cached.iter().take(take).cloned().collect();
-            for m in &mut copied {
-                m.id = MarkerId(self.b.alloc());
-            }
-            self.markers_made = self.markers_made.saturating_add(copied.len());
-            out.extend(copied);
-            if take < self.marker_lists.get(&list.id()).map_or(0, Vec::len) && self.markers_made == self.limits.markers {
+            let cached = match self.marker_lists.get(&list.id()) {
+                Some(c) => c.clone(),
+                None => {
+                    let parsed = std::rc::Rc::new(self.parse_marker_list(list));
+                    self.marker_lists.insert(list.id(), parsed.clone());
+                    parsed
+                }
+            };
+            let mut cut = false;
+            for m in cached.iter() {
+                let bytes = m.name.len().saturating_add(m.comment.len());
+                if self.markers_made >= self.limits.markers || self.marker_bytes.saturating_add(bytes) > self.limits.marker_bytes {
+                    cut = true;
+                    break;
+                }
                 self.markers_made += 1;
-                self.warn(format!("the project has more than {} markers; the rest were left out", self.limits.markers));
+                self.marker_bytes += bytes;
+                let mut c = m.clone();
+                c.id = MarkerId(self.b.alloc());
+                out.push(c);
+            }
+            if cut {
+                self.marker_budget_warning();
             }
         }
         out.sort_by_key(|m| m.start);
         out
     }
 
-    /// The markers of one `Markers` list object, read once (ids are given when copied out).
+    fn marker_budget_warning(&mut self) {
+        self.warn(format!(
+            "a marker list was cut short: one import reads at most {} markers and {} MiB of marker text",
+            self.limits.markers,
+            self.limits.marker_bytes / (1024 * 1024)
+        ));
+    }
+
+    /// The markers of one `Markers` list object, read once (ids are given when copied out). Reads
+    /// no more than is left of the marker budget, and each marker object once however often the
+    /// list names it.
     fn parse_marker_list(&mut self, list: Node<'a, 'i>) -> Vec<Marker> {
+        let room = self.limits.markers.saturating_sub(self.markers_made);
+        let byte_room = self.limits.marker_bytes.saturating_sub(self.marker_bytes);
         let mut out = Vec::new();
+        let mut bytes = 0usize;
+        let mut targets = HashSet::new();
         let entries: Vec<Node<'a, 'i>> = list.descendants().filter(|d| d.has_tag_name("Marker")).collect();
         for e in entries {
-            if out.len() >= self.limits.markers {
+            if out.len() >= room || bytes > byte_room {
+                self.marker_budget_warning();
                 break;
             }
             let mk = if is_ref(e) { self.follow(Some(e), "marker") } else { Some(e) };
             let Some(mk) = mk else { continue };
+            if !targets.insert(mk.id()) {
+                continue;
+            }
             let Some(json) = child_text(mk, "DVAMarker") else {
                 self.warn("a marker without marker data (<DVAMarker>) was skipped");
                 continue;
             };
             match marker_from_json(json) {
-                Some(mut m) => {
+                Some((mut m, bad_duration)) => {
                     if m.start < Tick::ZERO {
                         self.warn("a marker before the start was moved to the start");
                         m.start = Tick::ZERO;
                     }
+                    if bad_duration {
+                        self.warn("a marker duration could not be read or was negative; the marker was given no duration");
+                    }
+                    bytes = bytes.saturating_add(m.name.len()).saturating_add(m.comment.len());
                     out.push(m);
                 }
                 None => self.warn("a marker could not be read and was skipped"),
@@ -1053,12 +1096,16 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
     }
 }
 
-/// A marker from a `DVAMarker` JSON blob (id 0: the caller gives it one).
-fn marker_from_json(json: &str) -> Option<Marker> {
+/// A marker from a `DVAMarker` JSON blob (id 0: the caller gives it one), and whether a duration
+/// was there but unreadable or negative (it becomes zero).
+fn marker_from_json(json: &str) -> Option<(Marker, bool)> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     let m = v.get("DVAMarker").unwrap_or(&v);
     let start = json_ticks(m.get("mStartTime"))?;
-    let duration = json_ticks(m.get("mDuration")).unwrap_or(0).max(0);
+    let given = m.get("mDuration");
+    let read = json_ticks(given);
+    let bad_duration = given.is_some() && read.is_none_or(|d| d < 0);
+    let duration = read.unwrap_or(0).max(0);
     let text = |k: &str| m.get(k).and_then(|s| s.as_str()).unwrap_or("").to_string();
     let kind = match m.get("mType").and_then(|t| t.as_str()).unwrap_or("") {
         "Chapter" => MarkerKind::Chapter,
@@ -1067,7 +1114,9 @@ fn marker_from_json(json: &str) -> Option<Marker> {
         "FlashCuePoint" | "FlashCue" => MarkerKind::FlashCue,
         _ => MarkerKind::Comment,
     };
-    Some(Marker { id: MarkerId(0), start: Tick(start), duration: Tick(duration), name: text("mName"), comment: text("mComment"), kind, color: Label::Green })
+    let marker =
+        Marker { id: MarkerId(0), start: Tick(start), duration: Tick(duration), name: text("mName"), comment: text("mComment"), kind, color: Label::Green };
+    Some((marker, bad_duration))
 }
 
 impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
@@ -1130,7 +1179,14 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                 }
                 "VideoSequenceSource" | "AudioSequenceSource" => {
                     let s = child(src, "SequenceSource").and_then(|q| child(q, "Sequence"));
-                    self.follow(s, "nested sequence clip").filter(|s| s.has_tag_name("Sequence")).and_then(|s| self.sequence(s, 0))
+                    match self.follow(s, "nested sequence clip") {
+                        Some(t) if t.has_tag_name("Sequence") => self.sequence(t, 0),
+                        Some(_) => {
+                            self.warn("a nested sequence clip points at something that is not a sequence; it was skipped");
+                            None
+                        }
+                        None => None,
+                    }
                 }
                 other => {
                     self.warn(format!("Project panel clips with a {other} source are not supported and were not imported"));
@@ -1260,7 +1316,7 @@ mod tests {
 <Markers ObjectID="ml"><L><Marker ObjectRef="mk0"/><Marker ObjectRef="mk1"/><Marker ObjectRef="mk2"/><Marker ObjectRef="mk3"/><Marker ObjectRef="mk4"/><Marker ObjectRef="bad"/></L></Markers>
 </PremiereData>"#
         );
-        let limits = Limits { nodes: MAX_NODES, items: 10, markers: 25 };
+        let limits = Limits { items: 10, markers: 25, ..Limits::DEFAULT };
         let (im, report) = import_limited(doc.as_bytes(), &ImportOptions::default(), limits).unwrap();
         let seq = im.project.items.values().find_map(|i| i.as_sequence()).unwrap();
         let clips: Vec<&TrackItem> = seq.video_tracks.iter().flat_map(|t| &t.items).collect();
@@ -1269,7 +1325,7 @@ mod tests {
         assert_eq!(markers, 25);
         let count = |needle: &str| report.entries.iter().filter(|e| e.message.contains(needle)).map(|e| e.count).sum::<u32>();
         assert_eq!(count("more than 10 clip items"), 1, "{report}");
-        assert_eq!(count("more than 25 markers"), 1, "{report}");
+        assert!(count("marker list was cut short") >= 1, "{report}");
         assert_eq!(count("marker could not be read"), 1, "the shared list is parsed once: {report}");
         assert_eq!(count("not in the project file"), 0, "{report}");
         // every marker copy has its own id
@@ -1279,10 +1335,104 @@ mod tests {
         assert_eq!(ids.len(), 25);
     }
 
+    /// A sequence of `clips` one-second clips one after another; clip `i` owns the marker list
+    /// `lists[i % lists.len()]` (an object id). `objects` are added at the top level.
+    fn marker_doc(clips: usize, lists: &[&str], objects: &str) -> String {
+        let refs: String = (0..clips).map(|i| format!(r#"<TrackItem Index="{i}" ObjectRef="ti{i}"/>"#)).collect();
+        let items: String = (0..clips)
+            .map(|i| {
+                let list = lists.get(i % lists.len().max(1)).copied().unwrap_or("none");
+                format!(
+                    r#"<VideoClipTrackItem ObjectID="ti{i}"><ClipTrackItem><TrackItem><Start>{}</Start><End>{}</End></TrackItem><O><Markers ObjectRef="{list}"/></O></ClipTrackItem></VideoClipTrackItem>"#,
+                    i as i64 * TICKS_PER_SECOND,
+                    (i as i64 + 1) * TICKS_PER_SECOND
+                )
+            })
+            .collect();
+        format!(
+            r#"<?xml version="1.0"?><PremiereData Version="3"><Project ObjectID="1" Version="43"/>
+<Sequence ObjectUID="s"><TrackGroups><TrackGroup Index="0"><Second ObjectRef="g"/></TrackGroup></TrackGroups><Name>S</Name></Sequence>
+<VideoTrackGroup ObjectID="g"><TrackGroup><Tracks><Track Index="0" ObjectURef="t"/></Tracks><FrameRate>10160640000</FrameRate></TrackGroup></VideoTrackGroup>
+<VideoClipTrack ObjectUID="t"><ClipTrack><ClipItems><TrackItems>{refs}</TrackItems></ClipItems></ClipTrack></VideoClipTrack>
+{items}{objects}</PremiereData>"#
+        )
+    }
+
+    fn marker_obj(id: &str, ticks: i64, comment: &str) -> String {
+        format!(r#"<Marker ObjectID="{id}"><DVAMarker>{{"DVAMarker":{{"mStartTime":{{"ticks":{ticks}}},"mComment":"{comment}"}}}}</DVAMarker></Marker>"#)
+    }
+
+    fn list_obj(id: &str, markers: &[String]) -> String {
+        let refs: String = markers.iter().map(|m| format!(r#"<Marker ObjectRef="{m}"/>"#)).collect();
+        format!(r#"<Markers ObjectID="{id}"><L>{refs}</L></Markers>"#)
+    }
+
+    fn all_markers(im: &Imported) -> Vec<Marker> {
+        im.project
+            .items
+            .values()
+            .filter_map(|i| i.as_sequence())
+            .flat_map(|q| q.all_tracks().flat_map(|t| t.items.iter().flat_map(|c| c.markers.clone())))
+            .collect()
+    }
+
+    /// One list holding one marker more than the budget: it is cut, and the report says so. A list
+    /// of exactly the budget is not.
+    #[test]
+    fn a_marker_list_over_the_budget_is_cut_and_reported() {
+        let ids: Vec<String> = (0..6).map(|i| format!("m{i}")).collect();
+        let objects: String = ids.iter().enumerate().map(|(i, id)| marker_obj(id, i as i64, "x")).collect::<String>() + &list_obj("L", &ids);
+        let doc = marker_doc(1, &["L"], &objects);
+        let limits = Limits { markers: 5, ..Limits::DEFAULT };
+        let (im, report) = import_limited(doc.as_bytes(), &ImportOptions::default(), limits).unwrap();
+        assert_eq!(all_markers(&im).len(), 5);
+        assert!(report.mentions("cut short"), "{report}");
+        let limits = Limits { markers: 6, ..Limits::DEFAULT };
+        let (im, report) = import_limited(doc.as_bytes(), &ImportOptions::default(), limits).unwrap();
+        assert_eq!(all_markers(&im).len(), 6);
+        assert!(!report.mentions("cut short"), "{report}");
+    }
+
+    /// A long comment named 1,000 times in one list, owned by 50 clips: the list keeps it once,
+    /// and the text budget stops the copies.
+    #[test]
+    fn repeated_huge_markers_are_deduplicated_and_byte_capped() {
+        let comment = "c".repeat(1_000);
+        let refs: Vec<String> = (0..1_000).map(|_| "big".to_string()).collect();
+        let objects = marker_obj("big", 0, &comment) + &list_obj("L", &refs);
+        let doc = marker_doc(50, &["L"], &objects);
+        let limits = Limits { marker_bytes: 10_000, ..Limits::DEFAULT };
+        let (im, report) = import_limited(doc.as_bytes(), &ImportOptions::default(), limits).unwrap();
+        let markers = all_markers(&im);
+        assert_eq!(markers.len(), 10, "ten 1,000-byte comments fit in 10,000 bytes");
+        let text: usize = markers.iter().map(|m| m.comment.len()).sum();
+        assert!(text <= 10_000);
+        assert!(report.mentions("cut short"), "{report}");
+    }
+
+    /// Once the budget is spent, further lists are not parsed at all (a list with a dangling
+    /// marker reference would otherwise report it).
+    #[test]
+    fn no_marker_list_is_parsed_once_the_budget_is_spent() {
+        let first: Vec<String> = (0..3).map(|i| format!("m{i}")).collect();
+        let objects: String = first.iter().enumerate().map(|(i, id)| marker_obj(id, i as i64, "")).collect::<String>()
+            + &list_obj("A", &first)
+            + &list_obj("B", &["dangling".to_string()]);
+        let doc = marker_doc(2, &["A", "B"], &objects);
+        let limits = Limits { markers: 3, ..Limits::DEFAULT };
+        let (im, report) = import_limited(doc.as_bytes(), &ImportOptions::default(), limits).unwrap();
+        assert_eq!(all_markers(&im).len(), 3);
+        assert!(!report.mentions("not in the project file"), "list B was parsed: {report}");
+        assert!(report.mentions("cut short"), "{report}");
+        // with room, list B is parsed and its dangling reference reported
+        let (_, report) = import_limited(doc.as_bytes(), &ImportOptions::default(), Limits::DEFAULT).unwrap();
+        assert!(report.mentions("not in the project file"), "{report}");
+    }
+
     #[test]
     fn node_cap_is_an_error() {
-        assert!(import_limited(SMALL.as_bytes(), &ImportOptions::default(), Limits { nodes: MAX_NODES, items: MAX_ITEMS, markers: MAX_MARKERS }).is_ok());
-        let e = import_limited(SMALL.as_bytes(), &ImportOptions::default(), Limits { nodes: 5, items: MAX_ITEMS, markers: MAX_MARKERS }).unwrap_err();
+        assert!(import_limited(SMALL.as_bytes(), &ImportOptions::default(), Limits::DEFAULT).is_ok());
+        let e = import_limited(SMALL.as_bytes(), &ImportOptions::default(), Limits { nodes: 5, ..Limits::DEFAULT }).unwrap_err();
         assert!(matches!(e, Error::Parse { .. }), "{e:?}");
     }
 

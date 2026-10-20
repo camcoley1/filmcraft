@@ -1030,3 +1030,25 @@ fn a_bin_that_contains_itself_is_reported() {
     valid(&im).unwrap();
     assert_eq!(im.project.root.children.iter().filter(|c| matches!(c, filmcraft_project::BinEntry::Bin(_))).count(), 1);
 }
+
+#[test]
+fn bad_marker_durations_empty_marker_lists_and_wrong_master_sources_are_reported() {
+    // a malformed and a negative duration: the markers stay, with no duration, and it is said
+    for bad in [r#""mDuration":{"ticks":"x"}"#, r#""mDuration":{"ticks":-5}"#] {
+        let doc = FULL.replace(r#""mDuration":{"ticks":25401600000}"#, bad);
+        let (im, report) = import(doc.as_bytes()).unwrap();
+        assert!(report.mentions("marker duration"), "{bad}: {report}");
+        let (_, main) = seq_named(&im, "Main");
+        assert_eq!(main.markers.len(), 2);
+        assert_eq!(main.markers[1].duration, Tick(0));
+    }
+    // an empty <Markers/> (no reference, no markers) is reported, not skipped silently
+    let doc = FULL.replace(r#"<Markers ObjectRef="901"/>"#, "<Markers/>");
+    let (_, report) = import(doc.as_bytes()).unwrap();
+    assert!(report.mentions("marker list has no object reference"), "{report}");
+    // a Project panel master clip whose sequence source points at a non-sequence
+    let doc = FULL.replace(r#"<Sequence ObjectURef="seq-main"/>"#, r#"<Sequence ObjectURef="media-a"/>"#);
+    let (_, report) = import(doc.as_bytes()).unwrap();
+    let e = report.entries.iter().find(|e| e.message.contains("not a sequence")).unwrap_or_else(|| panic!("{report}"));
+    assert_eq!(e.count, 1, "{report}");
+}
