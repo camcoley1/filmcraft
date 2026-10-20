@@ -249,7 +249,16 @@ mod tests {
     use filmcraft_project::{CaptionFormat, ClipId, TrackId};
 
     fn cap(text: &str) -> Caption {
-        Caption { id: ClipId(1), start: Tick(0), duration: Tick(100), text: text.into(), speaker: None, cue_id: None, settings: String::new() }
+        Caption {
+            id: ClipId(1),
+            start: Tick(0),
+            duration: Tick(100),
+            text: text.into(),
+            speaker: None,
+            cue_id: None,
+            settings: String::new(),
+            words: Vec::new(),
+        }
     }
 
     #[test]

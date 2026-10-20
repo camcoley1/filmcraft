@@ -131,6 +131,38 @@ pub struct Caption {
     /// WebVTT cue settings (`line:90% align:start`…), kept verbatim.
     #[serde(default)]
     pub settings: String,
+    /// Per-word timing for animated burn-in (karaoke, word pop, boxed word), in sequence ticks.
+    /// Empty for captions typed by hand or imported from files; filled by Create Captions from
+    /// the transcript. The words always spell the caption's text (see [`Caption::words_match_text`]);
+    /// edits keep them inside the caption (see the `filmcraft-edit` caption functions).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<WordTiming>,
+}
+
+/// One timed word of a caption.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WordTiming {
+    /// Sequence time the word is spoken (same time base as the caption).
+    pub start: Tick,
+    pub duration: Tick,
+    /// The word as shown (one whitespace-free token of the caption text).
+    pub text: String,
+}
+
+impl WordTiming {
+    pub fn new(start: Tick, duration: Tick, text: impl Into<String>) -> Self {
+        Self { start, duration, text: text.into() }
+    }
+    /// End time; a negative duration (corrupt file) counts as zero.
+    pub fn end(&self) -> Tick {
+        self.start + self.duration.max(Tick::ZERO)
+    }
+}
+
+/// The whitespace-separated words of caption text as drawn (markup removed). Burn-in wraps lines
+/// only at spaces, so these are also the words of the laid-out lines, in order.
+pub fn caption_words(text: &str) -> Vec<String> {
+    plain_text(text).split_whitespace().map(str::to_string).collect()
 }
 
 impl Caption {
@@ -144,6 +176,77 @@ impl Caption {
     pub fn plain_lines(&self) -> Vec<String> {
         plain_text(&self.text).lines().map(str::to_string).collect()
     }
+    /// True when `words` is non-empty and spells the text word for word (renderers animate only
+    /// then; anything else draws the caption statically).
+    pub fn words_match_text(&self) -> bool {
+        !self.words.is_empty() && {
+            let tokens = caption_words(&self.text);
+            tokens.len() == self.words.len() && tokens.iter().zip(&self.words).all(|(a, w)| a == w.text.trim())
+        }
+    }
+    /// Clear `words` when they no longer spell the text (after a text edit or a merge).
+    pub fn reconcile_words(&mut self) {
+        if !self.words.is_empty() && !self.words_match_text() {
+            self.words.clear();
+        }
+    }
+    /// Move the caption by `d`; its words move with it.
+    pub fn shift(&mut self, d: Tick) {
+        self.start += d;
+        for w in &mut self.words {
+            w.start += d;
+        }
+    }
+    /// Clip every word into `[start, end]`. Words are never dropped (the text still shows them):
+    /// a word left outside the caption becomes zero-length at the nearest edge.
+    pub fn clamp_words(&mut self) {
+        let (a, b) = (self.start, self.end().max(self.start));
+        for w in &mut self.words {
+            let s = w.start.clamp(a, b);
+            let e = w.end().clamp(a, b).max(s);
+            w.start = s;
+            w.duration = e - s;
+        }
+    }
+    /// Split the caption's words at `t` for a split edit. When the words spell the text and fall
+    /// on both sides of `t`, returns the right half's text and words and leaves the left half's
+    /// in `self` (the text is cut at that word boundary, line breaks kept). Otherwise returns `None`
+    /// and changes nothing: both halves then keep the whole text and every word, clamped into
+    /// each half by the caller.
+    pub fn split_words_at(&mut self, t: Tick) -> Option<(String, Vec<WordTiming>)> {
+        if !self.words_match_text() {
+            return None;
+        }
+        // words are in text order; a corrupt, unsorted list is not split
+        let k = self.words.iter().position(|w| w.start >= t)?;
+        if k == 0 || self.words.iter().skip(k).any(|w| w.start < t) {
+            return None;
+        }
+        let plain = plain_text(&self.text);
+        let cut = token_offset(&plain, k)?;
+        let (left, right) = (plain.get(..cut)?.trim_end().to_string(), plain.get(cut..)?.trim_start().to_string());
+        let right_words = self.words.split_off(k);
+        self.text = left;
+        Some((right, right_words))
+    }
+}
+
+/// Byte offset of the start of the `k`-th whitespace-separated token of `s`.
+fn token_offset(s: &str, k: usize) -> Option<usize> {
+    let mut n = 0;
+    let mut in_word = false;
+    for (i, ch) in s.char_indices() {
+        if ch.is_whitespace() {
+            in_word = false;
+        } else if !in_word {
+            in_word = true;
+            if n == k {
+                return Some(i);
+            }
+            n += 1;
+        }
+    }
+    None
 }
 
 /// A caption track (shown in the caption area above the video tracks).
@@ -312,6 +415,7 @@ mod tests {
                 speaker: None,
                 cue_id: None,
                 settings: String::new(),
+                words: Vec::new(),
             });
         }
         assert_eq!(t.caption_at(Tick(120)).unwrap().text, "c1");
@@ -319,6 +423,80 @@ mod tests {
         assert!(t.check().is_ok());
         assert_eq!(CaptionFormat::from_name("cea608"), Some(CaptionFormat::Cea608));
         assert_eq!(CaptionFormat::from_name("CEA-708"), Some(CaptionFormat::Cea708));
+    }
+
+    fn timed_caption() -> Caption {
+        Caption {
+            id: ClipId(1),
+            start: Tick(0),
+            duration: Tick(100),
+            text: "Hello <i>big</i>\nworld".into(),
+            speaker: None,
+            cue_id: None,
+            settings: String::new(),
+            words: vec![WordTiming::new(Tick(0), Tick(20), "Hello"), WordTiming::new(Tick(30), Tick(20), "big"), WordTiming::new(Tick(60), Tick(30), "world")],
+        }
+    }
+
+    #[test]
+    fn captions_without_words_load_and_save_as_before() {
+        // a caption saved before word timing existed
+        let old = r#"{"id":1,"start":0,"duration":100,"text":"Hi","speaker":null,"cue_id":null,"settings":""}"#;
+        let c: Caption = serde_json::from_str(old).unwrap();
+        assert!(c.words.is_empty());
+        // and it saves byte for byte as before (no `words` key)
+        assert_eq!(serde_json::to_string(&c).unwrap(), old);
+        // a style saved before animations existed loads with the defaults for the new fields
+        let st: CaptionStyle = serde_json::from_str(r#"{"font":"Inter","size":40.0}"#).unwrap();
+        assert_eq!(st, CaptionStyle { size: 40.0, ..Default::default() });
+    }
+
+    #[test]
+    fn words_round_trip_and_match_the_text() {
+        let c = timed_caption();
+        let back: Caption = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back, c);
+        assert!(c.words_match_text());
+        assert_eq!(caption_words(&c.text), ["Hello", "big", "world"]);
+        let mut d = c.clone();
+        d.text = "Hello big".into();
+        assert!(!d.words_match_text());
+        d.reconcile_words();
+        assert!(d.words.is_empty());
+        let mut e = c.clone();
+        e.text = "Hello\nbig   world".into();
+        e.reconcile_words();
+        assert_eq!(e.words.len(), 3);
+    }
+
+    #[test]
+    fn split_words_cuts_text_at_the_word_boundary() {
+        let mut c = timed_caption();
+        let (right, words) = c.split_words_at(Tick(55)).unwrap();
+        assert_eq!((c.text.as_str(), right.as_str()), ("Hello big", "world"));
+        assert_eq!(words.len(), 1);
+        assert_eq!(c.words.len(), 2);
+        // no word on one side, or no words at all: nothing to split
+        let mut c = timed_caption();
+        assert!(c.split_words_at(Tick(0)).is_none());
+        assert!(c.split_words_at(Tick(95)).is_none());
+        assert_eq!(c, timed_caption());
+        c.words.swap(0, 2);
+        assert!(c.split_words_at(Tick(55)).is_none(), "words that do not spell the text are not split");
+    }
+
+    #[test]
+    fn clamp_and_shift_never_overflow() {
+        let mut c = timed_caption();
+        c.words.push(WordTiming::new(Tick(i64::MAX), Tick(i64::MAX), "x"));
+        c.words.push(WordTiming::new(Tick(i64::MIN), Tick(-7), "y"));
+        let r = std::panic::catch_unwind(move || {
+            c.shift(Tick(i64::MAX));
+            c.shift(Tick(i64::MIN));
+            c.clamp_words();
+            c.words.iter().all(|w| w.duration >= Tick::ZERO && w.start >= c.start && w.end() <= c.end())
+        });
+        assert_eq!(r.ok(), Some(true));
     }
 
     #[test]
@@ -333,6 +511,7 @@ mod tests {
                 speaker: None,
                 cue_id: None,
                 settings: String::new(),
+                words: Vec::new(),
             });
         }
         let result = std::panic::catch_unwind(|| track.check());

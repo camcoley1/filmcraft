@@ -430,7 +430,7 @@ pub fn simplify_sequence(proj: &filmcraft_project::Project, q: &mut Sequence, o:
             }
             for t in &mut q.caption_tracks {
                 for c in t.captions.iter_mut().filter(|c| c.start >= g.end()) {
-                    c.start -= g.duration;
+                    c.shift(Tick::ZERO - g.duration);
                 }
             }
             crate::sequence_tools::ripple_markers(&mut q.markers, g.end(), Tick::ZERO - g.duration);

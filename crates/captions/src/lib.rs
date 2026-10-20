@@ -329,6 +329,7 @@ pub fn track_from_document(doc: &Document, id: TrackId, name: &str, format: Capt
             speaker: c.speaker.clone(),
             cue_id: c.id.clone(),
             settings: c.settings.clone(),
+            words: Vec::new(),
         })
         .collect();
     t.sort();

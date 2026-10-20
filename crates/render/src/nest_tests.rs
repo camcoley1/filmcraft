@@ -219,6 +219,7 @@ fn captions_inside_a_nest_are_part_of_its_picture() {
         speaker: None,
         cue_id: None,
         settings: String::new(),
+        words: Vec::new(),
     });
     r.p.sequence_mut(inner).unwrap().caption_tracks.push(track);
     let outer = r.seq("outer", 640, 360, FrameRate::FPS_24);
@@ -254,6 +255,7 @@ fn captions_inside_a_nest_are_part_of_its_picture() {
         speaker: None,
         cue_id: None,
         settings: String::new(),
+        words: Vec::new(),
     });
     r.p.sequence_mut(outer).unwrap().caption_tracks.push(outer_track);
     assert!(worst(&r.frame(outer, t), &with) < 0.01, "outer captions are only drawn when asked for");

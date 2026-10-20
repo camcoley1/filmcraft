@@ -419,6 +419,7 @@ pub fn blocks_to_captions(blocks: &[CaptionBlock], ctx: &mut EditCtx) -> Vec<Cap
             speaker: b.speaker.clone(),
             cue_id: None,
             settings: String::new(),
+            words: Vec::new(),
         })
         .collect()
 }
