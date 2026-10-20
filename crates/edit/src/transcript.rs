@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use filmcraft_project::{Caption, ClipId, ItemId, Sequence, TrackId, Transcript};
+use filmcraft_project::{Caption, ClipId, ItemId, Sequence, TrackId, Transcript, WordTiming};
 use filmcraft_time::{FrameRate, TICKS_PER_SECOND, Tick, TimeRange};
 
 use crate::EditCtx;
@@ -407,19 +407,28 @@ pub fn caption_blocks(words: &[SeqWord], rules: &CaptionRules, rate: FrameRate) 
     out
 }
 
-/// Caption blocks as captions (ids from `ctx`).
-pub fn blocks_to_captions(blocks: &[CaptionBlock], ctx: &mut EditCtx) -> Vec<Caption> {
+/// Caption blocks as captions (ids from `ctx`). `words` are the words the blocks were made from
+/// (as passed to [`caption_blocks`]): each caption gets its words' timings for animated burn-in,
+/// clamped into the caption (blocks are frame-snapped). A block whose word range does not fit
+/// `words`, or whose words do not spell its text, gets no timings and renders statically.
+pub fn blocks_to_captions(blocks: &[CaptionBlock], words: &[SeqWord], ctx: &mut EditCtx) -> Vec<Caption> {
     blocks
         .iter()
-        .map(|b| Caption {
-            id: ClipId(ctx.alloc()),
-            start: b.start,
-            duration: b.end - b.start,
-            text: b.text.clone(),
-            speaker: b.speaker.clone(),
-            cue_id: None,
-            settings: String::new(),
-            words: Vec::new(),
+        .map(|b| {
+            let timed = words.get(b.words.clone()).unwrap_or(&[]);
+            let mut c = Caption {
+                id: ClipId(ctx.alloc()),
+                start: b.start,
+                duration: b.end - b.start,
+                text: b.text.clone(),
+                speaker: b.speaker.clone(),
+                cue_id: None,
+                settings: String::new(),
+                words: timed.iter().map(|w| WordTiming::new(w.start, (w.end - w.start).max(Tick::ZERO), w.text.trim())).collect(),
+            };
+            c.reconcile_words();
+            c.clamp_words();
+            c
         })
         .collect()
 }

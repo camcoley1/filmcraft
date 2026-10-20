@@ -296,3 +296,34 @@ fn captions_never_overlap_with_dense_words() {
     let b = caption_blocks(&words, &rules, R);
     check_blocks(&b, &rules);
 }
+
+#[test]
+fn created_captions_carry_the_transcript_word_timings() {
+    let w = sequence_words(&whole(), &transcripts());
+    let rules = CaptionRules::default();
+    let b = caption_blocks(&w, &rules, R);
+    let mut next = 1000;
+    let mut ctx = EditCtx { next_id: &mut next, media_duration: &media_dur, media_start: &|_| Tick::ZERO, min_duration: R.frame_duration() };
+    let caps = blocks_to_captions(&b, &w, &mut ctx);
+    assert_eq!(caps.len(), b.len());
+    // every caption is word-timed, its words spell its text and lie inside it
+    for (c, blk) in caps.iter().zip(&b) {
+        assert!(c.words_match_text(), "{c:?}");
+        assert_eq!(c.words.len(), blk.words.len());
+        assert!(c.words.iter().all(|x| x.start >= c.start && x.end() <= c.end()), "{c:?}");
+        // words keep their transcript times except where frame snapping clipped the caption
+        for (x, sw) in c.words.iter().zip(&w[blk.words.clone()]) {
+            assert_eq!(x.text, sw.text);
+            assert_eq!(x.start, sw.start.clamp(c.start, c.end()));
+            assert_eq!(x.end(), sw.end.clamp(c.start, c.end()));
+        }
+    }
+    let all: Vec<&str> = caps.iter().flat_map(|c| c.words.iter().map(|x| x.text.as_str())).collect();
+    assert_eq!(all, w.iter().map(|x| x.text.as_str()).collect::<Vec<_>>(), "every word once, in order");
+    // a word range that does not fit the words (stale blocks) gives no timings, never a panic
+    let mut stale = b.clone();
+    stale[0].words = 5..999;
+    let caps = blocks_to_captions(&stale, &w, &mut ctx);
+    assert!(caps[0].words.is_empty());
+    assert!(caps[1].words_match_text());
+}

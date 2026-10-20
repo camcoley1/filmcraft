@@ -126,6 +126,18 @@ fn remove_fillers_pauses_and_create_captions() {
     assert_eq!(tr.captions[0].text, "Hello world.");
     assert_eq!(tr.captions[1].speaker.as_deref(), Some("Speaker 2"));
     q.check().unwrap();
+    // the captions carry per-word timings for animated burn-in, and they survive save and reopen
+    let seq_words = crate::transcript::sequence_words(&s);
+    let timed: Vec<(String, Tick)> = tr.captions.iter().flat_map(|c| c.words.iter().map(|w| (w.text.clone(), w.start))).collect();
+    assert_eq!(timed.len(), 5, "{timed:?}");
+    assert!(tr.captions.iter().all(|c| c.words_match_text()));
+    for ((text, start), w) in timed.iter().zip(&seq_words) {
+        assert_eq!((text, *start), (&w.text, w.start.max(Tick::ZERO)));
+    }
+    let bytes = filmcraft_format::encode(&s.project, true);
+    let back = filmcraft_format::decode(&bytes).unwrap();
+    let saved: Vec<_> = back.project.sequences().filter_map(|i| i.as_sequence()).flat_map(|q| q.caption_tracks.iter()).collect();
+    assert_eq!(saved, [tr]);
 }
 
 #[test]

@@ -393,7 +393,7 @@ fn create_captions(s: &mut Session, p: &Value) -> Result<Value> {
     let tid = s.edit_sequence("Create Captions", |q, ctx, st| {
         let tid = TrackId(ctx.alloc());
         let mut t = CaptionTrack::new(tid, name, format);
-        t.captions = tx::blocks_to_captions(&blocks, ctx);
+        t.captions = tx::blocks_to_captions(&blocks, &words, ctx);
         q.caption_tracks.insert(0, t);
         st.caption_selection.clear();
         Ok(tid)
