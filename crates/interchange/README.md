@@ -1,7 +1,8 @@
 # filmcraft-interchange
 
 Timeline interchange for FilmCraft: CMX 3600 EDL, Final Cut Pro 7 XML (xmeml), FCPXML,
-OpenTimelineIO, AAF and OMF import and export, plus Avid ALE. Layer L2: no file I/O; media
+OpenTimelineIO, AAF and OMF import and export, plus Avid ALE, and Premiere Pro project
+(`.prproj`) import. Layer L2: no file I/O; media
 references are strings and audio essence is supplied by the caller (the engine).
 
 ## Specifications
@@ -21,12 +22,35 @@ read off files it exports, never from the application itself.
 | OMF | Avid *OMF Interchange Specification* | Version 2.0 (1997) | classes (`HEAD`, `CMOB`, `MMOB`, `SMOB`, `MSLT`, `TRKD`, `SEQU`, `SCLP`, `FILL`, `TRAN`, `EFFE`, `ESLT`, `CVAL`, `VVAL`, `TCCP`, `WAVD`, `AIFD`, `WAVE`, `AIFC`, locators), property and type names |
 | OMF | Apple *Bento Specification* | revision 1.0d5 | container label, TOC encoding, objects / properties / types, references |
 | WAVE / AIFF | Microsoft RIFF WAVE; Apple AIFF 1.3 | — | embedded and separate audio files |
+| Premiere Pro project | `prproj-format` research notes (MIT, from saved files; not an Adobe document) | 1.1 (2026-09-18), Project versions 40–45 | gzip / plain XML wrapper, flat object graph (`ObjectID` / `ObjectUID` references), sequences, track groups, clip items, sub / master clips, media and sequence sources, markers, links, bins, ticks |
+| gzip | IETF RFC 1952 (via the pure-Rust `flate2` / `miniz_oxide`) | n/a | compressed `.prproj` |
 
 The other formats' editions are listed in the module docs (`edl`, `fcp7`, `fcpxml`, `otio`, `ale`).
 
 **Invariant — Unicode media URLs:** file URL prefix probes must not panic when their byte boundary
 falls inside a UTF-8 character. Timeline importers use the shared converter; `tests/file_urls.rs`
 checks expected Unicode paths through the public converter, resolver and EDL importer.
+
+## Premiere Pro projects
+
+`prproj` reads `.prproj` files (plain or gzip XML, `<PremiereData>` root; detection needs that
+root, gzip magic alone is not enough). Mapped: sequences (name, frame rate, frame size, sample
+rate), video and audio tracks (name, lock, sync lock, mute), clip items (timeline start / end and
+source in point in exact ticks, constant speed, a negative speed as reverse), media paths
+(`FilePath`, else `ActualMediaFilePath`, else `RelativePath` against the document's folder),
+generated media (Black Video, Color Matte, Bars and Tone, Transparent Video, counting leader),
+nested sequences at any depth, sequence and clip markers, linked video / audio, and the bin tree.
+Reported as warnings with counts, not imported: transitions, effects (including the fixed Motion /
+Opacity / Volume settings and keyframes), speed ramps, captions, adjustment layers, titles and
+graphics (Transparent Video in their place), other clip sources (multicam). Export is refused.
+
+Hostile input: at most 512 MiB of decompressed XML, 40 million nodes and 1,000 levels of element
+nesting; a truncated gzip stream or invalid UTF-8 is an error; a reference to a missing object is
+a report entry; nested sequences (64 deep) and bins (64 deep) are walked with seen-sets.
+
+Open questions for real files: where Premiere stores track names and clip enable state, whether
+source in points count from the file's start timecode (the engine rebases them only when every
+use of the file is at or after it), and the reverse-speed encoding.
 
 ## AAF and OMF
 
@@ -93,6 +117,12 @@ OMF carries no video at all.
   random corruption never panic. Nested sequences: AAF round trips as compositions (nests in
   nests, a nest used twice, another frame and sample rate, breakout to mono), OMF with the
   rendered sound, the audio needs of nests, a sequence inside itself.
+- `tests/prproj.rs`: a synthetic project (sequences, nest, generator, speed, markers, links,
+  bins, transition, effects, captions) checked clip by clip; plain, gzip and BOM give the same
+  import; the version 45 shape (no zero `<Start>`) matches version 43; detection needs the root;
+  truncated gzip, invalid UTF-8, no `Project` object, a DTD and over-deep XML are errors; cyclic
+  and over-deep nests, dangling references and hostile numbers are report entries; truncation,
+  bit-flip and digit mutations never panic.
 - `tests/uncarried_clips.rs`: every format's export report names each graphic clip and adjustment
   layer once, as a warning; a sequence without them reports nothing; what a re-import gives back
   matches the report; the FCP7 XML import names a clip item whose file is not defined.

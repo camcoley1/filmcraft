@@ -724,6 +724,60 @@ fn interchange_roundtrip_through_files() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `file.import` of a Premiere Pro project (`.prproj`) creates its sequence, opens it and lists
+/// what was not imported; its media path is missing here, so the media comes in offline.
+#[test]
+fn import_premiere_project_creates_its_sequence() {
+    let dir = std::env::temp_dir().join(format!("fc-prproj-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let doc = r#"<?xml version="1.0" encoding="UTF-8" ?>
+<PremiereData Version="3">
+	<Project ObjectRef="1"/>
+	<Project ObjectID="1" Version="45"/>
+	<Sequence ObjectUID="seq"><TrackGroups Version="1">
+		<TrackGroup Index="0"><Second ObjectRef="10"/></TrackGroup>
+		<TrackGroup Index="1"><Second ObjectRef="11"/></TrackGroup>
+	</TrackGroups><Name>Cut 1</Name></Sequence>
+	<VideoTrackGroup ObjectID="10"><TrackGroup><Tracks><Track Index="0" ObjectURef="v1"/></Tracks><FrameRate>10160640000</FrameRate></TrackGroup><FrameRect>0,0,1080,1920</FrameRect></VideoTrackGroup>
+	<AudioTrackGroup ObjectID="11"><TrackGroup><FrameRate>5292000</FrameRate></TrackGroup></AudioTrackGroup>
+	<VideoClipTrack ObjectUID="v1"><ClipTrack>
+		<ClipItems><TrackItems><TrackItem Index="0" ObjectRef="20"/><TrackItem Index="1" ObjectRef="21"/></TrackItems></ClipItems>
+		<TransitionItems><TrackItems><TrackItem Index="0" ObjectRef="25"/></TrackItems></TransitionItems>
+	</ClipTrack></VideoClipTrack>
+	<VideoClipTrackItem ObjectID="20"><ClipTrackItem><TrackItem Version="4"><End>254016000000</End></TrackItem><SubClip ObjectRef="30"/></ClipTrackItem></VideoClipTrackItem>
+	<VideoClipTrackItem ObjectID="21"><ClipTrackItem><TrackItem Version="4"><Start>254016000000</Start><End>508032000000</End></TrackItem><SubClip ObjectRef="30"/></ClipTrackItem></VideoClipTrackItem>
+	<VideoTransitionTrackItem ObjectID="25"><TransitionTrackItem><DisplayName>Cross Dissolve</DisplayName></TransitionTrackItem></VideoTransitionTrackItem>
+	<SubClip ObjectID="30"><Clip ObjectRef="40"/><Name>shot.mov</Name></SubClip>
+	<VideoClip ObjectID="40"><Clip><Source ObjectRef="50"/><InPoint>0</InPoint></Clip></VideoClip>
+	<VideoMediaSource ObjectID="50"><MediaSource><Media ObjectURef="m"/></MediaSource></VideoMediaSource>
+	<Media ObjectUID="m"><FilePath>/nonexistent/filmcraft-prproj-test/shot.mov</FilePath><Title>shot.mov</Title></Media>
+</PremiereData>
+"#;
+    let path = dir.join("edit.prproj").to_string_lossy().to_string();
+    std::fs::write(&path, doc).unwrap();
+    let mut s = demo();
+    let r = s.execute("file.import", json!({"paths": [path]})).unwrap();
+    let seq = ItemId(r["sequences"][0].as_u64().unwrap_or_else(|| panic!("no sequence in {r}")));
+    assert_eq!(s.state.active_sequence, Some(seq), "the imported sequence is opened");
+    assert_eq!(s.project.item(seq).map(|i| i.name.as_str()), Some("Cut 1"));
+    let q = s.active_sequence().unwrap();
+    q.check().unwrap();
+    assert_eq!((q.settings.width, q.settings.height, q.settings.frame_rate), (1080, 1920, filmcraft_time::FrameRate::FPS_25));
+    let v1 = &q.video_tracks[0].items;
+    assert_eq!(v1.len(), 2);
+    assert_eq!((v1[0].start, v1[0].duration), (Tick::ZERO, Tick(254_016_000_000)), "a missing <Start> (version 45) is zero");
+    assert_eq!(v1[1].start, Tick(254_016_000_000));
+    let doc_report = &r["documents"][0];
+    assert_eq!(doc_report["format"], "Premiere Pro Project");
+    assert!(doc_report["report"].as_array().unwrap().iter().any(|e| e.as_str().unwrap_or("").contains("Cross Dissolve")), "{r}");
+    assert_eq!(doc_report["offlineMedia"].as_array().map(Vec::len), Some(1), "{r}");
+    // a damaged project is an error, not a crash
+    let bad = dir.join("bad.prproj").to_string_lossy().to_string();
+    std::fs::write(&bad, [0x1f, 0x8b, 0x08, 0x00, 0x00]).unwrap();
+    assert!(s.execute("file.import", json!({"paths": [bad]})).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `file.exportInterchange {format: "<unknown>"}` used to write FCP7 XML without a word.
 #[test]
 fn export_interchange_refuses_an_unknown_format() {

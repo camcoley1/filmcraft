@@ -1,4 +1,5 @@
-//! Interchange documents (CMX 3600 EDL, FCP7 XML, FCPXML, OTIO, AAF, OMF) ↔ the session's project.
+//! Interchange documents (CMX 3600 EDL, FCP7 XML, FCPXML, OTIO, AAF, OMF; Premiere Pro projects
+//! import only) ↔ the session's project.
 
 use serde_json::{Value, json};
 
@@ -10,7 +11,7 @@ use crate::{EngineError, Result, Session};
 /// The interchange format of a file, if it is one (by content, with the extension as a hint).
 pub fn detect(path: &str, bytes: &[u8]) -> Option<Format> {
     let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
-    if !matches!(ext.as_deref(), Some("edl" | "xml" | "fcpxml" | "otio" | "aaf" | "omf" | "omfi")) {
+    if !matches!(ext.as_deref(), Some("edl" | "xml" | "fcpxml" | "otio" | "aaf" | "omf" | "omfi" | "prproj")) {
         return None;
     }
     filmcraft_interchange::detect(bytes, ext.as_deref())
@@ -91,7 +92,22 @@ pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format) -> Resu
             Some(src) => {
                 let info = src.info().clone();
                 let identity = crate::relink::identity_of(&*s.services, &file).ok();
-                let rebase = (format == Format::Edl).then_some(info.start_timecode).flatten();
+                // EDL source times are absolute timecode. A Premiere Pro project's in points are
+                // too when every use of the file is at or after its start timecode.
+                let rebase = match format {
+                    Format::Edl => info.start_timecode,
+                    Format::Prproj => info.start_timecode.filter(|&tc| {
+                        info.video.as_ref().is_some_and(|v| {
+                            let off = v.frame_rate.tick_of(tc);
+                            s.project
+                                .items
+                                .values()
+                                .filter_map(|i| i.as_sequence())
+                                .all(|q| q.all_tracks().all(|t| t.items.iter().all(|c| c.item != id || c.source_in >= off)))
+                        })
+                    }),
+                    _ => None,
+                };
                 s.edit("Link Media", |proj, _| {
                     if let Some(item) = proj.items.get_mut(&id)
                         && let ItemKind::Media(m) = &mut item.kind
@@ -136,10 +152,13 @@ pub fn export(s: &mut Session, p: &Value) -> Result<Value> {
     // else, so the error can list exactly what is accepted.
     let format = match p.get("format") {
         None | Some(Value::Null) => Format::Fcp7Xml,
-        Some(v) => v.as_str().and_then(|name| Format::ALL.into_iter().find(|f| f.extension().eq_ignore_ascii_case(name))).ok_or_else(|| {
-            let names: Vec<&str> = Format::ALL.iter().map(|f| f.extension()).collect();
-            crate::commands::bad("file.exportInterchange", format!("unknown format {v}: use one of {}", names.join(", ")))
-        })?,
+        Some(v) => v
+            .as_str()
+            .and_then(|name| Format::ALL.into_iter().filter(|f| !f.is_import_only()).find(|f| f.extension().eq_ignore_ascii_case(name)))
+            .ok_or_else(|| {
+                let names: Vec<&str> = Format::ALL.iter().filter(|f| !f.is_import_only()).map(|f| f.extension()).collect();
+                crate::commands::bad("file.exportInterchange", format!("unknown format {v}: use one of {}", names.join(", ")))
+            })?,
     };
     let path = p.get("path").and_then(Value::as_str).ok_or_else(|| EngineError::Other("need `path`".into()))?.to_string();
     let seq = p.get("sequence").and_then(Value::as_u64).map(ItemId).or(s.state.active_sequence).ok_or(EngineError::NoSequence)?;

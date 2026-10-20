@@ -52,9 +52,10 @@ platforms** G4, G9, G17; **performance** G16; **ecosystem** G11; **measurement**
 
 ## G2. Premiere's `.prproj` cannot be opened
 
-- **Missing:** import of Premiere project files. `grep -ri prproj crates apps` finds nothing.
-  Today an editor must export FCP7 XML, AAF or OTIO from Premiere first, losing bins, effects and
-  most metadata; there is no "Selection as Premiere Project" export either.
+- **Missing:** v1 import exists (`crates/interchange/src/prproj.rs`: sequences, tracks, clips,
+  speed, nested sequences, markers, links, bins), tested on synthetic projects only. Transitions,
+  effects, keyframes, Lumetri, audio gain, captions and multicam are reported, not imported; it
+  has not been checked against real Premiere Pro projects; there is no export.
 - **Impact:** the beta bar requires opening the target's main format; every switching editor's
   existing work is behind this.
 - **Approach:** `.prproj` is gzip-compressed XML. Clean-room from projects we author ourselves in
