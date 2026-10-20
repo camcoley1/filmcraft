@@ -70,6 +70,80 @@ pub enum CaptionAnchor {
     Bottom,
 }
 
+/// Per-word caption animation for burn-in. It needs word timings ([`Caption::words`]); captions
+/// without them draw statically whatever the animation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum CaptionAnimation {
+    /// Static captions (as before animations existed).
+    #[default]
+    None,
+    /// Karaoke: words at or before the playhead take `highlight_color`, the rest the text colour.
+    KaraokeHighlight { highlight_color: [u8; 4] },
+    /// The word being spoken is drawn `scale` times larger around its centre and baseline.
+    WordPop { scale: f32 },
+    /// A filled box of `box_color` behind the word being spoken, `pad` pixels (at 1080 lines)
+    /// wider than the word on each side.
+    Boxed { box_color: [u8; 4], pad: f32 },
+}
+
+impl CaptionAnimation {
+    pub const DEFAULT_HIGHLIGHT: [u8; 4] = [255, 214, 10, 255];
+    pub const DEFAULT_POP_SCALE: f32 = 1.25;
+    pub const DEFAULT_BOX: [u8; 4] = [229, 57, 53, 255];
+    pub const DEFAULT_BOX_PAD: f32 = 10.0;
+    /// Every preset with its default parameters, in menu order.
+    pub fn presets() -> [CaptionAnimation; 4] {
+        [
+            CaptionAnimation::None,
+            CaptionAnimation::KaraokeHighlight { highlight_color: Self::DEFAULT_HIGHLIGHT },
+            CaptionAnimation::WordPop { scale: Self::DEFAULT_POP_SCALE },
+            CaptionAnimation::Boxed { box_color: Self::DEFAULT_BOX, pad: Self::DEFAULT_BOX_PAD },
+        ]
+    }
+    pub fn is_none(&self) -> bool {
+        matches!(self, CaptionAnimation::None)
+    }
+    /// The command / control-channel name (`captions.setStyle` `animation`).
+    pub fn name(self) -> &'static str {
+        match self {
+            CaptionAnimation::None => "none",
+            CaptionAnimation::KaraokeHighlight { .. } => "karaoke",
+            CaptionAnimation::WordPop { .. } => "pop",
+            CaptionAnimation::Boxed { .. } => "boxed",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            CaptionAnimation::None => "Static",
+            CaptionAnimation::KaraokeHighlight { .. } => "Karaoke",
+            CaptionAnimation::WordPop { .. } => "Word pop",
+            CaptionAnimation::Boxed { .. } => "Boxed word",
+        }
+    }
+    /// The preset called `name` with default parameters.
+    pub fn from_name(name: &str) -> Option<CaptionAnimation> {
+        Self::presets().into_iter().find(|a| a.name().eq_ignore_ascii_case(name.trim()))
+    }
+}
+
+/// An unknown or malformed animation (a newer or hand-edited project) loads as static captions
+/// instead of failing the whole project.
+fn lenient_animation<'de, D: serde::Deserializer<'de>>(d: D) -> Result<CaptionAnimation, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).unwrap_or_default())
+}
+
+/// Margin (fraction of the frame height) that keeps a caption anchored at `anchor` clear of the
+/// buttons and text that short-video apps lay over a 9:16 picture. A guide value for the
+/// `captions.setStyle` `safeArea` preset, written into the ordinary `anchor` and `margin` fields.
+pub fn vertical_safe_margin(anchor: CaptionAnchor) -> f32 {
+    match anchor {
+        CaptionAnchor::Top => 0.12,
+        CaptionAnchor::Middle => 0.0,
+        CaptionAnchor::Bottom => 0.22,
+    }
+}
+
 /// Track-level caption style (Premiere's caption track style / Essential Graphics text settings).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -93,6 +167,9 @@ pub struct CaptionStyle {
     /// Text outline width in pixels at 1080 lines (0 = none).
     pub outline: f32,
     pub outline_color: [u8; 4],
+    /// Per-word animation for burn-in (static by default).
+    #[serde(deserialize_with = "lenient_animation", skip_serializing_if = "CaptionAnimation::is_none")]
+    pub animation: CaptionAnimation,
 }
 
 impl Default for CaptionStyle {
@@ -109,6 +186,7 @@ impl Default for CaptionStyle {
             line_spacing: 1.25,
             outline: 0.0,
             outline_color: [0, 0, 0, 255],
+            animation: CaptionAnimation::None,
         }
     }
 }
@@ -446,9 +524,27 @@ mod tests {
         assert!(c.words.is_empty());
         // and it saves byte for byte as before (no `words` key)
         assert_eq!(serde_json::to_string(&c).unwrap(), old);
+        // a static style saves without an `animation` key
+        assert!(!serde_json::to_string(&CaptionStyle::default()).unwrap().contains("animation"));
         // a style saved before animations existed loads with the defaults for the new fields
         let st: CaptionStyle = serde_json::from_str(r#"{"font":"Inter","size":40.0}"#).unwrap();
         assert_eq!(st, CaptionStyle { size: 40.0, ..Default::default() });
+    }
+
+    #[test]
+    fn animation_presets_round_trip_and_bad_values_load_static() {
+        for a in CaptionAnimation::presets() {
+            let st = CaptionStyle { animation: a, ..Default::default() };
+            let back: CaptionStyle = serde_json::from_str(&serde_json::to_string(&st).unwrap()).unwrap();
+            assert_eq!(back, st);
+            assert_eq!(CaptionAnimation::from_name(a.name()), Some(a));
+        }
+        assert_eq!(CaptionAnimation::from_name("Karaoke "), Some(CaptionAnimation::presets()[1]));
+        assert_eq!(CaptionAnimation::from_name("sparkle"), None);
+        for bad in [r#""Sparkle""#, r#"{"WordPop":{"scale":"big"}}"#, "42", "null", r#"{"Boxed":{}}"#] {
+            let st: CaptionStyle = serde_json::from_str(&format!(r#"{{"size":30.0,"animation":{bad}}}"#)).unwrap();
+            assert_eq!(st, CaptionStyle { size: 30.0, ..Default::default() }, "{bad}");
+        }
     }
 
     #[test]

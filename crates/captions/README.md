@@ -72,6 +72,17 @@ frame, colour, background box, outline, alignment, top/middle/bottom anchor and 
 rasterises it to a small premultiplied linear-light RGBA overlay. `filmcraft-render` composites the
 overlays of visible caption tracks over the finished frame (Program monitor and export burn-in).
 
+`burn::render_caption_at` adds the track style's word animation at a timeline time (karaoke
+highlight, word pop, boxed word) for captions whose `words` spell their text. Each line is laid
+out once, exactly as for a static caption, and its glyphs are split per word by their cluster
+offsets, so words never shift between frames; the overlay's size is fixed for the whole caption.
+Captions without matching word timings, or tracks with no animation, draw statically.
+`sequence_overlays` (used by both the Program monitor and export) always draws at the frame's time.
+
+**Styled and animated captions export as burn-in only.** The SRT, WebVTT, SCC, MCC, STL and TTML
+writers ignore the style and word timings, so a project with animated captions writes the same
+caption files as before.
+
 Text is set in **Inter SemiBold** (`assets/fonts/Inter-SemiBold.ttf`, SIL OFL 1.1, attributed in
 `ATTRIBUTION.md`) by the `filmcraft-text` engine: shaped with kerning and ligatures, bidi-ordered,
 and drawn from its sub-pixel positioned glyph cache.

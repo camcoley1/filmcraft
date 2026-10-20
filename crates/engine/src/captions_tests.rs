@@ -158,3 +158,55 @@ fn caption_list_track_filter_never_falls_back_to_every_track() {
         assert!(s.execute("captions.list", json!({"track": sel})).is_err(), "{sel} names no caption track");
     }
 }
+
+#[test]
+fn set_style_animation_presets_and_safe_area() {
+    use filmcraft_project::{CaptionAnchor, CaptionAnimation};
+    let mut s = demo();
+    s.execute("captions.add", json!({"text": "hi there"})).unwrap();
+    let style = |s: &Session| s.active_sequence().unwrap().caption_tracks[0].style.clone();
+    // a preset with its defaults, then its own parameters
+    s.execute("captions.setStyle", json!({"track": "C1", "animation": "karaoke"})).unwrap();
+    assert_eq!(style(&s).animation, CaptionAnimation::KaraokeHighlight { highlight_color: CaptionAnimation::DEFAULT_HIGHLIGHT });
+    s.execute("captions.setStyle", json!({"track": "C1", "highlightColor": "#00ff00"})).unwrap();
+    // re-picking the same preset keeps its parameters
+    s.execute("captions.setStyle", json!({"track": "C1", "animation": "karaoke"})).unwrap();
+    assert_eq!(style(&s).animation, CaptionAnimation::KaraokeHighlight { highlight_color: [0, 255, 0, 255] });
+    s.execute("captions.setStyle", json!({"track": "C1", "animation": "pop", "popScale": 9.0})).unwrap();
+    assert_eq!(style(&s).animation, CaptionAnimation::WordPop { scale: 3.0 }, "scale clamped");
+    s.execute("captions.setStyle", json!({"track": "C1", "animation": "boxed", "boxColor": [1, 2, 3], "boxPad": -5})).unwrap();
+    assert_eq!(style(&s).animation, CaptionAnimation::Boxed { box_color: [1, 2, 3, 255], pad: 0.0 });
+    // hostile or mismatched parameters are refused and leave the style as it was
+    let before = style(&s);
+    for bad in [
+        json!({"track": "C1", "animation": "sparkle"}),
+        json!({"track": "C1", "animation": 7}),
+        json!({"track": "C1", "highlightColor": "#00ff00"}),
+        json!({"track": "C1", "popScale": 2.0}),
+        json!({"track": "C1", "boxColor": "nope"}),
+        json!({"track": "C1", "boxPad": "wide"}),
+        json!({"track": "C1", "safeArea": "left"}),
+        json!({"track": "C1", "safeArea": 3}),
+    ] {
+        assert!(s.execute("captions.setStyle", bad.clone()).is_err(), "{bad}");
+        assert_eq!(style(&s), before, "{bad}");
+    }
+    // 9:16 safe-area presets write the ordinary anchor and margin; explicit values win
+    s.execute("captions.setStyle", json!({"track": "C1", "safeArea": "bottom"})).unwrap();
+    assert_eq!((style(&s).anchor, style(&s).margin), (CaptionAnchor::Bottom, filmcraft_project::vertical_safe_margin(CaptionAnchor::Bottom)));
+    s.execute("captions.setStyle", json!({"track": "C1", "safeArea": "top", "margin": 0.3})).unwrap();
+    assert_eq!((style(&s).anchor, style(&s).margin), (CaptionAnchor::Top, 0.3));
+    // back to static; undo restores the animation
+    s.execute("captions.setStyle", json!({"track": "C1", "animation": "none"})).unwrap();
+    assert_eq!(style(&s).animation, CaptionAnimation::None);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(matches!(style(&s).animation, CaptionAnimation::Boxed { .. }));
+    // captions.list reports the animation in setStyle's parameter names
+    let r = s.execute("captions.list", json!({})).unwrap();
+    let st = &r["tracks"][0]["style"];
+    assert_eq!((st["animation"].clone(), st["boxColor"].clone(), st["boxPad"].clone()), (json!("boxed"), json!("#010203ff"), json!(0.0)), "{st}");
+    assert_eq!(r["tracks"][0]["captions"][0]["words"], 0);
+    // reset clears it
+    s.execute("captions.setStyle", json!({"track": "C1", "reset": true})).unwrap();
+    assert_eq!(style(&s), filmcraft_project::CaptionStyle::default());
+}

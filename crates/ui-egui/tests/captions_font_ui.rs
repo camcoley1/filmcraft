@@ -1,5 +1,6 @@
 //! Headless UI test of the caption track font picker in the Text panel's Captions tab: picking a
 //! family sets the track style's font, and macOS-private (`.`-prefixed) faces are not offered.
+//! The same dropdown starts with the word animation and 9:16 safe-area presets.
 
 use std::sync::mpsc::{Sender, channel};
 
@@ -92,4 +93,40 @@ fn caption_font_picker_sets_the_track_font() {
     d.ok("ui.click", json!({"id": serif}));
     d.frames(3);
     assert_eq!(d.font(track), "Noto Serif");
+}
+
+#[test]
+fn caption_font_dropdown_offers_animation_and_safe_area_presets() {
+    let mut d = Driver::demo();
+    d.ok("ui.set", json!({"workspace": "Captions and Graphics"}));
+    let track = d.ok("engine.execute", json!({"command": "captions.newTrack", "params": {"format": "Subtitle"}}))["track"].as_u64().unwrap();
+    d.ok("engine.execute", json!({"command": "captions.add", "params": {"track": track, "text": "Hello", "seconds": 1.0}}));
+    d.frames(2);
+    d.ok("ui.click", json!({"id": "text.tab.Captions"}));
+    d.frames(3);
+    let style = |d: &mut Driver| {
+        let r = d.ok("engine.execute", json!({"command": "captions.list", "params": {}}));
+        r["tracks"].as_array().unwrap().iter().find(|t| t["id"] == json!(track)).expect("track")["style"].clone()
+    };
+    assert_eq!(style(&mut d)["animation"], json!("none"), "static by default");
+    // the closed strip has exactly the controls it had before
+    let strip = d.ids("text.captions.style.");
+    assert_eq!(strip.len(), 10, "{strip:?}");
+    // the presets head the font dropdown's list
+    d.ok("ui.click", json!({"id": "text.captions.style.font"}));
+    d.frames(3);
+    let options = d.ids("text.captions.style.animation.option.");
+    assert_eq!(options.len(), 4, "{options:?}");
+    assert_eq!(d.ids("text.captions.style.safeArea.").len(), 3);
+    d.ok("ui.click", json!({"id": "text.captions.style.animation.option.karaoke"}));
+    d.frames(3);
+    assert_eq!(style(&mut d)["animation"], json!("karaoke"), "{}", style(&mut d));
+    assert_eq!(style(&mut d)["font"], json!("Inter"), "picking a preset leaves the font alone");
+    d.ok("ui.click", json!({"id": "text.captions.style.font"}));
+    d.frames(3);
+    d.ok("ui.click", json!({"id": "text.captions.style.safeArea.bottom"}));
+    d.frames(3);
+    let st = style(&mut d);
+    assert_eq!(st["anchor"], json!("bottom"));
+    assert!((st["margin"].as_f64().unwrap() - 0.22).abs() < 1e-6, "{st}");
 }

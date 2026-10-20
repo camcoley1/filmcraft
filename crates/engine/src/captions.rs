@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 use filmcraft_captions::{Document, Format, WriteOptions};
 use filmcraft_edit as edit;
 use filmcraft_edit::Edge;
-use filmcraft_project::{CaptionAlign, CaptionAnchor, CaptionFormat, CaptionStyle, CaptionTrack, ClipId, SequenceSettings, TrackId};
+use filmcraft_project::{
+    CaptionAlign, CaptionAnchor, CaptionAnimation, CaptionFormat, CaptionStyle, CaptionTrack, ClipId, SequenceSettings, TrackId, vertical_safe_margin,
+};
 use filmcraft_time::{Tick, TimeDisplay, format_time};
 
 use crate::commands::{CommandSpec, always, bad, bool_p, f64_p, has_seq, str_p, time_p, u64_p};
@@ -71,6 +73,52 @@ fn caption_ids(s: &Session, p: &Value) -> Vec<ClipId> {
 
 fn one_caption(s: &Session, p: &Value, cmd: &str) -> Result<ClipId> {
     caption_ids(s, p).first().copied().ok_or_else(|| bad(cmd, "no caption (pass `caption` or select one)"))
+}
+
+/// The animation a `captions.setStyle` call leaves: `animation` picks a preset (re-picking the
+/// current one keeps its parameters), then the preset's own parameters apply. A parameter for
+/// another preset, or a value that cannot be read, is an error.
+fn style_animation(current: CaptionAnimation, p: &Value) -> Result<CaptionAnimation> {
+    let err = |m: String| bad("captions.setStyle", m);
+    let mut a = current;
+    if let Some(v) = p.get("animation") {
+        let name = v.as_str().unwrap_or_default();
+        let picked = CaptionAnimation::from_name(name).ok_or_else(|| err(format!("unknown animation {v} (none, karaoke, pop or boxed)")))?;
+        if picked.name() != a.name() {
+            a = picked;
+        }
+    }
+    let color = |k: &str| -> Result<Option<[u8; 4]>> {
+        match p.get(k) {
+            None => Ok(None),
+            Some(v) => parse_color(v).map(Some).ok_or_else(|| err(format!("{k} must be \"#rrggbb[aa]\" or [r,g,b(,a)], got {v}"))),
+        }
+    };
+    let num = |k: &str| -> Result<Option<f32>> {
+        match p.get(k) {
+            None => Ok(None),
+            Some(v) => v.as_f64().filter(|x| x.is_finite()).map(|x| Some(x as f32)).ok_or_else(|| err(format!("{k} must be a number, got {v}"))),
+        }
+    };
+    let picked = a.name();
+    let only = |k: &str, preset: &str| err(format!("{k} applies to animation `{preset}`, not `{picked}`"));
+    if let Some(c) = color("highlightColor")? {
+        let CaptionAnimation::KaraokeHighlight { highlight_color } = &mut a else { return Err(only("highlightColor", "karaoke")) };
+        *highlight_color = c;
+    }
+    if let Some(v) = num("popScale")? {
+        let CaptionAnimation::WordPop { scale } = &mut a else { return Err(only("popScale", "pop")) };
+        *scale = v.clamp(0.5, 3.0);
+    }
+    if let Some(c) = color("boxColor")? {
+        let CaptionAnimation::Boxed { box_color, .. } = &mut a else { return Err(only("boxColor", "boxed")) };
+        *box_color = c;
+    }
+    if let Some(v) = num("boxPad")? {
+        let CaptionAnimation::Boxed { pad, .. } = &mut a else { return Err(only("boxPad", "boxed")) };
+        *pad = v.clamp(0.0, 200.0);
+    }
+    Ok(a)
 }
 
 fn parse_color(v: &Value) -> Option<[u8; 4]> {
@@ -174,10 +222,30 @@ fn caption_json(s: &Session, c: &filmcraft_project::Caption) -> Value {
         "text": c.text,
         "speaker": c.speaker,
         "settings": c.settings,
+        "words": c.words.len(),
     })
 }
 
+/// The style's animation in `captions.setStyle` parameter names.
+fn animation_json(a: CaptionAnimation) -> Value {
+    match a {
+        CaptionAnimation::None => json!({"animation": a.name()}),
+        CaptionAnimation::KaraokeHighlight { highlight_color } => json!({"animation": a.name(), "highlightColor": hex(highlight_color)}),
+        CaptionAnimation::WordPop { scale } => json!({"animation": a.name(), "popScale": scale}),
+        CaptionAnimation::Boxed { box_color, pad } => json!({"animation": a.name(), "boxColor": hex(box_color), "boxPad": pad}),
+    }
+}
+
 fn track_json(s: &Session, t: &CaptionTrack, index: usize) -> Value {
+    let mut style = json!({
+        "font": t.style.font, "size": t.style.size, "color": hex(t.style.color),
+        "background": t.style.background, "backgroundColor": hex(t.style.background_color),
+        "align": format!("{:?}", t.style.align).to_lowercase(), "anchor": format!("{:?}", t.style.anchor).to_lowercase(),
+        "margin": t.style.margin, "lineSpacing": t.style.line_spacing, "outline": t.style.outline, "outlineColor": hex(t.style.outline_color),
+    });
+    if let (Some(o), Value::Object(a)) = (style.as_object_mut(), animation_json(t.style.animation)) {
+        o.extend(a);
+    }
     json!({
         "id": t.id.0,
         "label": format!("C{}", index + 1),
@@ -187,12 +255,7 @@ fn track_json(s: &Session, t: &CaptionTrack, index: usize) -> Value {
         "enabled": t.enabled,
         "locked": t.locked,
         "syncLock": t.sync_lock,
-        "style": {
-            "font": t.style.font, "size": t.style.size, "color": hex(t.style.color),
-            "background": t.style.background, "backgroundColor": hex(t.style.background_color),
-            "align": format!("{:?}", t.style.align).to_lowercase(), "anchor": format!("{:?}", t.style.anchor).to_lowercase(),
-            "margin": t.style.margin, "lineSpacing": t.style.line_spacing, "outline": t.style.outline, "outlineColor": hex(t.style.outline_color),
-        },
+        "style": style,
         "captions": t.captions.iter().map(|c| caption_json(s, c)).collect::<Vec<_>>(),
     })
 }
@@ -296,7 +359,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "Caption Track Style",
             &[],
             None,
-            r##"{"track":id|"C1","font":str?,"size":f32?,"color":"#rrggbb[aa]"?,"background":bool?,"backgroundColor":"#rrggbbaa"?,"align":"left|center|right"?,"anchor":"top|middle|bottom"?,"margin":0..0.45 (fraction of frame height)?,"lineSpacing":f32?,"outline":f32?,"outlineColor":str?,"reset":bool?}"##,
+            r##"{"track":id|"C1","font":str?,"size":f32?,"color":"#rrggbb[aa]"?,"background":bool?,"backgroundColor":"#rrggbbaa"?,"align":"left|center|right"?,"anchor":"top|middle|bottom"?,"margin":0..0.45 (fraction of frame height)?,"lineSpacing":f32?,"outline":f32?,"outlineColor":str?,"animation":"none|karaoke|pop|boxed"?,"highlightColor":str? (karaoke),"popScale":0.5..3? (pop),"boxColor":str? (boxed),"boxPad":0..200 px at 1080 lines? (boxed),"safeArea":"top|middle|bottom"? (9:16 safe-area anchor and margin; explicit anchor/margin win),"reset":bool?}"##,
             has_caption_track,
             |s, p| {
                 let tid = track_param(s, p).ok_or_else(|| {
@@ -316,6 +379,21 @@ pub fn commands() -> Vec<CommandSpec> {
                     if bool_p(&p, "reset").unwrap_or(false) {
                         *y = CaptionStyle::default();
                     }
+                    match str_p(&p, "safeArea") {
+                        Some(name) => {
+                            let a = match name {
+                                "top" => CaptionAnchor::Top,
+                                "middle" => CaptionAnchor::Middle,
+                                "bottom" => CaptionAnchor::Bottom,
+                                o => return Err(bad("captions.setStyle", format!("unknown safeArea `{o}` (top, middle or bottom)"))),
+                            };
+                            y.anchor = a;
+                            y.margin = vertical_safe_margin(a);
+                        }
+                        None if p.get("safeArea").is_some() => return Err(bad("captions.setStyle", "safeArea must be \"top\", \"middle\" or \"bottom\"")),
+                        None => {}
+                    }
+                    y.animation = style_animation(y.animation, &p)?;
                     if let Some(v) = str_p(&p, "font") {
                         y.font = v.to_string();
                     }

@@ -8,7 +8,7 @@
 //! the selection marks In/Out and can be extracted or lifted (`transcript.*` commands).
 
 use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
-use filmcraft_project::{CaptionAlign, CaptionAnchor, CaptionFormat};
+use filmcraft_project::{CaptionAlign, CaptionAnchor, CaptionAnimation, CaptionFormat, vertical_safe_margin};
 use filmcraft_time::{TimeDisplay, format_time};
 use serde_json::{Value, json};
 
@@ -637,6 +637,10 @@ fn style_strip(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, track_idx: us
     child.horizontal_centered(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         let r = egui::ComboBox::from_id_salt(("caption-font", tr.id.0)).selected_text(&st.font).width(130.0).height(400.0).show_ui(ui, |ui| {
+            // word animation presets and 9:16 safe-area positions head the list, so the closed
+            // strip looks exactly as before
+            animation_rows(app, ui, &tr, &st, actions);
+            ui.separator();
             if !filmcraft_text::fonts::system_scanned() {
                 filmcraft_text::fonts::scan_system();
             }
@@ -700,6 +704,51 @@ fn style_strip(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, track_idx: us
             }
         }
     });
+}
+
+/// The animation and safe-area rows at the top of the caption font dropdown.
+fn animation_rows(
+    app: &mut FilmcraftApp,
+    ui: &mut egui::Ui,
+    tr: &filmcraft_project::CaptionTrack,
+    st: &filmcraft_project::CaptionStyle,
+    actions: &mut Vec<(String, Value)>,
+) {
+    let anim_label = |a: CaptionAnimation| match a {
+        CaptionAnimation::None => tl!("Static"),
+        CaptionAnimation::KaraokeHighlight { .. } => tl!("Karaoke"),
+        CaptionAnimation::WordPop { .. } => tl!("Word pop"),
+        CaptionAnimation::Boxed { .. } => tl!("Boxed word"),
+    };
+    // a row may be only partly visible in the scrolled list; automation clicks its visible part
+    let register = |app: &mut FilmcraftApp, ui: &egui::Ui, id: String, resp: &egui::Response, label: &str| {
+        let visible = resp.rect.intersect(ui.clip_rect());
+        if visible.is_positive() {
+            app.auto.add(&id, visible, label);
+        }
+    };
+    ui.label(egui::RichText::new(tl!("Animation")).size(11.0).color(app.tokens.text_dim))
+        .on_hover_text(tl!("Word animation for captions with word timings (Create Captions from a transcript)"));
+    for a in CaptionAnimation::presets() {
+        let resp = ui.selectable_label(st.animation.name() == a.name(), anim_label(a));
+        register(app, ui, format!("text.captions.style.animation.option.{}", a.name()), &resp, a.name());
+        if resp.clicked() {
+            actions.push(("captions.setStyle".into(), json!({"track": tr.id.0, "animation": a.name()})));
+        }
+    }
+    ui.label(egui::RichText::new(tl!("9:16 safe area")).size(11.0).color(app.tokens.text_dim));
+    for (a, name, label) in [
+        (CaptionAnchor::Top, "top", tl!("Safe top")),
+        (CaptionAnchor::Middle, "middle", tl!("Safe middle")),
+        (CaptionAnchor::Bottom, "bottom", tl!("Safe bottom")),
+    ] {
+        let on = st.anchor == a && (st.margin - vertical_safe_margin(a)).abs() < 1e-4;
+        let resp = ui.selectable_label(on, label);
+        register(app, ui, format!("text.captions.style.safeArea.{name}"), &resp, name);
+        if resp.clicked() {
+            actions.push(("captions.setStyle".into(), json!({"track": tr.id.0, "safeArea": name})));
+        }
+    }
 }
 
 fn run(app: &mut FilmcraftApp, ui: &egui::Ui, actions: Vec<(String, Value)>) {
