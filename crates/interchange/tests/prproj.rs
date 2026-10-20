@@ -1052,3 +1052,11 @@ fn bad_marker_durations_empty_marker_lists_and_wrong_master_sources_are_reported
     let e = report.entries.iter().find(|e| e.message.contains("not a sequence")).unwrap_or_else(|| panic!("{report}"));
     assert_eq!(e.count, 1, "{report}");
 }
+
+#[test]
+fn a_marker_list_reference_to_another_kind_of_object_is_reported() {
+    let doc = FULL.replace(r#"<Markers ObjectRef="901"/>"#, r#"<Markers ObjectURef="media-a"/>"#);
+    let (im, report) = import(doc.as_bytes()).unwrap();
+    assert!(report.mentions("a marker list reference points at Media, not a marker list"), "{report}");
+    assert!(seq_named(&im, "Main").1.video_tracks[0].items[0].markers.is_empty());
+}

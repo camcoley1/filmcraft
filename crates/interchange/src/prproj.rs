@@ -264,6 +264,8 @@ fn import_limited(bytes: &[u8], opts: &ImportOptions, limits: Limits) -> Result<
         items_made: 0,
         markers_made: 0,
         marker_bytes: 0,
+        cached_markers: 0,
+        cached_bytes: 0,
         warned: HashSet::new(),
         track_effects: false,
     };
@@ -320,6 +322,9 @@ struct Imp<'a, 'i, 'r> {
     markers_made: usize,
     /// Bytes of marker text (names and comments) created.
     marker_bytes: usize,
+    /// Markers and text bytes held in the parsed-list cache (charged against the same limits).
+    cached_markers: usize,
+    cached_bytes: usize,
     /// Messages already in the report (bounds the report's own linear merge).
     warned: HashSet<String>,
     /// Track-level effects were seen (reported once).
@@ -1013,6 +1018,10 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
             // an inline list holds its markers; anything else must be a reference (follow reports it)
             let list = if !is_ref(r) && elements(r).next().is_some() { Some(r) } else { self.follow(Some(r), "marker list") };
             let Some(list) = list else { continue };
+            if !list.has_tag_name("Markers") {
+                self.warn(format!("a marker list reference points at {}, not a marker list; it was skipped", list.tag_name().name()));
+                continue;
+            }
             if !seen.insert(list.id()) {
                 continue;
             }
@@ -1053,19 +1062,26 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
         ));
     }
 
-    /// The markers of one `Markers` list object, read once (ids are given when copied out). Reads
-    /// no more than is left of the marker budget, and each marker object once however often the
-    /// list names it.
+    /// The markers of one `Markers` list object, read once (ids are given when copied out). What
+    /// the cache keeps is charged against the marker limits too, so it reads no more than is left
+    /// of either the cache's or the output's share: nothing once one is spent, a marker that does
+    /// not fit is dropped (not kept), and each marker object is read once however often the list
+    /// names it.
     fn parse_marker_list(&mut self, list: Node<'a, 'i>) -> Vec<Marker> {
-        let room = self.limits.markers.saturating_sub(self.markers_made);
-        let byte_room = self.limits.marker_bytes.saturating_sub(self.marker_bytes);
+        let room = self.limits.markers.saturating_sub(self.markers_made).min(self.limits.markers.saturating_sub(self.cached_markers));
+        let byte_room = self.limits.marker_bytes.saturating_sub(self.marker_bytes).min(self.limits.marker_bytes.saturating_sub(self.cached_bytes));
         let mut out = Vec::new();
+        if room == 0 || byte_room == 0 {
+            self.marker_budget_warning();
+            return out;
+        }
         let mut bytes = 0usize;
+        let mut cut = false;
         let mut targets = HashSet::new();
-        let entries: Vec<Node<'a, 'i>> = list.descendants().filter(|d| d.has_tag_name("Marker")).collect();
-        for e in entries {
-            if out.len() >= room || bytes > byte_room {
-                self.marker_budget_warning();
+        // walked lazily: a list with more entries than there is room for is not collected first
+        for e in list.descendants().filter(|d| d.has_tag_name("Marker")) {
+            if out.len() >= room {
+                cut = true;
                 break;
             }
             let mk = if is_ref(e) { self.follow(Some(e), "marker") } else { Some(e) };
@@ -1079,6 +1095,11 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
             };
             match marker_from_json(json) {
                 Some((mut m, bad_duration)) => {
+                    let size = m.name.len().saturating_add(m.comment.len());
+                    if bytes.saturating_add(size) > byte_room {
+                        cut = true;
+                        continue;
+                    }
                     if m.start < Tick::ZERO {
                         self.warn("a marker before the start was moved to the start");
                         m.start = Tick::ZERO;
@@ -1086,11 +1107,16 @@ impl<'a, 'i, 'r> Imp<'a, 'i, 'r> {
                     if bad_duration {
                         self.warn("a marker duration could not be read or was negative; the marker was given no duration");
                     }
-                    bytes = bytes.saturating_add(m.name.len()).saturating_add(m.comment.len());
+                    bytes += size;
                     out.push(m);
                 }
                 None => self.warn("a marker could not be read and was skipped"),
             }
+        }
+        self.cached_markers = self.cached_markers.saturating_add(out.len());
+        self.cached_bytes = self.cached_bytes.saturating_add(bytes);
+        if cut {
+            self.marker_budget_warning();
         }
         out
     }
@@ -1427,6 +1453,33 @@ mod tests {
         // with room, list B is parsed and its dangling reference reported
         let (_, report) = import_limited(doc.as_bytes(), &ImportOptions::default(), Limits::DEFAULT).unwrap();
         assert!(report.mentions("not in the project file"), "{report}");
+    }
+
+    /// Thirty lists, each naming one 1,000-byte comment (and then a marker that is not in the
+    /// file), owned by thirty clips, under a 10,000-byte budget: no more than ten lists are read
+    /// (the cache's share), no more than 10,000 bytes reach the timeline, and the report says so.
+    #[test]
+    fn the_byte_budget_bounds_what_is_cached_and_copied() {
+        let comment = "c".repeat(1_000);
+        let mut objects = marker_obj("big", 0, &comment);
+        let lists: Vec<String> = (0..30).map(|i| format!("L{i}")).collect();
+        for l in &lists {
+            objects.push_str(&list_obj(l, &["big".to_string(), "dangling".to_string()]));
+        }
+        let names: Vec<&str> = lists.iter().map(String::as_str).collect();
+        let doc = marker_doc(30, &names, &objects);
+        let limits = Limits { marker_bytes: 10_000, ..Limits::DEFAULT };
+        let (im, report) = import_limited(doc.as_bytes(), &ImportOptions::default(), limits).unwrap();
+        let text: usize = all_markers(&im).iter().map(|m| m.comment.len()).sum();
+        assert!(text <= 10_000, "{text} bytes reached the timeline");
+        let parsed: u32 = report.entries.iter().filter(|e| e.message.contains("not in the project file")).map(|e| e.count).sum();
+        assert!(parsed <= 10, "{parsed} lists were read and cached: {report}");
+        assert!(report.mentions("cut short"), "{report}");
+        // a marker bigger than the whole budget is dropped, not kept
+        let doc = marker_doc(1, &["L0"], &(marker_obj("big", 0, &comment) + &list_obj("L0", &["big".to_string()])));
+        let (im, report) = import_limited(doc.as_bytes(), &ImportOptions::default(), Limits { marker_bytes: 999, ..Limits::DEFAULT }).unwrap();
+        assert!(all_markers(&im).is_empty());
+        assert!(report.mentions("cut short"), "{report}");
     }
 
     #[test]

@@ -919,6 +919,63 @@ fn premiere_in_points_are_not_rebased_but_timecoded_files_are_reported() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The video case of the test above: only video media can be rebased by timecode (the link step
+/// needs a frame rate), so a regression would show here. An ffmpeg-made MJPEG MOV starting at
+/// 01:00:00:00; skipped without ffmpeg.
+#[test]
+fn premiere_in_points_on_timecoded_video_are_not_rebased() {
+    let Some(ffmpeg) = filmcraft_testkit::ffmpeg_or_skip("premiere_in_points_on_timecoded_video_are_not_rebased") else { return };
+    let dir = filmcraft_testkit::fixtures_dir("prproj");
+    let Some(mov) = filmcraft_testkit::fixtures::generate(&dir.join("tc_0100.mov"), |tmp| {
+        std::process::Command::new(&ffmpeg)
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=blue:s=320x180:r=25:d=2", "-c:v", "mjpeg", "-q:v", "8", "-timecode", "01:00:00:00"])
+            .arg(tmp)
+            .status()
+            .is_ok_and(|s| s.success())
+    }) else {
+        return;
+    };
+    let mov_path = mov.to_string_lossy().to_string();
+    let in_point: i64 = 127_008_000_000; // 0.5 s
+    let doc = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
+<PremiereData Version="3">
+	<Project ObjectRef="1"/>
+	<Project ObjectID="1" Version="43"/>
+	<Sequence ObjectUID="seq"><TrackGroups>
+		<TrackGroup Index="0"><Second ObjectRef="10"/></TrackGroup>
+		<TrackGroup Index="1"><Second ObjectRef="11"/></TrackGroup>
+	</TrackGroups><Name>TC video</Name></Sequence>
+	<VideoTrackGroup ObjectID="10"><TrackGroup><Tracks><Track Index="0" ObjectURef="v1"/></Tracks><FrameRate>10160640000</FrameRate></TrackGroup><FrameRect>0,0,320,180</FrameRect></VideoTrackGroup>
+	<AudioTrackGroup ObjectID="11"><TrackGroup><FrameRate>5292000</FrameRate></TrackGroup></AudioTrackGroup>
+	<VideoClipTrack ObjectUID="v1"><ClipTrack><ClipItems><TrackItems><TrackItem Index="0" ObjectRef="20"/></TrackItems></ClipItems></ClipTrack></VideoClipTrack>
+	<VideoClipTrackItem ObjectID="20"><ClipTrackItem><TrackItem><Start>0</Start><End>254016000000</End></TrackItem><SubClip ObjectRef="30"/></ClipTrackItem></VideoClipTrackItem>
+	<SubClip ObjectID="30"><Clip ObjectRef="40"/><Name>tc.mov</Name></SubClip>
+	<VideoClip ObjectID="40"><Clip><Source ObjectRef="50"/><InPoint>{in_point}</InPoint></Clip></VideoClip>
+	<VideoMediaSource ObjectID="50"><MediaSource><Media ObjectURef="m"/></MediaSource></VideoMediaSource>
+	<Media ObjectUID="m"><FilePath>{mov_path}</FilePath><Title>tc.mov</Title></Media>
+</PremiereData>
+"#
+    );
+    let tmp = std::env::temp_dir().join(format!("fc-prproj-tcv-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let path = tmp.join("tcv.prproj").to_string_lossy().to_string();
+    std::fs::write(&path, doc).unwrap();
+    let mut s = demo();
+    let r = s.execute("file.import", json!({"paths": [path]})).unwrap();
+    let doc_report = &r["documents"][0];
+    assert_eq!(doc_report["linkedMedia"], 1, "{r}");
+    let q = s.active_sequence().unwrap();
+    let clip = q.video_tracks[0].items[0].clone();
+    let media = s.project.item(clip.item).and_then(|i| i.as_media()).unwrap();
+    assert!(media.info.video.is_some(), "the fixture is video, so a rebase would apply");
+    assert!(media.info.start_timecode.is_some_and(|t| t != 0), "the fixture has a start timecode: {:?}", media.info.start_timecode);
+    assert_eq!(clip.source_in, Tick(in_point), "the in point is not shifted by the timecode");
+    let lines: Vec<&str> = doc_report["report"].as_array().unwrap().iter().filter_map(|e| e.as_str()).collect();
+    assert!(lines.iter().any(|l| l.contains(&mov_path) && l.contains("not shifted")), "{r}");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// `file.exportInterchange {format: "<unknown>"}` used to write FCP7 XML without a word.
 #[test]
 fn export_interchange_refuses_an_unknown_format() {
