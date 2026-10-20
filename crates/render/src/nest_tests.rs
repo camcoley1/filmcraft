@@ -263,6 +263,42 @@ fn captions_inside_a_nest_are_part_of_its_picture() {
     assert!(worst(&shown, &with) > 0.1, "and are drawn when asked for");
 }
 
+#[test]
+fn animated_captions_burn_in_the_same_on_both_render_paths() {
+    // export renders frames with captions on; the Program monitor plans them: both go through
+    // caption_overlays at the frame time, so a karaoke caption lights its words identically
+    let mut r = Rig::new();
+    let red = r.matte(RED, 640, 360);
+    let seq = r.seq("karaoke", 640, 360, FrameRate::FPS_24);
+    r.put(seq, red, 48);
+    let half = Tick(TICKS_PER_SECOND / 2);
+    let mut track = CaptionTrack::new(TrackId(9101), "Subtitles".into(), CaptionFormat::Subtitle);
+    track.style.animation = filmcraft_project::CaptionAnimation::KaraokeHighlight { highlight_color: [0, 0, 255, 255] };
+    track.captions.push(Caption {
+        id: ClipId(9102),
+        start: Tick::ZERO,
+        duration: Tick(TICKS_PER_SECOND),
+        text: "ONE TWO".into(),
+        speaker: None,
+        cue_id: None,
+        settings: String::new(),
+        words: vec![filmcraft_project::WordTiming::new(Tick::ZERO, half, "ONE"), filmcraft_project::WordTiming::new(half, half, "TWO")],
+    });
+    r.p.sequence_mut(seq).unwrap().caption_tracks.push(track);
+    let opts = RenderOptions { captions: true, ..Default::default() };
+    let first = render_sequence(&r.p, seq, Tick(1000), opts, &r.map);
+    let second = render_sequence(&r.p, seq, half + Tick(1000), opts, &r.map);
+    let blue = |img: &crate::Image| {
+        (0..img.h).flat_map(|y| (0..img.w).map(move |x| (x, y))).filter(|&(x, y)| img.get(x, y)[2] > 0.5 && img.get(x, y)[0] < 0.1).count()
+    };
+    let (b1, b2) = (blue(&first), blue(&second));
+    assert!(b1 > 20 && b2 > b1 + 20, "the highlight grows with time: {b1} then {b2}");
+    // the planned frame (Program monitor) matches the rendered one (export) at both times
+    let planned = |t: Tick| plan::execute_cpu(&plan::plan_frame(&r.p, seq, t, opts, &r.map));
+    assert!(worst(&planned(Tick(1000)), &first) < 0.02);
+    assert!(worst(&planned(half + Tick(1000)), &second) < 0.02);
+}
+
 // ---- the frame plan draws a plain nest's layers itself
 
 /// How many layers the plan of `seq` at `t` has (None when it fell back to one CPU image).

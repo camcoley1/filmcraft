@@ -362,6 +362,65 @@ pub fn document_from_track(t: &CaptionTrack, offset: Tick) -> Document {
 mod tests {
     use super::*;
 
+    /// Two captions as Create Captions makes them: word-timed, on a track with an animation.
+    fn animated_track() -> CaptionTrack {
+        use filmcraft_project::{CaptionAnimation, WordTiming};
+        let ms = |v: i64| Tick(v * TICKS_PER_MS);
+        let mut t = CaptionTrack::new(TrackId(7), "Transcript".into(), CaptionFormat::Subtitle);
+        t.style.animation = CaptionAnimation::KaraokeHighlight { highlight_color: [255, 255, 0, 255] };
+        for (i, (start, text, words)) in [
+            (500, "Hello there,\nfriend.", vec![(500, "Hello"), (900, "there,"), (1400, "friend.")]),
+            (2500, "Second <i>line</i>", vec![(2500, "Second"), (3000, "line")]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            t.captions.push(Caption {
+                id: ClipId(10 + i as u64),
+                start: ms(start),
+                duration: ms(1500),
+                text: text.into(),
+                speaker: (i == 1).then(|| "Ann".to_string()),
+                cue_id: None,
+                settings: String::new(),
+                words: words.into_iter().map(|(s, w)| WordTiming::new(ms(s), ms(400), w)).collect(),
+            });
+        }
+        assert!(t.captions.iter().all(Caption::words_match_text));
+        t
+    }
+
+    #[test]
+    fn word_timings_and_animations_do_not_change_caption_files() {
+        let animated = animated_track();
+        // the same track as it was before word timing existed
+        let mut plain = animated.clone();
+        plain.style = Default::default();
+        for c in &mut plain.captions {
+            c.words.clear();
+        }
+        // and the animated track after a project save and reopen
+        let mut p = filmcraft_project::Project::new("t");
+        let seq = p.new_sequence("s", Default::default(), 1, 1, None);
+        p.sequence_mut(seq).unwrap().caption_tracks.push(animated.clone());
+        let reopened = filmcraft_project::Project::from_json(&p.to_json()).unwrap();
+        let reopened = reopened.sequence(seq).unwrap().caption_tracks[0].clone();
+        assert_eq!(reopened, animated, "words and animation survive save and reopen");
+        let opts = WriteOptions { drop_frame: true, rate: Some(FrameRate::FPS_29_97) };
+        for format in Format::ALL {
+            let want = write(&document_from_track(&plain, Tick::ZERO), format, opts);
+            assert_eq!(write(&document_from_track(&animated, Tick::ZERO), format, opts), want, "{format:?}");
+            assert_eq!(write(&document_from_track(&reopened, Tick::ZERO), format, opts), want, "{format:?}");
+        }
+        // SRT and WebVTT carry no word timing: exactly the text and cue times
+        let doc = document_from_track(&animated, Tick::ZERO);
+        assert_eq!(srt::write(&doc), "1\n00:00:00,500 --> 00:00:02,000\nHello there,\nfriend.\n\n2\n00:00:02,500 --> 00:00:04,000\nSecond <i>line</i>\n\n");
+        assert_eq!(
+            vtt::write(&doc),
+            "WEBVTT\n\n00:00:00.500 --> 00:00:02.000\nHello there,\nfriend.\n\n00:00:02.500 --> 00:00:04.000\n<v Ann>Second <i>line</i>\n\n"
+        );
+    }
+
     #[test]
     fn clock() {
         assert_eq!(parse_clock("00:00:01,500"), Some(Tick(TICKS_PER_SECOND * 3 / 2)));
