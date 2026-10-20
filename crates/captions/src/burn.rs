@@ -259,7 +259,9 @@ fn render(c: &Caption, style: &CaptionStyle, t: Option<Tick>, w: usize, h: usize
             let mut part = filmcraft_text::Layout { glyphs: l.glyphs.iter().filter(|g| (a..b).contains(&g.cluster)).copied().collect(), ..Default::default() };
             let Some(g0) = part.glyphs.first().copied() else { continue };
             part.vertical = l.vertical;
-            let left = g0.x;
+            // the word's left edge is its leftmost glyph (glyph order is visual order only for
+            // left-to-right text)
+            let left = part.glyphs.iter().map(|g| g.x).fold(g0.x, f32::min);
             let tw = filmcraft_text::measure(line.get(a..b).unwrap_or(""), &ts);
             let spoken = wt.start <= now;
             let active = spoken && now < wt.end();

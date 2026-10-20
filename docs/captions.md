@@ -107,7 +107,8 @@ How word timings follow edits:
   becomes zero-length at that edge; words are never dropped while the text still shows them);
 - setting in/out moves the words by the change of the in point, then clamps them;
 - splitting gives each half the words that start on its side and cuts the text at that word
-  boundary (if all words start on one side, both halves keep the whole text and all words);
+  boundary, keeping line breaks but dropping inline markup (if all words start on one side, both
+  halves keep the whole text and all words);
 - merging joins the word lists; editing the text keeps the words only while they still spell it
   word for word (line breaks and markup may change), otherwise they are cleared.
 

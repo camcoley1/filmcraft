@@ -3592,3 +3592,12 @@
 	Open a sequence to search its graphics	打开序列以搜索其中的图形
 	No text graphics in this sequence. Add text with the Type tool.	此序列中没有文本图形。请用文字工具添加文本。
 	No matching text.	没有匹配的文本。
+	Static	静态
+	Karaoke	卡拉 OK
+	Word pop	单词弹出
+	Boxed word	单词方框
+	9:16 safe area	9:16 安全区域
+	Safe top	安全区域：顶部
+	Safe middle	安全区域：中间
+	Safe bottom	安全区域：底部
+	Word animation for captions with word timings (Create Captions from a transcript)	为带单词时间的字幕添加逐词动画（从转录创建字幕）
