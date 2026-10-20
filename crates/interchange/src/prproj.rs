@@ -1571,7 +1571,7 @@ mod tests {
         let doc = marker_doc(50, &names, &objects);
         let limits = Limits { marker_bytes: 4_000, ..Limits::DEFAULT };
         let (im, report, stats) = import_stats(doc.as_bytes(), &ImportOptions::default(), limits).unwrap();
-        assert!(stats.parse_attempts <= 1, "{} parses", stats.parse_attempts);
+        assert_eq!(stats.parse_attempts, 1);
         assert_eq!(stats.cached_bytes, 0);
         assert_eq!(stats.marker_bytes, 0);
         assert!(all_markers(&im).is_empty());
@@ -1626,6 +1626,53 @@ mod tests {
         assert!(markers.iter().all(|m| m.comment.starts_with('a')));
         let cut: u32 = report.entries.iter().filter(|e| e.message.contains("cut short")).map(|e| e.count).sum();
         assert_eq!(cut, 2, "the third copy of A and list B: {report}");
+    }
+
+    /// A list is built whole before it is copied out, so a marker can fit when it is parsed and
+    /// then not fit when copied. With a 2,500-byte budget: clip 0 copies A (1,000); clip 1's list
+    /// holds the cached A and a new B (600). B fits when parsed (1,500 left on both sides) and is
+    /// kept and charged, but copying A first leaves 500, so B never reaches the timeline.
+    #[test]
+    fn a_marker_can_be_cached_but_never_copied_and_is_still_charged() {
+        let objects = marker_obj("a", 0, &"a".repeat(1_000))
+            + &marker_obj("b", 1, &"b".repeat(600))
+            + &list_obj("A", &["a".to_string()])
+            + &list_obj("AB", &["a".to_string(), "b".to_string()]);
+        let doc = marker_doc(2, &["A", "AB"], &objects);
+        let limits = Limits { marker_bytes: 2_500, ..Limits::DEFAULT };
+        let (im, report, stats) = import_stats(doc.as_bytes(), &ImportOptions::default(), limits).unwrap();
+        assert_eq!(stats.cached_bytes, 1_600, "B is kept, so the cache is charged for it");
+        assert_eq!(stats.marker_bytes, 2_000, "two copies of A; B did not fit");
+        let markers = all_markers(&im);
+        assert_eq!(markers.len(), 2);
+        assert!(markers.iter().all(|m| m.comment.starts_with('a')));
+        assert!(report.mentions("cut short"), "{report}");
+    }
+
+    /// Past the memo's cap, markers are not remembered and a second list naming them parses them
+    /// again; the JSON budget still bounds that work, and the result stays correct.
+    #[test]
+    fn a_saturated_marker_memo_is_still_bounded_by_the_json_budget() {
+        let ids: Vec<String> = (0..5).map(|i| format!("m{i}")).collect();
+        let mut objects: String = ids.iter().enumerate().map(|(i, id)| marker_obj(id, i as i64, "x")).collect();
+        let lists: Vec<String> = (0..10).map(|i| format!("L{i}")).collect();
+        for l in &lists {
+            objects.push_str(&list_obj(l, &ids));
+        }
+        let names: Vec<&str> = lists.iter().map(String::as_str).collect();
+        let doc = marker_doc(10, &names, &objects);
+        // memo of two: three markers are parsed again by each of the ten lists
+        let (im, report, stats) = import_stats(doc.as_bytes(), &ImportOptions::default(), Limits { marker_memo: 2, ..Limits::DEFAULT }).unwrap();
+        assert_eq!(stats.parse_attempts, 2 + 3 * 10);
+        assert_eq!(all_markers(&im).len(), 50, "every clip still gets its five markers");
+        assert!(!report.mentions("cut short"), "{report}");
+        // a small JSON budget bounds that re-parsing and says so
+        let blob = r#"{"DVAMarker":{"mStartTime":{"ticks":0},"mComment":"x"}}"#.len();
+        let budget = blob * 12;
+        let (_, report, stats) =
+            import_stats(doc.as_bytes(), &ImportOptions::default(), Limits { marker_memo: 2, marker_json: budget, ..Limits::DEFAULT }).unwrap();
+        assert!(stats.parse_attempts <= 12, "{} parses under a 12-blob budget", stats.parse_attempts);
+        assert!(report.mentions("marker data beyond"), "{report}");
     }
 
     #[test]
