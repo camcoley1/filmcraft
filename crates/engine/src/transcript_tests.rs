@@ -221,3 +221,33 @@ fn onset_guard_param_is_validated_and_widens_the_kept_air() {
     assert!((diff - 0.6).abs() < 0.1, "{diff}");
     assert_eq!(s.active_sequence().unwrap().duration(), before);
 }
+
+#[test]
+fn pause_presets_map_to_thresholds_and_explicit_values_win() {
+    let (mut s, item, _) = session();
+    s.execute("transcript.generate", json!({"items": [item.0]})).unwrap();
+    let before = s.active_sequence().unwrap().duration();
+    // the fixture pause is 1.2 s: gentle (min 1.5) leaves it, balanced (min 1.0) and aggressive cut it
+    let run = |s: &mut Session, p: serde_json::Value| s.execute("transcript.removePauses", p).unwrap();
+    assert_eq!(run(&mut s, json!({"preset": "gentle"}))["removed"], 0);
+    let balanced = run(&mut s, json!({"preset": "balanced"}));
+    assert_eq!(balanced["removed"], 1);
+    s.execute("edit.undo", json!({})).unwrap();
+    let default = run(&mut s, json!({}));
+    assert_eq!(default["ticks"], balanced["ticks"], "balanced is the default");
+    s.execute("edit.undo", json!({})).unwrap();
+    let aggressive = run(&mut s, json!({"preset": "aggressive", "onsetGuardMs": 0}));
+    assert!(aggressive["ticks"].as_i64().unwrap() > balanced["ticks"].as_i64().unwrap(), "{aggressive} vs {balanced}");
+    s.execute("edit.undo", json!({})).unwrap();
+    // explicit minSeconds beats the preset's: gentle with min 0.5 now cuts the pause
+    assert_eq!(run(&mut s, json!({"preset": "gentle", "minSeconds": 0.5}))["removed"], 1);
+    s.execute("edit.undo", json!({})).unwrap();
+    // and explicit keepSeconds beats the preset's 0.15
+    let keep = run(&mut s, json!({"keepSeconds": 0.4, "onsetGuardMs": 0}));
+    assert!(keep["ticks"].as_i64().unwrap() < balanced["ticks"].as_i64().unwrap());
+    s.execute("edit.undo", json!({})).unwrap();
+    for bad in [json!({"preset": "extreme"}), json!({"preset": 3}), json!({"minSeconds": -1}), json!({"keepSeconds": "x"}), json!({"minSeconds": 1e30})] {
+        assert!(s.execute("transcript.removePauses", bad.clone()).is_err(), "{bad}");
+    }
+    assert_eq!(s.active_sequence().unwrap().duration(), before);
+}

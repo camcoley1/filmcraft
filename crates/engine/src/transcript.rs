@@ -365,11 +365,33 @@ fn onset_guard_p(p: &Value, cmd: &str) -> Result<Tick> {
     Ok(tx::onset_guard(ms.round().clamp(0.0, f64::from(tx::MAX_ONSET_GUARD_MS)) as u32))
 }
 
+/// Aggressiveness presets for Remove Pauses: (name, `minSeconds`, `keepSeconds`).
+const PAUSE_PRESETS: &[(&str, f64, f64)] = &[("gentle", 1.5, 0.3), ("balanced", 1.0, 0.15), ("aggressive", 0.5, 0.08)];
+
+/// A seconds parameter: a finite number from 0 to 3600, else refused.
+fn seconds_p(p: &Value, key: &str, cmd: &str) -> Result<Option<f64>> {
+    let Some(v) = p.get(key).filter(|v| !v.is_null()) else { return Ok(None) };
+    v.as_f64()
+        .filter(|x| x.is_finite() && (0.0..=3600.0).contains(x))
+        .map(Some)
+        .ok_or_else(|| bad(cmd, format!("`{key}` must be a number of seconds from 0 to 3600")))
+}
+
 fn remove_pauses(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "transcript.removePauses";
+    let (preset_min, preset_keep) = match p.get("preset").filter(|v| !v.is_null()) {
+        None => (1.0, 0.15),
+        Some(v) => {
+            let hit = v.as_str().and_then(|n| PAUSE_PRESETS.iter().find(|(name, ..)| *name == n));
+            let names: Vec<&str> = PAUSE_PRESETS.iter().map(|x| x.0).collect();
+            let hit = hit.ok_or_else(|| bad(CMD, format!("unknown `preset`; use one of: {}", names.join(", "))))?;
+            (hit.1, hit.2)
+        }
+    };
+    let min = Tick::from_seconds_f64(seconds_p(p, "minSeconds", CMD)?.unwrap_or(preset_min));
+    let keep = Tick::from_seconds_f64(seconds_p(p, "keepSeconds", CMD)?.unwrap_or(preset_keep));
+    let guard = onset_guard_p(p, CMD)?;
     let words = sequence_words(s);
-    let min = Tick::from_seconds_f64(f64_p(p, "minSeconds").unwrap_or(1.0));
-    let keep = Tick::from_seconds_f64(f64_p(p, "keepSeconds").unwrap_or(0.15));
-    let guard = onset_guard_p(p, "transcript.removePauses")?;
     let ranges = tx::find_pauses(&words, min, keep, guard, s.sequence_rate());
     remove_ranges(s, "Remove Pauses", ranges)
 }
@@ -485,7 +507,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "transcript.removePauses",
             "Remove Pauses",
             &["Sequence", "Transcript"],
-            r#"{"minSeconds":f?,"keepSeconds":f?,"onsetGuardMs":n?}"#,
+            r#"{"preset":"gentle"|"balanced"|"aggressive"?,"minSeconds":f?,"keepSeconds":f?,"onsetGuardMs":n?}"#,
             has_transcript,
             remove_pauses,
             true,
