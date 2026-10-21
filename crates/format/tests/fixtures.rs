@@ -259,3 +259,35 @@ fn v10_minimal_loads_with_m3_11_defaults() {
     assert_eq!(again.schema_version, SCHEMA_VERSION);
     assert_eq!(&again.project, p);
 }
+
+#[test]
+fn v15_caption_track_loads_and_resaves_as_v16_intact() {
+    // a project saved before caption word timings and animation existed (schema 15)
+    let bytes = fixture("v15-captions.fcproj");
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(!text.contains("\"words\"") && !text.contains("\"animation\""));
+    let l = decode(&bytes).unwrap();
+    assert_eq!(l.schema_version, 15);
+    assert!(l.migrated());
+    let p = &l.project;
+    let seq = p.sequences().find_map(|i| i.as_sequence()).unwrap();
+    let track = &seq.caption_tracks[0];
+    let c = &track.captions[0];
+    assert_eq!(c.text, "{\\an8}Hello <i>there</i>");
+    assert_eq!((c.start, c.duration), (Tick(254_016_000_000), Tick(508_032_000_000)));
+    assert_eq!((c.speaker.as_deref(), c.cue_id.as_deref()), (Some("Ann"), Some("1")));
+    assert!(c.words.is_empty());
+    assert_eq!(track.style.size, 60.0);
+    assert_eq!(track.style.color, [255, 255, 0, 255]);
+    assert_eq!(track.style.animation, filmcraft_project::CaptionAnimation::None);
+    // saved again: schema 16, the caption unchanged, and still no new keys
+    let out = encode(p, false);
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["schema_version"], SCHEMA_VERSION);
+    assert_eq!(SCHEMA_VERSION, 16);
+    let again = decode(&out).unwrap();
+    assert!(!again.migrated());
+    assert_eq!(&again.project, p);
+    let resaved = String::from_utf8(out).unwrap();
+    assert!(!resaved.contains("\"words\"") && !resaved.contains("\"animation\""));
+}

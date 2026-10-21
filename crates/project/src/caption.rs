@@ -420,29 +420,41 @@ enum Piece<'a> {
 const ENTITIES: [(&str, char); 8] =
     [("amp;", '&'), ("lt;", '<'), ("gt;", '>'), ("nbsp;", '\u{a0}'), ("quot;", '"'), ("apos;", '\''), ("lrm;", '\u{200e}'), ("rlm;", '\u{200f}')];
 
-/// Walk raw caption text into pieces with their byte ranges, by the rules of [`plain_text`]: a
-/// `<` up to the next `>` is a tag (with no `>` after it, a literal `<`), `{\` up to the next `}`
-/// is an override block, the common entities decode to one character, `\r` is dropped.
-fn pieces(s: &str) -> Vec<(std::ops::Range<usize>, Piece<'_>)> {
-    let mut out = Vec::with_capacity(s.len());
-    let mut i = 0;
-    // once no `>` or `}` follows, none follows any later position either (keeps this linear)
-    let (mut no_gt, mut no_brace) = (false, false);
-    while let Some(rest) = s.get(i..) {
-        let Some(c) = rest.chars().next() else { break };
+/// Raw caption text as pieces with their byte ranges, by the rules of [`plain_text`]: a `<` up to
+/// the next `>` is a tag (with no `>` after it, a literal `<`), `{\` up to the next `}` is an
+/// override block, the common entities decode to one character, `\r` is dropped. Streams without
+/// allocating, linear in the text length (once no `>` or `}` follows, none follows any later
+/// position either).
+struct Pieces<'a> {
+    s: &'a str,
+    i: usize,
+    no_gt: bool,
+    no_brace: bool,
+}
+
+fn pieces(s: &str) -> Pieces<'_> {
+    Pieces { s, i: 0, no_gt: false, no_brace: false }
+}
+
+impl<'a> Iterator for Pieces<'a> {
+    type Item = (std::ops::Range<usize>, Piece<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let rest = self.s.get(self.i..)?;
+        let c = rest.chars().next()?;
         let n = c.len_utf8();
         let (len, piece) = match c {
-            '<' if !no_gt => match rest.find('>') {
+            '<' if !self.no_gt => match rest.find('>') {
                 Some(e) => (e + 1, Piece::Tag(rest.get(1..e).unwrap_or(""))),
                 None => {
-                    no_gt = true;
+                    self.no_gt = true;
                     (n, Piece::Char('<'))
                 }
             },
-            '{' if !no_brace && rest.get(1..).is_some_and(|r| r.starts_with('\\')) => match rest.find('}') {
+            '{' if !self.no_brace && rest.get(1..).is_some_and(|r| r.starts_with('\\')) => match rest.find('}') {
                 Some(e) => (e + 1, Piece::Hidden),
                 None => {
-                    no_brace = true;
+                    self.no_brace = true;
                     (n, Piece::Char('{'))
                 }
             },
@@ -453,16 +465,15 @@ fn pieces(s: &str) -> Vec<(std::ops::Range<usize>, Piece<'_>)> {
             '\r' => (n, Piece::Hidden),
             _ => (n, Piece::Char(c)),
         };
-        out.push((i..i + len, piece));
-        i += len;
+        let at = self.i;
+        self.i += len;
+        Some((at..self.i, piece))
     }
-    out
 }
 
 /// Strip `<…>` tags and decode the common HTML/WebVTT entities.
 pub fn plain_text(s: &str) -> String {
     pieces(s)
-        .into_iter()
         .filter_map(|(_, p)| match p {
             Piece::Char(c) => Some(c),
             _ => None,
@@ -470,76 +481,90 @@ pub fn plain_text(s: &str) -> String {
         .collect()
 }
 
-/// The name of an inline tag that opens a span (`i`, `b`, `u`, `v`, `c`, `lang`, `ruby`...), from
-/// the text between its angle brackets; `None` for closing tags, timestamps and empty tags.
-fn opening_tag_name(tag: &str) -> Option<&str> {
-    let t = tag.trim();
-    if t.starts_with('/') || t.ends_with('/') || t.starts_with(|c: char| c.is_ascii_digit()) {
-        return None;
-    }
-    let name = t.split(|c: char| c.is_whitespace() || c == '.').next().unwrap_or("");
-    (!name.is_empty()).then_some(name)
-}
+/// Deepest inline tag nesting a word split handles; deeper markup keeps the whole-text fallback.
+const MAX_TAG_DEPTH: usize = 64;
 
 /// Cut raw caption text before its `k`-th word (counted in the drawn text, as [`caption_words`]
 /// does), keeping the markup on both halves: a leading override block (`{\an8}`) starts both, and
-/// an inline tag open across the cut is closed on the left and reopened on the right. `None`
-/// when the cut cannot be placed.
+/// inline tags open across the cut are closed on the left and reopened on the right. `None` when
+/// the cut cannot be placed or the markup is not strictly nested (crossed, unclosed or unmatched
+/// tags, an empty or self-closing tag inside another, nesting deeper than [`MAX_TAG_DEPTH`]).
 fn split_raw_at_word(raw: &str, k: usize) -> Option<(String, String)> {
-    let ps = pieces(raw);
+    // pass 1: the cut is the end of the whitespace before the k-th word
     let mut words = 0usize;
     let mut in_word = false;
-    // end of the whitespace before the current position, and the tags open there
+    let mut last_space_end = None;
     let mut cut = None;
-    let mut open: Vec<(&str, &str)> = Vec::new();
-    let mut open_at_cut: Vec<(&str, &str)> = Vec::new();
-    for (range, p) in &ps {
-        match *p {
+    let mut prefix = None;
+    for (range, p) in pieces(raw) {
+        match p {
             Piece::Char(c) if c.is_whitespace() => {
                 in_word = false;
-                cut = Some(range.end);
-                open_at_cut.clone_from(&open);
+                last_space_end = Some(range.end);
             }
-            Piece::Char(_) => {
-                if !in_word {
-                    in_word = true;
-                    if words == k {
-                        break;
-                    }
-                    words += 1;
+            Piece::Char(_) if !in_word => {
+                in_word = true;
+                if words == k {
+                    cut = last_space_end;
+                    break;
                 }
+                words += 1;
             }
-            Piece::Tag(t) => match opening_tag_name(t) {
-                Some(name) => open.push((name, t)),
-                None => {
-                    let closing = t.trim().strip_prefix('/').map(str::trim);
-                    if let Some(name) = closing
-                        && let Some(at) = open.iter().rposition(|(n, _)| *n == name)
-                    {
-                        open.remove(at);
-                    }
-                }
-            },
-            Piece::Hidden => {}
+            // a leading override block ({\an8}: position) applies to both halves
+            Piece::Hidden if words == 0 && prefix.is_none() && raw.get(range.clone()).is_some_and(|b| b.starts_with('{')) => {
+                prefix = Some(range);
+            }
+            _ => {}
         }
     }
-    if words != k || !in_word {
+    let cut = cut?;
+    // pass 2: the whole text must be strictly nested; the tags open at the cut are snapshotted once
+    let mut stack: Vec<(&str, &str)> = Vec::new();
+    let mut at_cut: Option<Vec<(&str, &str)>> = None;
+    for (range, p) in pieces(raw) {
+        if at_cut.is_none() && range.start >= cut {
+            at_cut = Some(stack.clone());
+        }
+        let Piece::Tag(tag) = p else { continue };
+        let t = tag.trim();
+        if let Some(closing) = t.strip_prefix('/') {
+            // a closer must close the innermost open tag
+            let (name, _) = stack.pop()?;
+            if closing.trim() != name {
+                return None;
+            }
+        } else if t.starts_with(|c: char| c.is_ascii_digit()) {
+            // a WebVTT timestamp tag (<00:00:01.000>) opens nothing
+        } else if t.is_empty() || t.ends_with('/') {
+            if !stack.is_empty() {
+                return None;
+            }
+        } else {
+            let name = t.split(|c: char| c.is_whitespace() || c == '.').next().unwrap_or("");
+            if name.is_empty() || stack.len() >= MAX_TAG_DEPTH {
+                return None;
+            }
+            stack.push((name, t));
+        }
+    }
+    let open = at_cut?;
+    if !stack.is_empty() {
         return None;
     }
-    let cut = cut?;
     let mut left = raw.get(..cut)?.trim_end().to_string();
-    for (name, _) in open_at_cut.iter().rev() {
-        left.push_str(&format!("</{name}>"));
+    for (name, _) in open.iter().rev() {
+        left.push_str("</");
+        left.push_str(name);
+        left.push('>');
     }
     let mut right = String::new();
-    // a leading override block ({\an8}: position) applies to both halves
-    if let Some((range, Piece::Hidden)) = ps.iter().find(|(_, p)| !matches!(p, Piece::Char(c) if c.is_whitespace()))
-        && raw.get(range.clone()).is_some_and(|b| b.starts_with('{'))
-    {
-        right.push_str(raw.get(range.clone())?);
+    if let Some(range) = prefix {
+        right.push_str(raw.get(range)?);
     }
-    for (_, tag) in &open_at_cut {
-        right.push_str(&format!("<{tag}>"));
+    for (_, tag) in &open {
+        right.push('<');
+        right.push_str(tag);
+        right.push('>');
     }
     right.push_str(raw.get(cut..)?.trim_start());
     Some((left, right))
@@ -696,6 +721,52 @@ mod tests {
             let all = caption_words(text);
             assert_eq!((caption_words(&l), caption_words(&r)), (all[..k].to_vec(), all[k..].to_vec()), "{text}");
         }
+    }
+
+    #[test]
+    fn malformed_markup_keeps_the_whole_text() {
+        for text in [
+            "<b><i>one two</b></i>", // crossed
+            "<i>one two",            // unclosed
+            "one</i> two",           // unmatched closer
+            "<i>one <> two</i>",     // empty tag inside another
+            "<i>one <br/> two</i>",  // self-closing tag inside another
+            "<i>one</b> two</i>",    // wrong closer
+        ] {
+            let mut c = spelled(text);
+            let before = c.clone();
+            assert_eq!(c.split_words_at(Tick(20)), None, "{text}");
+            assert_eq!(c, before, "{text}: nothing changes before every check has passed");
+        }
+        // markup that is fine at the top level still splits
+        assert_eq!(split_text("one <br/> two", 1), Some(("one <br/>".into(), "two".into())));
+        assert_eq!(split_text("<00:00:01.000>one two", 1), Some(("<00:00:01.000>one".into(), "two".into())));
+    }
+
+    #[test]
+    fn deep_nesting_is_capped_and_shallow_nesting_reopens_exactly() {
+        // 10,000 nested tags: over the depth cap, so the split declines, quickly
+        let n = 10_000;
+        let text = format!("{}a{}b{}", "<i>".repeat(n), " ".repeat(n), "</i>".repeat(n));
+        let r = std::panic::catch_unwind(|| {
+            let started = std::time::Instant::now();
+            let mut c = spelled(&text);
+            let before = c.clone();
+            let split = c.split_words_at(Tick(20));
+            (split.is_none(), c == before, started.elapsed())
+        });
+        let (declined, unchanged, took) = r.unwrap();
+        assert!(declined && unchanged);
+        assert!(took < std::time::Duration::from_millis(500), "{took:?}");
+        // 60 nested classed spans split with every opening tag reopened as written
+        let opens: String = (0..60).map(|i| format!("<c.t{i}>")).collect();
+        let closes = "</c>".repeat(60);
+        let (l, r) = split_text(&format!("{opens}a b{closes}"), 1).unwrap();
+        assert_eq!(l, format!("{opens}a{closes}"));
+        assert_eq!(r, format!("{opens}b{closes}"));
+        // and 65 is one too deep
+        let opens: String = (0..65).map(|i| format!("<c.t{i}>")).collect();
+        assert_eq!(split_text(&format!("{opens}a b{}", "</c>".repeat(65)), 1), None);
     }
 
     #[test]
