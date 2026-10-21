@@ -356,11 +356,21 @@ fn remove_ranges(s: &mut Session, label: &str, ranges: Vec<TimeRange>) -> Result
     Ok(json!({"removed": n, "ticks": total.0, "seconds": total.0 as f64 / TICKS_PER_SECOND as f64}))
 }
 
+/// `onsetGuardMs`: how close a cut may come to the neighbouring words, in milliseconds (default
+/// [`tx::DEFAULT_ONSET_GUARD_MS`]). Numbers are rounded and clamped to `0..=500`; anything else is
+/// refused.
+fn onset_guard_p(p: &Value, cmd: &str) -> Result<Tick> {
+    let Some(v) = p.get("onsetGuardMs").filter(|v| !v.is_null()) else { return Ok(tx::onset_guard(tx::DEFAULT_ONSET_GUARD_MS)) };
+    let ms = v.as_f64().filter(|x| x.is_finite()).ok_or_else(|| bad(cmd, "`onsetGuardMs` must be a number of milliseconds from 0 to 500"))?;
+    Ok(tx::onset_guard(ms.round().clamp(0.0, f64::from(tx::MAX_ONSET_GUARD_MS)) as u32))
+}
+
 fn remove_pauses(s: &mut Session, p: &Value) -> Result<Value> {
     let words = sequence_words(s);
     let min = Tick::from_seconds_f64(f64_p(p, "minSeconds").unwrap_or(1.0));
     let keep = Tick::from_seconds_f64(f64_p(p, "keepSeconds").unwrap_or(0.15));
-    let ranges = tx::find_pauses(&words, min, keep, s.sequence_rate());
+    let guard = onset_guard_p(p, "transcript.removePauses")?;
+    let ranges = tx::find_pauses(&words, min, keep, guard, s.sequence_rate());
     remove_ranges(s, "Remove Pauses", ranges)
 }
 
@@ -371,7 +381,8 @@ fn remove_fillers(s: &mut Session, p: &Value) -> Result<Value> {
         None => tx::DEFAULT_FILLERS.iter().map(|f| f.to_string()).collect(),
     };
     let hits = tx::find_fillers(&words, &fillers);
-    let ranges = tx::filler_ranges(&words, &hits, s.sequence_rate());
+    let guard = onset_guard_p(p, "transcript.removeFillers")?;
+    let ranges = tx::filler_ranges(&words, &hits, guard, s.sequence_rate());
     remove_ranges(s, "Remove Filler Words", ranges)
 }
 
@@ -474,12 +485,20 @@ pub fn commands() -> Vec<CommandSpec> {
             "transcript.removePauses",
             "Remove Pauses",
             &["Sequence", "Transcript"],
-            r#"{"minSeconds":f?,"keepSeconds":f?}"#,
+            r#"{"minSeconds":f?,"keepSeconds":f?,"onsetGuardMs":n?}"#,
             has_transcript,
             remove_pauses,
             true,
         ),
-        spec("transcript.removeFillers", "Remove Filler Words", &["Sequence", "Transcript"], r#"{"fillers":[str]?}"#, has_transcript, remove_fillers, true),
+        spec(
+            "transcript.removeFillers",
+            "Remove Filler Words",
+            &["Sequence", "Transcript"],
+            r#"{"fillers":[str]?,"onsetGuardMs":n?}"#,
+            has_transcript,
+            remove_fillers,
+            true,
+        ),
         spec(
             "transcript.createCaptions",
             "Create Captions from Transcript…",

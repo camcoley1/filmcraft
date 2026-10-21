@@ -191,3 +191,33 @@ fn generate_without_a_transcriber() {
     let r = s.execute("transcript.generate", json!({})).unwrap();
     assert!(r["items"].as_array().unwrap().len() >= 2, "{r}");
 }
+
+#[test]
+fn onset_guard_param_is_validated_and_widens_the_kept_air() {
+    let (mut s, item, _) = session();
+    s.execute("transcript.generate", json!({"items": [item.0]})).unwrap();
+    let before = s.active_sequence().unwrap().duration();
+    for cmd in ["transcript.removePauses", "transcript.removeFillers"] {
+        for bad in [json!("40"), json!([]), json!({}), json!(true)] {
+            let e = s.execute(cmd, json!({"onsetGuardMs": bad})).unwrap_err().to_string();
+            assert!(e.contains("onsetGuardMs"), "{cmd}: {e}");
+            assert_eq!(s.active_sequence().unwrap().duration(), before, "a refused call edits nothing");
+        }
+    }
+    // out-of-range numbers clamp to 0..=500 instead of failing
+    for v in [json!(-1e30), json!(1e30), json!(12.6)] {
+        s.execute("transcript.removePauses", json!({"minSeconds": 1.0, "keepSeconds": 0.0, "onsetGuardMs": v})).unwrap();
+        s.execute("edit.undo", json!({})).unwrap();
+    }
+    // the 1.2 s pause keeps `guard` of air on both sides: a 300 ms guard removes 0.6 s less than none
+    let ticks = |s: &mut Session, g: i64| {
+        s.execute("transcript.removePauses", json!({"minSeconds": 1.0, "keepSeconds": 0.0, "onsetGuardMs": g})).unwrap()["ticks"].as_i64().unwrap()
+    };
+    let none = ticks(&mut s, 0);
+    s.execute("edit.undo", json!({})).unwrap();
+    let wide = ticks(&mut s, 300);
+    s.execute("edit.undo", json!({})).unwrap();
+    let diff = Tick(none - wide).seconds();
+    assert!((diff - 0.6).abs() < 0.1, "{diff}");
+    assert_eq!(s.active_sequence().unwrap().duration(), before);
+}

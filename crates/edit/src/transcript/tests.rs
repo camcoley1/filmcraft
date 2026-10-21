@@ -186,11 +186,11 @@ fn pauses_are_found_and_removed_in_one_pass() {
     let mut q = whole();
     let w = sequence_words(&q, &transcripts());
     // only the 2 s pause after "show." is ≥ 1 s; 0.1 s is kept on each side
-    let p = find_pauses(&w, s(1.0), s(0.1), R);
+    let p = find_pauses(&w, s(1.0), s(0.1), Tick::ZERO, R);
     assert_eq!(p.len(), 1);
     assert_eq!((p[0].start, p[0].end()), (s(1.80), s(3.60)));
     // 0.4 s threshold also finds 5.90→6.40 and 7.60→8.00
-    let p2 = find_pauses(&w, s(0.4), s(0.1), R);
+    let p2 = find_pauses(&w, s(0.4), s(0.1), Tick::ZERO, R);
     assert_eq!(p2.len(), 3);
     let mut next = 1000;
     let mut ctx = EditCtx { next_id: &mut next, media_duration: &media_dur, media_start: &|_| Tick::ZERO, min_duration: R.frame_duration() };
@@ -202,7 +202,7 @@ fn pauses_are_found_and_removed_in_one_pass() {
     // the long pause is now 0.2 s
     assert_eq!(w2[4].start - w2[3].end, s(0.2));
     assert_eq!(w2.last().unwrap().end, s(10.0) - removed);
-    assert!(find_pauses(&w2, s(0.4), s(0.1), R).is_empty());
+    assert!(find_pauses(&w2, s(0.4), s(0.1), Tick::ZERO, R).is_empty());
 }
 
 #[test]
@@ -216,7 +216,7 @@ fn fillers_are_found_with_phrases_and_removed() {
     more.push("You know".into());
     more.push("you".into());
     assert_eq!(find_fillers(&w, &more), vec![4..5, 15..16, 18..20]);
-    let ranges = filler_ranges(&w, &hits, R);
+    let ranges = filler_ranges(&w, &hits, Tick::ZERO, R);
     // "Um," 3.70–4.00 → nearest frames 3.68–4.00; "uh" 8.20–8.50 → 8.20–8.48
     assert_eq!(ranges.iter().map(|r| (r.start, r.end())).collect::<Vec<_>>(), vec![(s(3.68), s(4.00)), (s(8.20), s(8.48))]);
     let mut next = 1000;
@@ -352,4 +352,72 @@ fn transcript_words_with_spaces_or_no_text_keep_captions_animated() {
     assert!(c.words_match_text(), "{c:?}");
     let got: Vec<(&str, Tick, Tick)> = c.words.iter().map(|x| (x.text.as_str(), x.start, x.end())).collect();
     assert_eq!(got, [("I", s(0.0), s(0.2)), ("love", s(0.2), s(0.5)), ("New", s(0.5), s(0.8)), ("York", s(0.8), s(1.1)), ("pizza.", s(1.2), s(1.7))]);
+}
+
+fn word(text: &str, start: f64, end: f64) -> SeqWord {
+    SeqWord { text: text.into(), start: s(start), end: s(end), clip: ClipId(1), item: MEDIA, index: 0, track: 0, speaker: None, confidence: 1.0 }
+}
+
+#[test]
+fn onset_guard_clamps_hostile_values() {
+    assert_eq!(onset_guard(0), Tick::ZERO);
+    assert_eq!(onset_guard(40), s(0.04));
+    assert_eq!(onset_guard(MAX_ONSET_GUARD_MS), s(0.5));
+    assert_eq!(onset_guard(u32::MAX), s(0.5));
+}
+
+#[test]
+fn a_pause_cut_stays_the_guard_away_from_both_neighbours() {
+    let w = [word("a", 0.0, 1.0), word("b", 3.0, 3.5)];
+    // no guard and no keep: the naive cut is the whole gap, touching the onset of "b"
+    let naive = find_pauses(&w, s(1.0), Tick::ZERO, Tick::ZERO, R);
+    assert_eq!((naive[0].start, naive[0].end()), (s(1.0), s(3.0)));
+    // 50 ms guard: starts at/after 1.05 (frame 1.08), ends at/before 2.95 (frame 2.92)
+    let g = find_pauses(&w, s(1.0), Tick::ZERO, s(0.05), R);
+    assert_eq!((g[0].start, g[0].end()), (s(1.08), s(2.92)));
+    assert!(g[0].start >= w[0].end + s(0.05) && g[0].end() <= w[1].start - s(0.05));
+    // a larger keep wins over a smaller guard
+    let k = find_pauses(&w, s(1.0), s(0.2), s(0.05), R);
+    assert_eq!((k[0].start, k[0].end()), (s(1.2), s(2.8)));
+    // a pause only as long as the two guards leaves nothing to cut
+    assert!(find_pauses(&w, s(1.0), Tick::ZERO, s(1.0), R).is_empty());
+}
+
+#[test]
+fn a_filler_cut_never_clips_the_neighbouring_words() {
+    // "um" touches both neighbours, as Whisper often times it
+    let w = [word("so", 0.0, 0.5), word("um", 0.5, 0.8), word("then", 0.8, 1.2)];
+    let naive = filler_ranges(&w, &[1..2], Tick::ZERO, R);
+    assert_eq!((naive[0].start, naive[0].end()), (s(0.52), s(0.8)));
+    let g = filler_ranges(&w, &[1..2], s(0.1), R);
+    assert_eq!((g[0].start, g[0].end()), (s(0.6), s(0.68)));
+    assert!(g[0].start >= w[0].end + s(0.1) && g[0].end() <= w[2].start - s(0.1));
+    // a filler shorter than the two guards is kept whole
+    assert!(filler_ranges(&w, &[1..2], s(0.2), R).is_empty());
+    // with air around it the cut keeps the filler's own bounds
+    let air = [word("so", 0.0, 0.4), word("um", 1.0, 1.4), word("then", 2.0, 2.4)];
+    let r = filler_ranges(&air, &[1..2], s(0.04), R);
+    assert_eq!((r[0].start, r[0].end()), (s(1.0), s(1.4)));
+}
+
+#[test]
+fn overlapping_unsorted_or_out_of_range_words_do_not_panic() {
+    let w = [word("a", 2.0, 1.0), word("b", 0.5, 3.0), word("um", 0.0, 0.0), word("c", 1.0, 1.0), word("d", -5.0, 9e3)];
+    for ms in [0, 40, 500, u32::MAX] {
+        let g = onset_guard(ms);
+        for keep in [Tick::ZERO, s(0.1), Tick(i64::MAX), Tick(i64::MIN)] {
+            for r in find_pauses(&w, Tick::ZERO, keep, g, R) {
+                assert!(r.duration > Tick::ZERO);
+            }
+        }
+        for hits in [vec![0..0], vec![2..3], vec![0..5], vec![3..9], vec![9..10], vec![4..2]] {
+            for r in filler_ranges(&w, &hits, g, R) {
+                assert!(r.duration > Tick::ZERO);
+            }
+        }
+    }
+    assert!(filler_ranges(&[], &[0..1], s(0.04), R).is_empty());
+    assert!(find_pauses(&[], Tick::ZERO, Tick::ZERO, s(0.04), R).is_empty());
+    // a negative guard is treated as none
+    assert_eq!(find_pauses(&[word("a", 0.0, 1.0), word("b", 3.0, 4.0)], s(1.0), Tick::ZERO, Tick(-5), R).len(), 1);
 }

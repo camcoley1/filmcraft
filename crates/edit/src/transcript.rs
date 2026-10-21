@@ -166,10 +166,23 @@ pub fn media_word_range(t: &Transcript, a: usize, b: usize, rate: FrameRate) -> 
     Some(TimeRange::from_bounds(s, e2))
 }
 
-/// Pauses between consecutive words of at least `min`, as the ranges to remove: each keeps `keep`
-/// of silence next to both words and is snapped inward to frames (pauses shorter than one frame
-/// after that are skipped).
-pub fn find_pauses(words: &[SeqWord], min: Tick, keep: Tick, rate: FrameRate) -> Vec<TimeRange> {
+/// Default onset guard in milliseconds (see [`find_pauses`]).
+pub const DEFAULT_ONSET_GUARD_MS: u32 = 40;
+/// Largest accepted onset guard in milliseconds.
+pub const MAX_ONSET_GUARD_MS: u32 = 500;
+
+/// The onset guard as ticks, with a hostile value clamped into `0..=MAX_ONSET_GUARD_MS`.
+pub fn onset_guard(ms: u32) -> Tick {
+    Tick(i64::from(ms.min(MAX_ONSET_GUARD_MS)) * (TICKS_PER_SECOND / 1000))
+}
+
+/// Pauses between consecutive words of at least `min`, as the ranges to remove: each keeps
+/// `max(keep, guard)` of silence next to both words and is snapped inward to frames (pauses shorter
+/// than one frame after that are skipped). The `guard` (onset guard) is the least distance a cut may
+/// come to either neighbouring word, so word timings that start a little late never lose the
+/// attack of the word after the cut, nor the tail of the word before it.
+pub fn find_pauses(words: &[SeqWord], min: Tick, keep: Tick, guard: Tick, rate: FrameRate) -> Vec<TimeRange> {
+    let keep = keep.max(guard).max(Tick::ZERO);
     let mut out = Vec::new();
     for p in words.windows(2) {
         let (a, b) = (p[0].end, p[1].start);
@@ -219,21 +232,30 @@ pub fn find_fillers(words: &[SeqWord], fillers: &[String]) -> Vec<std::ops::Rang
     out
 }
 
-/// Timeline ranges removing the filler words `hits`: each word range snapped to the nearest frames
-/// (never into the neighbouring words' frames).
-pub fn filler_ranges(words: &[SeqWord], hits: &[std::ops::Range<usize>], rate: FrameRate) -> Vec<TimeRange> {
+/// Timeline ranges removing the filler words `hits`: each word range snapped to the nearest frames,
+/// then pulled inward so no cut comes closer than `guard` to the word before or after it (a filler
+/// touching its neighbour keeps a `guard` sliver rather than clipping the neighbour).
+pub fn filler_ranges(words: &[SeqWord], hits: &[std::ops::Range<usize>], guard: Tick, rate: FrameRate) -> Vec<TimeRange> {
+    let guard = guard.max(Tick::ZERO);
     let mut out = Vec::new();
     for h in hits {
-        let (a, b) = (h.start, h.end - 1);
-        let mut s = rate.snap_nearest(words[a].start);
-        let mut e = rate.snap_nearest(words[b].end);
-        if a > 0 && s < words[a - 1].end {
-            s = rate.snap(words[a - 1].end) + rate.frame_duration();
+        let (Some(first), Some(last)) = (words.get(h.start), h.end.checked_sub(1).and_then(|b| words.get(b))) else { continue };
+        let mut s = rate.snap_nearest(first.start);
+        let mut e = rate.snap_nearest(last.end);
+        if let Some(prev) = h.start.checked_sub(1).and_then(|i| words.get(i)) {
+            let lo = prev.end + guard;
+            if s < lo {
+                s = rate.snap(lo);
+                if s < lo {
+                    s += rate.frame_duration();
+                }
+            }
         }
-        if let Some(n) = words.get(b + 1)
-            && e > n.start
-        {
-            e = rate.snap(n.start);
+        if let Some(next) = words.get(h.end) {
+            let hi = next.start - guard;
+            if e > hi {
+                e = rate.snap(hi);
+            }
         }
         if e > s {
             out.push(TimeRange::from_bounds(s, e));
