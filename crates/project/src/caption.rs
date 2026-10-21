@@ -724,6 +724,27 @@ mod tests {
     }
 
     #[test]
+    fn split_handles_multibyte_words_and_unicode_whitespace() {
+        // Japanese and accented words separated by an ideographic space (U+3000), a no-break
+        // space (U+00A0) and the `&nbsp;` entity, inside one tag that spans the cut
+        let text = "<i>東京 café\u{3000}日本語\u{a0}naïve&nbsp;Ωmega</i>";
+        assert_eq!(caption_words(text), ["東京", "café", "日本語", "naïve", "Ωmega"]);
+        let (l, r) = split_text(text, 2).unwrap();
+        assert_eq!(l, "<i>東京 café</i>");
+        assert_eq!(r, "<i>日本語\u{a0}naïve&nbsp;Ωmega</i>");
+        assert_eq!(
+            (caption_words(&l), caption_words(&r)),
+            (vec!["東京".to_string(), "café".into()], vec!["日本語".to_string(), "naïve".into(), "Ωmega".into()])
+        );
+        // a cut right after the no-break space entity
+        let (l, r) = split_text(text, 4).unwrap();
+        assert_eq!(l, "<i>東京 café\u{3000}日本語\u{a0}naïve&nbsp;</i>");
+        assert_eq!(r, "<i>Ωmega</i>");
+        assert_eq!(caption_words(&l).len(), 4);
+        assert_eq!(caption_words(&r), ["Ωmega"]);
+    }
+
+    #[test]
     fn malformed_markup_keeps_the_whole_text() {
         for text in [
             "<b><i>one two</b></i>", // crossed
