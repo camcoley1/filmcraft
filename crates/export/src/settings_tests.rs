@@ -1340,7 +1340,7 @@ fn hardware_b_frames_are_off_unless_asked_for() {
     assert!(!ExportSettings::default().hardware_b_frames);
     // settings saved before the field existed read as off; set, it round-trips
     let mut json = serde_json::to_value(ExportSettings::default()).unwrap();
-    json.as_object_mut().unwrap().remove("hardware_b_frames");
+    assert_eq!(json.as_object_mut().unwrap().remove("hardwareBFrames"), Some(serde_json::Value::Bool(false)));
     assert!(!serde_json::from_value::<ExportSettings>(json).unwrap().hardware_b_frames);
     let on = ExportSettings { hardware_b_frames: true, ..Default::default() };
     assert!(serde_json::from_value::<ExportSettings>(serde_json::to_value(&on).unwrap()).unwrap().hardware_b_frames);
