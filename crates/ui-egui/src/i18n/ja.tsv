@@ -2423,6 +2423,8 @@
 	Special	特殊
 	Special Effects	特殊エフェクト
 	Speech model	音声認識モデル
+	Filler words (comma separated)	フィラーワード（カンマ区切り）
+	Word onset guard when removing pauses and fillers	間とフィラーを削除するときの語頭保護
 	Speed	速度
 	Spherize	球面
 	Spiky	とげ状

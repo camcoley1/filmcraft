@@ -2434,6 +2434,8 @@
 	Special	Spécial
 	Special Effects	Effets spéciaux
 	Speech model	Modèle de parole
+	Filler words (comma separated)	Mots de remplissage (séparés par des virgules)
+	Word onset guard when removing pauses and fillers	Protection du début des mots lors de la suppression des pauses et des mots de remplissage
 	Speed	Vitesse
 	Spherize	Sphériser
 	Spiky	Hérissé

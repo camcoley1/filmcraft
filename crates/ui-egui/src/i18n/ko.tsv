@@ -2954,6 +2954,8 @@
 	Special	특수
 	Special Effects	특수 효과
 	Speech model	음성 모델
+	Filler words (comma separated)	군말 단어(쉼표로 구분)
+	Word onset guard when removing pauses and fillers	일시 정지 및 군말 제거 시 단어 시작 보호
 	Speech-to-text turns the dialogue into editable text.	음성 인식으로 대화를 편집 가능한 텍스트로 변환합니다.
 	Speed	속도
 	Speed {n}%	속도 {n}%

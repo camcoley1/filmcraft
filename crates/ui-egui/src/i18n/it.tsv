@@ -2431,6 +2431,8 @@
 	Special	Speciale
 	Special Effects	Effetti speciali
 	Speech model	Modello vocale
+	Filler words (comma separated)	Parole riempitive (separate da virgole)
+	Word onset guard when removing pauses and fillers	Protezione dell'inizio delle parole durante la rimozione di pause e riempitivi
 	Speed	Velocità
 	Spherize	Sferizza
 	Spiky	Appuntito

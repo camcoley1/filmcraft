@@ -2462,6 +2462,8 @@
 	Special	Spezial
 	Special Effects	Spezialeffekte
 	Speech model	Sprachmodell
+	Filler words (comma separated)	Füllwörter (durch Kommas getrennt)
+	Word onset guard when removing pauses and fillers	Schutz des Wortanfangs beim Entfernen von Pausen und Füllwörtern
 	Speed	Geschwindigkeit
 	Spherize	Kugelisieren
 	Spiky	Spitz

@@ -2437,6 +2437,8 @@
 	Special	Especial
 	Special Effects	Efectos especiales
 	Speech model	Modelo de voz
+	Filler words (comma separated)	Muletillas (separadas por comas)
+	Word onset guard when removing pauses and fillers	Protección del inicio de palabra al quitar pausas y muletillas
 	Speed	Velocidad
 	Spherize	Esferizar
 	Spiky	Puntiagudo

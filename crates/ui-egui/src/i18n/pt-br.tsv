@@ -2436,6 +2436,8 @@
 	Special	Especial
 	Special Effects	Efeitos especiais
 	Speech model	Modelo de fala
+	Filler words (comma separated)	Palavras de preenchimento (separadas por vírgula)
+	Word onset guard when removing pauses and fillers	Proteção do início das palavras ao remover pausas e palavras de preenchimento
 	Speed	Velocidade
 	Spherize	Esferizar
 	Spiky	Pontiagudo

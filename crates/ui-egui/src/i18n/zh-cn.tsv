@@ -2417,6 +2417,8 @@
 	Special	特殊
 	Special Effects	特殊效果
 	Speech model	语音模型
+	Filler words (comma separated)	填充词（以逗号分隔）
+	Word onset guard when removing pauses and fillers	删除停顿和填充词时保护词首
 	Speed	速度
 	Spherize	球面化
 	Spiky	尖锐
