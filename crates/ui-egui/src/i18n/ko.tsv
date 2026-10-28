@@ -1497,6 +1497,7 @@
 	Import: no file chosen (agents: shortcuts.import {path})	가져오기: 선택한 파일 없음(에이전트: shortcuts.import {path})
 	Imported “{name}”	“{name}” 가져옴
 	Import…	가져오기…
+	Import Folder or Bundle…	폴더 또는 번들 가져오기…
 	Impulse	임펄스
 	In	시작
 	in	시작
