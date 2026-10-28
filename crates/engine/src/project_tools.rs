@@ -677,8 +677,11 @@ fn new_from_template(s: &mut Session, p: &Value) -> Result<Value> {
     let name = str_p(p, "name").unwrap_or("Untitled").to_string();
     proj.name = name.clone();
     proj.root.name = name;
+    // a project made from a template is a new project: its AI cache is its own
+    proj.id.clear();
     s.project = std::sync::Arc::new(proj);
     s.history = Default::default();
+    s.project_generation += 1;
     s.history.limit = 200;
     s.state = Session::default().state;
     s.state.active_sequence = s.project.sequences().next().map(|i| i.id);

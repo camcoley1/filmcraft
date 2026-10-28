@@ -11,6 +11,8 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
 pub mod aaf_omf;
+#[cfg(feature = "sidecar")]
+pub mod ai;
 pub mod autosave;
 pub mod captions;
 pub mod clip_ops;
@@ -448,6 +450,16 @@ pub struct Session {
     pub media_stamps: std::collections::HashMap<String, media_watch::Stamp>,
     /// The stamps being taken on a worker thread ([`Session::start_media_scan`]).
     pub media_scan: Option<media_watch::MediaScan>,
+    /// Bumped whenever another project replaces this one (New, Open, Close, Recover): background
+    /// results started on the old one are not applied to the new one.
+    pub project_generation: u64,
+    /// The AI helper client (feature `sidecar`, ADR 0002); `ai.status` / `ai.connect` install the
+    /// real one, tests a fake.
+    #[cfg(feature = "sidecar")]
+    pub sidecar: Option<Arc<dyn filmcraft_sidecar::SidecarClient>>,
+    /// The AI helper handshake and the AI jobs in flight.
+    #[cfg(feature = "sidecar")]
+    pub ai: ai::AiState,
 }
 
 /// An export advanced a batch at a time on the host's thread ([`Session::pump_jobs`]).
@@ -540,6 +552,11 @@ impl Session {
             exec_depth: 0,
             media_stamps: Default::default(),
             media_scan: None,
+            project_generation: 0,
+            #[cfg(feature = "sidecar")]
+            sidecar: None,
+            #[cfg(feature = "sidecar")]
+            ai: Default::default(),
         }
     }
 
@@ -625,6 +642,8 @@ impl Session {
         proxies::poll(self);
         masks::poll(self);
         scene_detect::poll(self);
+        #[cfg(feature = "sidecar")]
+        ai::poll(self);
         export_tools::pump_queue(self, false);
         panels::log_jobs(self);
         let Some(p) = self.persistence.as_mut() else { return };

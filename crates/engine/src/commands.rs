@@ -1141,6 +1141,7 @@ fn build() -> Vec<CommandSpec> {
             let name = str_p(p, "name").unwrap_or("Untitled").to_string();
             s.project = std::sync::Arc::new(filmcraft_project::Project::new(&name));
             s.history = Default::default();
+            s.project_generation += 1;
             s.history.limit = 200;
             s.state = crate::Session::default().state;
             if s.path.take().is_some() {
@@ -1155,6 +1156,7 @@ fn build() -> Vec<CommandSpec> {
             let (p, seq) = crate::demo::demo_project(&s.media);
             s.project = std::sync::Arc::new(p);
             s.history = Default::default();
+            s.project_generation += 1;
             s.history.limit = 200;
             s.state = crate::Session::default().state;
             s.state.active_sequence = Some(seq);
@@ -3443,6 +3445,8 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::project_panel::commands());
     v.extend(crate::media_browser::commands());
     v.extend(crate::paste_media::commands());
+    #[cfg(feature = "sidecar")]
+    v.extend(crate::ai::commands());
     // Edit ▸ Label ▸ <colour>, Paste Attributes, subclips, Video / Audio Options, Replace With Clip…
     // and their menu order
     crate::clip_ops::apply_layout(&mut v);
@@ -4379,6 +4383,7 @@ fn install_project(s: &mut Session, proj: filmcraft_project::Project, path: Opti
     s.media.add_stored(&proj, path.as_deref());
     s.project = std::sync::Arc::new(proj);
     s.history = Default::default();
+    s.project_generation += 1;
     s.history.limit = 200;
     s.state = crate::Session::default().state;
     s.state.active_sequence = first;

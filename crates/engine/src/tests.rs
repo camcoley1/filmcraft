@@ -1413,3 +1413,10 @@ fn negative_place_and_marker_times_are_refused() {
     s.execute("markers.add", json!({"frame": 0, "name": "start"})).unwrap();
     assert!(s.active_sequence().unwrap().markers.iter().any(|m| m.start == Tick::ZERO && m.name == "start"));
 }
+
+/// Without the `sidecar` feature there are no `ai.*` commands (ADR 0002).
+#[cfg(not(feature = "sidecar"))]
+#[test]
+fn no_ai_commands_without_the_sidecar_feature() {
+    assert!(crate::command_specs().iter().all(|c| !c.id.starts_with("ai.")));
+}
