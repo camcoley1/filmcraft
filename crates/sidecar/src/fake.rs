@@ -27,12 +27,16 @@ pub enum ResultMode {
     Fail(String),
 }
 
-/// Which reply is not JSON.
+/// Which reply is not JSON, or how the helper misbehaves on the wire.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Malformed {
     None,
     Hello,
     Status,
+    /// Reads the request and never answers (a hung helper).
+    Silent,
+    /// Answers one byte at a time, never ending the line.
+    Trickle,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +50,8 @@ pub struct Script {
     pub malformed: Malformed,
     /// The helper dies (stops listening, drops the connection) at this status poll.
     pub die_at_poll: Option<u32>,
+    /// Requests must carry this token (`None`: any or none).
+    pub token: Option<String>,
 }
 
 impl Default for Script {
@@ -58,6 +64,7 @@ impl Default for Script {
             result: ResultMode::Echo,
             malformed: Malformed::None,
             die_at_poll: None,
+            token: None,
         }
     }
 }
@@ -131,11 +138,32 @@ fn serve(s: TcpStream, script: &Script, state: &Mutex<State>, stop: &AtomicBool)
         return;
     }
     let req: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+    let mut w = &s;
+    match script.malformed {
+        Malformed::Silent => {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            return;
+        }
+        Malformed::Trickle => {
+            while !stop.load(Ordering::Relaxed) && w.write_all(b" ").is_ok() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            return;
+        }
+        _ => {}
+    }
+    if let Some(t) = &script.token
+        && req["token"].as_str() != Some(t.as_str())
+    {
+        let _ = w.write_all(b"{\"type\":\"error\",\"message\":\"unauthorized: wrong or missing token\"}\n");
+        return;
+    }
     let reply = match reply(&req, script, state, stop) {
         Some(r) => r,
         None => return,
     };
-    let mut w = &s;
     let _ = w.write_all(reply.as_bytes());
     let _ = w.write_all(b"\n");
 }

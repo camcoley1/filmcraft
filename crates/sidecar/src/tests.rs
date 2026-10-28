@@ -130,3 +130,53 @@ fn job_timeout_cancels() {
     assert!(matches!(r, Err(SidecarError::Timeout(_))), "{r:?}");
     assert_eq!(h.cancelled(), ["j1"]);
 }
+
+#[test]
+fn silent_and_trickling_peers_fail_at_the_deadline() {
+    for mode in [Malformed::Silent, Malformed::Trickle] {
+        let h = FakeHelper::start(Script { malformed: mode, ..Default::default() }).unwrap();
+        let l = Limits { io_timeout: Duration::from_millis(200), ..limits() };
+        let t0 = std::time::Instant::now();
+        let e = TcpClient::new(h.port(), l).hello().unwrap_err();
+        let took = t0.elapsed();
+        assert!(matches!(e, SidecarError::Io(ref m) if m.contains("no reply within")), "{mode:?}: {e:?}");
+        assert!(took < Duration::from_millis(1500), "{mode:?} held the caller for {took:?}");
+    }
+}
+
+#[test]
+fn the_token_is_required_when_the_helper_has_one() {
+    let h = FakeHelper::start(Script { token: Some("s3cret".into()), ..Default::default() }).unwrap();
+    let e = TcpClient::new(h.port(), limits()).with_token("wrong").hello().unwrap_err();
+    assert!(matches!(e, SidecarError::Helper(ref m) if m.contains("unauthorized")), "{e:?}");
+    TcpClient::new(h.port(), limits()).with_token("s3cret").hello().unwrap();
+    // the token file: first line, trimmed, bounded
+    let d = out_dir("token");
+    let f = d.join("token");
+    std::fs::write(&f, "abc123\nignored").unwrap();
+    assert_eq!(read_token(&f).as_deref(), Some("abc123"));
+    std::fs::write(&f, "x".repeat(10_000)).unwrap();
+    assert_eq!(read_token(&f).map(|t| t.len()), Some(256));
+    std::fs::write(&f, "  \n").unwrap();
+    assert_eq!(read_token(&f), None);
+    assert_eq!(read_token(&d.join("none")), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_or_swapped_results_are_refused() {
+    let d = out_dir("links");
+    let outside = d.parent().unwrap().join(format!("filmcraft-sidecar-{}-target.bin", std::process::id()));
+    std::fs::write(&outside, b"secret").unwrap();
+    std::os::unix::fs::symlink(&outside, d.join("link.bin")).unwrap();
+    let r = JobResult { files: vec!["link.bin".into()], meta: Value::Null };
+    assert!(matches!(check_result(&r, &d, &limits()), Err(SidecarError::BadResult(ref m)) if m.contains("symbolic link") || m.contains("outside")));
+    std::fs::write(d.join("ok.bin"), b"data").unwrap();
+    let ok = check_result(&JobResult { files: vec!["ok.bin".into()], meta: Value::Null }, &d, &limits()).unwrap();
+    assert!(open_result(&ok[0], &d, 100).is_ok());
+    assert!(open_result(&ok[0], &d, 2).is_err(), "over the size cap");
+    // swapped for a link after the check
+    std::fs::remove_file(&ok[0]).unwrap();
+    std::os::unix::fs::symlink(&outside, &ok[0]).unwrap();
+    assert!(open_result(&ok[0], &d, 100).is_err());
+}

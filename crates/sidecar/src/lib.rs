@@ -11,6 +11,10 @@
 //! | `{"op":"job.status","job":str}` | `{"type":"progress","job":str,"fraction":0..1,"status":str}`, `{"type":"result","job":str,"files":[path],"meta":{…}}` |
 //! | `{"op":"job.cancel","job":str}` | `{"type":"cancelled","job":str}` |
 //!
+//! Every request also carries `"token"`: the helper writes a random token for each launch to
+//! [`token_file`] (readable by the user only) and refuses requests without it, so other local
+//! users and programs cannot run jobs through it.
+//!
 //! Any request can be answered with `{"type":"error","message":str}`. Results are files the helper
 //! wrote inside `out_dir`; the engine imports them through its own edits, so the helper never
 //! writes a project.
@@ -219,6 +223,34 @@ pub fn status_from(v: Value) -> Result<JobStatus> {
     }
 }
 
+/// Where the helper writes its per-launch token: `$CRAFT_AI_TOKEN_FILE`, else
+/// `~/Library/Application Support/craft-ai/token` (macOS), `%APPDATA%\craft-ai\token` (Windows),
+/// `$XDG_STATE_HOME/craft-ai/token` or `~/.local/state/craft-ai/token` (elsewhere). Keep in step
+/// with `craft_ai/protocol.py`.
+pub fn token_file() -> Option<PathBuf> {
+    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    if let Some(f) = env("CRAFT_AI_TOKEN_FILE") {
+        return Some(f);
+    }
+    let dir = if cfg!(target_os = "macos") {
+        env("HOME").map(|h| h.join("Library/Application Support"))
+    } else if cfg!(windows) {
+        env("APPDATA")
+    } else {
+        env("XDG_STATE_HOME").or_else(|| env("HOME").map(|h| h.join(".local/state")))
+    };
+    dir.map(|d| d.join("craft-ai").join("token"))
+}
+
+/// The token in `file` (first line, at most 256 bytes); `None` when it cannot be read.
+pub fn read_token(file: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::fs::File::open(file).ok()?.take(256).read_to_end(&mut buf).ok()?;
+    let t = String::from_utf8(buf).ok()?.lines().next()?.trim().to_string();
+    (!t.is_empty()).then_some(t)
+}
+
 /// Run `req` to the end: start it, poll its progress (`on_progress(fraction, status)`), cancel it
 /// when `cancelled()` turns true or [`Limits::timeout`] passes, and check its result files with
 /// [`check_result`]. A helper that stops answering for [`Limits::max_poll_failures`] polls in a
@@ -266,7 +298,8 @@ pub fn drive(
 }
 
 /// The result's files, resolved (relative names are inside `out_dir`), each an existing regular
-/// file inside `out_dir`, together within [`Limits::max_result_bytes`].
+/// file (not a symbolic link) inside `out_dir`, together within [`Limits::max_result_bytes`].
+/// Read them later through [`open_result`], which checks again on the open file.
 pub fn check_result(r: &JobResult, out_dir: &Path, limits: &Limits) -> Result<Vec<PathBuf>> {
     if r.files.len() > limits.max_files {
         return Err(SidecarError::BadResult(format!("{} files (at most {})", r.files.len(), limits.max_files)));
@@ -277,6 +310,10 @@ pub fn check_result(r: &JobResult, out_dir: &Path, limits: &Limits) -> Result<Ve
     for f in &r.files {
         let p = Path::new(f);
         let p = if p.is_absolute() { p.to_path_buf() } else { root.join(p) };
+        let link = std::fs::symlink_metadata(&p).map_err(|e| SidecarError::BadResult(format!("{f}: missing ({e})")))?;
+        if link.file_type().is_symlink() {
+            return Err(SidecarError::BadResult(format!("{f} is a symbolic link")));
+        }
         let real = p.canonicalize().map_err(|e| SidecarError::BadResult(format!("{f}: missing ({e})")))?;
         if !real.starts_with(&root) {
             return Err(SidecarError::BadResult(format!("{f} is outside the job's folder")));
@@ -292,6 +329,35 @@ pub fn check_result(r: &JobResult, out_dir: &Path, limits: &Limits) -> Result<Ve
         out.push(real);
     }
     Ok(out)
+}
+
+/// Open a file [`check_result`] accepted, checking again on the open handle: still a regular file
+/// inside `out_dir`, at most `max_bytes`, and (Unix) the very file the path names now, so a file
+/// swapped for a link or another file after the check is refused.
+pub fn open_result(path: &Path, out_dir: &Path, max_bytes: u64) -> Result<std::fs::File> {
+    let bad = |m: String| SidecarError::BadResult(format!("{}: {m}", path.display()));
+    let root = out_dir.canonicalize().map_err(|e| bad(e.to_string()))?;
+    let link = std::fs::symlink_metadata(path).map_err(|e| bad(e.to_string()))?;
+    if !link.file_type().is_file() {
+        return Err(bad("not a regular file".into()));
+    }
+    let real = path.canonicalize().map_err(|e| bad(e.to_string()))?;
+    if !real.starts_with(&root) {
+        return Err(bad("outside the job's folder".into()));
+    }
+    let f = std::fs::File::open(&real).map_err(|e| bad(e.to_string()))?;
+    let m = f.metadata().map_err(|e| bad(e.to_string()))?;
+    if !m.is_file() || m.len() > max_bytes {
+        return Err(bad(format!("not a regular file of at most {max_bytes} bytes")));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (m.dev(), m.ino()) != (link.dev(), link.ino()) {
+            return Err(bad("changed while it was opened".into()));
+        }
+    }
+    Ok(f)
 }
 
 #[cfg(test)]
