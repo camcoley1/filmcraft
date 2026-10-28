@@ -16,6 +16,8 @@ path = "src/main.rs"
 default = []
 # Speech-to-text (Text panel ▸ Transcribe) with Whisper on the CPU, and model downloads.
 whisper = ["filmcraft-engine/whisper", "filmcraft-engine/speech-download"]
+# AI features through the optional local helper `craft-ai` (Clip ▸ AI, Sequence ▸ AI; ADR 0002).
+sidecar = ["filmcraft-engine/sidecar"]
 
 [dependencies]
 filmcraft-engine = { workspace = true }

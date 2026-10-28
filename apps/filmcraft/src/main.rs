@@ -214,6 +214,11 @@ fn app_creator(launch: Launch, graphics: graphics::GraphicsStart, created: Arc<A
         }
         // voice-over recording reads the microphone through cpal
         session.voiceover.input = Some(Box::new(audio_in::CpalIn::new(&session.prefs.audio_hardware.device_class)));
+        // AI helper (feature `sidecar`): a craft-ai already running enables the AI commands
+        #[cfg(feature = "sidecar")]
+        if let Err(e) = session.execute("ai.status", json!({})) {
+            log::warn!("{e}");
+        }
         let (project, media) = args::project_and_media(&files);
         if let Some(p) = project {
             if let Err(e) = session.execute("file.open", json!({"path": p})) {
