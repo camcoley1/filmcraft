@@ -602,7 +602,7 @@ fn edit_cameras_and_save_load() {
     s.execute("file.save", json!({"path": path})).unwrap();
     let bytes = std::fs::read(&path).unwrap();
     let doc: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(doc["schema_version"], filmcraft_format::SCHEMA_VERSION);
+    assert_eq!(doc["schema_version"], filmcraft_format::schema_for(&s.project));
     let mut t = Session::default();
     t.execute("file.open", json!({"path": path})).unwrap();
     assert_eq!(*t.project, *s.project, "multi-camera data survives save/load");

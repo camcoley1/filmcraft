@@ -14,11 +14,29 @@ use serde_json::{Value, json};
 
 use crate::server::FilmcraftMcp;
 
-/// Engine commands that block until a render is written when called with `wait: true`.
-pub const LONG_COMMANDS: &[&str] = &["file.exportMedia"];
+/// Engine commands that block until a render is written (or an AI job's result is applied) when
+/// called with `wait: true`: run as a job instead, so neither the app's UI thread nor the session
+/// lock is held for the whole job.
+pub const LONG_COMMANDS: &[&str] = &[
+    "file.exportMedia",
+    "ai.echo",
+    "ai.reframe",
+    "ai.stems",
+    "ai.enhanceSpeech",
+    "ai.beatGrid",
+    "ai.musicFit",
+    "ai.upscale",
+    "ai.interpolate",
+    "ai.generativeExtend",
+];
 
 /// How often the job is polled (and at most how often progress is reported).
 const POLL: Duration = Duration::from_millis(100);
+
+/// The error of a long call that failed (exports keep their established wording).
+pub fn failed(id: &str, e: &str) -> String {
+    if id == "file.exportMedia" { format!("export failed: {e}") } else { format!("{id} failed: {e}") }
+}
 
 /// Whether `command_run {id, params}` is a long call this module runs.
 pub fn is_long(id: &str, params: &Value) -> bool {
@@ -75,7 +93,7 @@ impl FilmcraftMcp {
                 let offline = state.as_ref().and_then(|j| j.get("offlineMedia").cloned());
                 let result = state.map(|j| j["result"].clone()).unwrap_or(Value::Null);
                 if let Some(e) = result.get("error").and_then(Value::as_str) {
-                    return CallToolResult::error(vec![Content::text(format!("export failed: {e}"))]);
+                    return CallToolResult::error(vec![Content::text(crate::long_job::failed(id, e))]);
                 }
                 let mut out = start;
                 if let Some(o) = out.as_object_mut() {

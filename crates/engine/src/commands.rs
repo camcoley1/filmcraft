@@ -4348,7 +4348,7 @@ fn write_project(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
     let view = s.project_view();
     let bytes = filmcraft_format::encode_with_view(&s.project, Some(&view), false);
     let mut backup = None;
-    if adopt && s.path.as_deref() == Some(path) && s.loaded_schema < filmcraft_format::SCHEMA_VERSION {
+    if adopt && s.path.as_deref() == Some(path) && s.loaded_schema < filmcraft_format::schema_for(&s.project) {
         let b = schema_backup_path(path, s.loaded_schema);
         if s.services.read_file(&b).is_err()
             && let Ok(old) = s.services.read_file(path)
@@ -4363,7 +4363,7 @@ fn write_project(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
         s.previews_follow_path();
         s.note_recent_project();
         s.saved_revision = s.revision;
-        s.loaded_schema = filmcraft_format::SCHEMA_VERSION;
+        s.loaded_schema = filmcraft_format::schema_for(&s.project);
     }
     Ok(json!({"path": path, "bytes": bytes.len(), "ms": t0.elapsed().as_secs_f64() * 1000.0, "backup": backup}))
 }
@@ -4417,7 +4417,10 @@ fn open_project(s: &mut Session, path: &str) -> Result<Value> {
     s.note_recent_project();
     s.loaded_schema = from;
     if migrated {
-        s.toast(format!("Upgraded project from schema v{from} to v{}; the original is kept as a backup when you save", filmcraft_format::SCHEMA_VERSION));
+        s.toast(format!(
+            "Upgraded project from schema v{from} to v{}; the original is kept as a backup when you save",
+            filmcraft_format::schema_for(&s.project)
+        ));
     }
     let missing = crate::relink::on_open(s);
     Ok(json!({"path": path, "schemaVersion": from, "migrated": migrated, "missingMedia": missing}))

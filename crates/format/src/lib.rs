@@ -42,7 +42,9 @@
 //! - **v16** (M4): caption word timings and caption animation. No-op step; older builds would drop
 //!   them when saving.
 //! - **v17** (M6.0): the project id (`Project::id`) naming the project's AI cache folder. No-op step
-//!   (older files have none and get one on their first AI job); older builds would drop it.
+//!   (older files have none and get one on their first AI job); older builds would drop it. A
+//!   project without an id is still written as v16 ([`schema_for`]), so builds without AI features
+//!   write exactly what they wrote before and older builds keep opening those files.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
@@ -70,6 +72,15 @@ pub const MIGRATIONS: &[Migration] = &[
 
 /// The schema version this build writes (and the newest it reads).
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32 + 1;
+
+/// The schema that introduced `Project::id`.
+pub const PROJECT_ID_SCHEMA: u32 = 17;
+
+/// The schema `project` is written in: the current one, except that a project without an id (no
+/// AI job yet) is written as v16 while v17 (the id) is the newest schema: nothing in it needs v17.
+pub fn schema_for(project: &Project) -> u32 {
+    if SCHEMA_VERSION == PROJECT_ID_SCHEMA && project.id.is_empty() { PROJECT_ID_SCHEMA - 1 } else { SCHEMA_VERSION }
+}
 
 /// Oldest schema this build can still upgrade.
 pub const OLDEST_SCHEMA: u32 = 1;
@@ -104,9 +115,10 @@ pub struct Loaded {
 }
 
 impl Loaded {
-    /// True when the file was written in an older schema and upgraded on load.
+    /// True when the file was written in an older schema than the project needs now and was
+    /// upgraded on load ([`schema_for`]).
     pub fn migrated(&self) -> bool {
-        self.schema_version < SCHEMA_VERSION
+        self.schema_version < schema_for(&self.project)
     }
 }
 
@@ -159,7 +171,7 @@ struct Probe {
     root: Option<serde::de::IgnoredAny>,
 }
 
-/// Serialize a project in the current schema. `pretty` = indented (human-diffable; used for the
+/// Serialize a project in the current schema ([`schema_for`]). `pretty` = indented (human-diffable; used for the
 /// project file itself), compact otherwise (recovery snapshots).
 pub fn encode(project: &Project, pretty: bool) -> Vec<u8> {
     encode_with_view(project, None, pretty)
@@ -169,7 +181,7 @@ pub fn encode(project: &Project, pretty: bool) -> Vec<u8> {
 /// outside the schema's promises: builds that do not know it ignore it, and it is dropped rather
 /// than migrated when it cannot be read.
 pub fn encode_with_view(project: &Project, view: Option<&ProjectView>, pretty: bool) -> Vec<u8> {
-    let env = EnvelopeOut { format: FORMAT_ID, schema_version: SCHEMA_VERSION, generator: generator(), project, view };
+    let env = EnvelopeOut { format: FORMAT_ID, schema_version: schema_for(project), generator: generator(), project, view };
     let r = if pretty { serde_json::to_vec_pretty(&env) } else { serde_json::to_vec(&env) };
     // Serializing plain data (string keys, finite numbers or null) cannot fail.
     r.unwrap_or_default()
@@ -432,7 +444,7 @@ mod tests {
             let b = encode(&p, pretty);
             let l = decode(&b).unwrap();
             assert_eq!(l.project, p);
-            assert_eq!(l.schema_version, SCHEMA_VERSION);
+            assert_eq!(l.schema_version, schema_for(&p));
             assert!(!l.migrated());
             assert_eq!(l.generator.as_deref(), Some(generator().as_str()));
         }
@@ -505,25 +517,31 @@ mod tests {
     #[test]
     fn envelope_has_explicit_schema_version() {
         let v: Value = serde_json::from_slice(&encode(&Project::new("x"), true)).unwrap();
-        assert_eq!(v["schema_version"], SCHEMA_VERSION);
+        assert_eq!(v["schema_version"], schema_for(&Project::new("x")));
         assert_eq!(v["format"], FORMAT_ID);
         assert!(v["project"]["items"].is_object());
         assert!(v["project"].get("version").is_none());
     }
 
-    /// A v16 file (no project id) opens with an empty id; an id survives a save.
+    /// A project without an id is written as v16, exactly as before the id existed, and reads back
+    /// as not migrated; one with an id is written as v17 and keeps it; a v16 file that gains an id
+    /// counts as upgraded (its first save keeps a backup for older builds).
     #[test]
     fn project_id_is_optional_and_kept() {
-        let mut v: Value = serde_json::from_slice(&encode(&Project::new("old"), false)).unwrap();
+        let bytes = encode(&Project::new("old"), false);
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(v["project"].get("id").is_none(), "an empty id is not written");
-        v["schema_version"] = Value::from(16);
-        let l = decode(&serde_json::to_vec(&v).unwrap()).unwrap();
-        assert!(l.migrated() && l.project.id.is_empty());
+        assert_eq!(v["schema_version"], 16);
+        let l = decode(&bytes).unwrap();
+        assert!(!l.migrated() && l.project.id.is_empty());
         let mut p = l.project;
         p.id = "0b8e7d2c-5f1a-4c3e-9d6b-2a7f8e1c4b90".into();
+        assert_eq!(schema_for(&p), 17);
         let again = decode(&encode(&p, false)).unwrap();
-        assert_eq!(again.project.id, p.id);
+        assert_eq!((again.project.id.as_str(), again.schema_version), (p.id.as_str(), 17));
         assert!(!again.migrated());
+        let gained = Loaded { project: p, schema_version: 16, generator: None, view: None };
+        assert!(gained.migrated());
     }
 
     #[test]

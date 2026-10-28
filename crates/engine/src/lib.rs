@@ -453,6 +453,9 @@ pub struct Session {
     /// Bumped whenever another project replaces this one (New, Open, Close, Recover): background
     /// results started on the old one are not applied to the new one.
     pub project_generation: u64,
+    /// The host has a gesture in progress that Escape may take back (a mouse press on a value):
+    /// background results (AI jobs) wait until it ends instead of landing in the middle of it.
+    pub gesture_in_progress: bool,
     /// The AI helper client (feature `sidecar`, ADR 0002); `ai.status` / `ai.connect` install the
     /// real one, tests a fake.
     #[cfg(feature = "sidecar")]
@@ -553,6 +556,7 @@ impl Session {
             media_stamps: Default::default(),
             media_scan: None,
             project_generation: 0,
+            gesture_in_progress: false,
             #[cfg(feature = "sidecar")]
             sidecar: None,
             #[cfg(feature = "sidecar")]
@@ -1022,6 +1026,8 @@ impl Session {
 
     /// Drop dangling references after undo/redo/delete.
     pub fn fix_state(&mut self) {
+        #[cfg(feature = "sidecar")]
+        ai::restamp(self);
         let p = self.project.clone();
         if let Some(m) = self.state.selected_mask {
             let ok =

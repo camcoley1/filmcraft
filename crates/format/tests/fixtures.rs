@@ -1,6 +1,6 @@
 //! Old project files keep opening: hand-made fixtures of every past schema are upgraded on load.
 
-use filmcraft_format::{FormatError, SCHEMA_VERSION, decode, encode};
+use filmcraft_format::{FormatError, SCHEMA_VERSION, decode, encode, schema_for};
 use filmcraft_project::{ClipId, ItemId, ItemKind, Project};
 use filmcraft_time::Tick;
 
@@ -100,7 +100,7 @@ fn v8_subclip_loads_with_m3_10_defaults() {
     assert!(clip.time_interpolation.is_default() && !clip.hold_filters && clip.field_options.is_none() && clip.source_channels.is_empty());
     // resaved in the current schema, losslessly
     let again = decode(&encode(p, true)).unwrap();
-    assert_eq!(again.schema_version, SCHEMA_VERSION);
+    assert_eq!(again.schema_version, schema_for(p));
     assert_eq!(&again.project, p);
 }
 
@@ -109,7 +109,7 @@ fn upgraded_file_resaves_in_current_schema_losslessly() {
     let old = decode(&fixture("v1-edit.fcproj")).unwrap().project;
     let bytes = encode(&old, true);
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["schema_version"], SCHEMA_VERSION);
+    assert_eq!(v["schema_version"], schema_for(&old));
     let again = decode(&bytes).unwrap();
     assert!(!again.migrated());
     assert_eq!(again.project, old);
@@ -236,7 +236,7 @@ fn v11_minimal_loads_without_graphics_design_data() {
     assert!(p.source_graphics.is_empty());
     assert!(p.root.find_bin(filmcraft_project::BinId(1)).is_some());
     let again = decode(&encode(p, true)).unwrap();
-    assert_eq!(again.schema_version, SCHEMA_VERSION);
+    assert_eq!(again.schema_version, schema_for(p));
     const { assert!(SCHEMA_VERSION >= 12) };
     assert_eq!(&again.project, p);
 }
@@ -256,7 +256,7 @@ fn v10_minimal_loads_with_m3_11_defaults() {
     assert_eq!(p.settings.scratch, Default::default());
     assert!(p.root.find_bin(filmcraft_project::BinId(1)).is_some());
     let again = decode(&encode(p, true)).unwrap();
-    assert_eq!(again.schema_version, SCHEMA_VERSION);
+    assert_eq!(again.schema_version, schema_for(p));
     assert_eq!(&again.project, p);
 }
 
@@ -283,7 +283,7 @@ fn v15_caption_track_loads_and_resaves_intact() {
     // saved again: the current schema, the caption unchanged, and still no new keys
     let out = encode(p, false);
     let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-    assert_eq!(v["schema_version"], SCHEMA_VERSION);
+    assert_eq!(v["schema_version"], schema_for(p));
     assert_eq!(SCHEMA_VERSION, 17);
     assert!(p.id.is_empty(), "an old project has no id until its first AI job");
     let again = decode(&out).unwrap();

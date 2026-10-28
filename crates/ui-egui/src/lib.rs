@@ -1978,6 +1978,7 @@ impl FilmcraftApp {
             Some(p) if self.value_press.is_some_and(|(q, _)| q == p) => {}
             Some(p) => self.value_press = Some((p, self.session.undo_mark())),
         }
+        self.session.gesture_in_progress = self.value_press.is_some();
     }
 
     /// Escape while a mouse button is held takes back every edit this press made (#580): value

@@ -70,10 +70,11 @@ fn fixture(name: &str, script: Script) -> Fixture {
     Fixture { s, helper, clip, item, cache }
 }
 
-/// Wait for job `id` to finish, then apply results.
+/// Poll (apply results) until job `id` is finished.
 fn finish(s: &mut Session, id: u64) {
     let t0 = std::time::Instant::now();
     loop {
+        super::poll(s);
         let done = s.jobs.iter().find(|j| j.id == id).is_none_or(|j| j.progress.finished.load(Ordering::Relaxed));
         if done {
             break;
@@ -81,7 +82,6 @@ fn finish(s: &mut Session, id: u64) {
         assert!(t0.elapsed() < Duration::from_secs(10), "job {id} never finished");
         std::thread::sleep(Duration::from_millis(5));
     }
-    super::poll(s);
 }
 
 fn job_error(s: &Session, id: u64) -> Option<String> {
@@ -174,7 +174,9 @@ fn echo_job_applies_in_one_undo_step() {
     let undo = f.s.history.undo.len();
     let r = f.s.execute("ai.echo", json!({"wait": true, "steps": 3})).unwrap();
     let id = r["job"].as_u64().unwrap();
+    assert_eq!(r["applied"], true, "{r}");
     assert_eq!(job_error(&f.s, id), None);
+    assert!(f.s.jobs.iter().find(|j| j.id == id).unwrap().progress.finished.load(Ordering::Relaxed));
     // the request the helper saw: the clip's media, the params, a folder of the project's cache
     let req = &f.helper.started()[0];
     assert_eq!(req.inputs, ["/media/interview.mov"]);
@@ -238,7 +240,8 @@ fn stale(name: &str, change: impl FnOnce(&mut Fixture), why: &str) {
     let before = snapshot(&f.s);
     let _ = toasts(&mut f.s);
     finish(&mut f.s, id);
-    assert_eq!(job_error(&f.s, id), None, "{name}: the job itself succeeded");
+    let e = job_error(&f.s, id).unwrap_or_default();
+    assert!(e.contains(why) && e.contains("kept in"), "{name}: the job fails with the reason: {e}");
     assert_eq!(snapshot(&f.s), before, "{name}: nothing applied");
     let t = toasts(&mut f.s);
     assert!(t.iter().any(|m| m.contains(why) && m.contains("not applied")), "{name}: {t:?}");
@@ -270,13 +273,6 @@ fn stale_results_are_dropped() {
         },
         "a target clip was deleted",
     );
-    stale(
-        "newproject",
-        |f| {
-            f.s.execute("file.newProject", json!({"name": "Other", "force": true})).unwrap();
-        },
-        "another project was opened",
-    );
 }
 
 #[test]
@@ -306,7 +302,8 @@ fn a_failing_step_reverts_the_whole_apply() {
     let before = snapshot(&f.s);
     let (undo, redo) = (f.s.history.undo.len(), f.s.history.redo.len());
     let _ = toasts(&mut f.s);
-    f.s.execute("ai.echo", json!({"wait": true, "failStep": 2})).unwrap();
+    let e = f.s.execute("ai.echo", json!({"wait": true, "failStep": 2})).unwrap_err().to_string();
+    assert!(e.contains("injected failure in step 2") && e.contains("nothing was changed"), "the caller learns it: {e}");
     assert_eq!(snapshot(&f.s), before, "step 1's marker was rolled back");
     assert_eq!((f.s.history.undo.len(), f.s.history.redo.len()), (undo, redo));
     let t = toasts(&mut f.s);
@@ -331,12 +328,12 @@ fn project_id_through_save_open_and_switch() {
     let dir = cache_dir("file-proj");
     std::fs::create_dir_all(&dir).unwrap();
     let old = dir.join("old.fcproj");
-    // written as schema 16, the last without the id
-    let mut v: serde_json::Value = serde_json::from_slice(&filmcraft_format::encode(&f.s.project, false)).unwrap();
-    v["schema_version"] = json!(16);
-    std::fs::write(&old, serde_json::to_vec(&v).unwrap()).unwrap();
+    // a project without an id is written as schema 16, as before the id existed
+    let bytes = filmcraft_format::encode(&f.s.project, false);
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["schema_version"], 16);
+    std::fs::write(&old, bytes).unwrap();
     let r = f.s.execute("file.open", json!({"path": old.to_string_lossy()})).unwrap();
-    assert_eq!(r["migrated"], true);
+    assert_eq!(r["migrated"], false);
     assert!(f.s.project.id.is_empty());
     let seq = f.s.state.active_sequence.unwrap();
     f.s.state.selection = vec![f.s.project.sequence(seq).unwrap().video_tracks[0].items[0].id];
@@ -357,5 +354,202 @@ fn project_id_through_save_open_and_switch() {
     let before = snapshot(&f.s);
     finish(&mut f.s, job);
     assert_eq!(snapshot(&f.s), before);
-    assert!(toasts(&mut f.s).iter().any(|m| m.contains("another project was opened")));
+    // the job of the replaced project was stopped (or its result dropped), never applied
+    assert!(job_error(&f.s, job).is_some_and(|e| e.starts_with("stopped")), "{:?}", job_error(&f.s, job));
+}
+
+/// Wait until job `id`'s result is ready to apply (not applied: nobody polls).
+fn ready(s: &Session, id: u64) {
+    let t0 = std::time::Instant::now();
+    while !s.ai.jobs.iter().any(|j| j.job == id && j.outcome.lock().unwrap().is_some()) {
+        assert!(t0.elapsed() < Duration::from_secs(10), "job {id} never got its result");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The desktop app: handshakes run on a worker and `wait` is ignored, so a silent helper never
+/// holds the caller.
+#[test]
+fn a_background_host_never_waits_on_the_helper() {
+    let mut f = fixture("background", Script::default());
+    f.s.ai.background = true;
+    f.s.ai.hello = None;
+    let st = f.s.execute("ai.status", json!({})).unwrap();
+    assert_eq!(st["probing"], true, "{st}");
+    let t0 = std::time::Instant::now();
+    while f.s.ai.hello.is_none() {
+        assert!(t0.elapsed() < Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(5));
+        super::poll(&mut f.s);
+    }
+    assert!(f.s.is_enabled("ai.echo"));
+    let r = f.s.execute("ai.echo", json!({"wait": true})).unwrap();
+    assert_eq!(r["background"], true, "wait is ignored: {r}");
+    let id = r["job"].as_u64().unwrap();
+    finish(&mut f.s, id);
+    assert_eq!(markers(&f.s), 1);
+
+    let silent = FakeHelper::start(Script { malformed: Malformed::Silent, ..Default::default() }).unwrap();
+    let t0 = std::time::Instant::now();
+    let st = f.s.execute("ai.connect", json!({"port": silent.port()})).unwrap();
+    assert!(t0.elapsed() < Duration::from_millis(500), "ai.connect held the caller for {:?}", t0.elapsed());
+    assert_eq!(st["probing"], true);
+    while f.s.ai.probe.is_some() {
+        assert!(t0.elapsed() < Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(20));
+        super::poll(&mut f.s);
+    }
+    assert!(reason(&f.s, "ai.echo").contains("no reply within"), "{}", reason(&f.s, "ai.echo"));
+    assert!(toasts(&mut f.s).iter().any(|m| m.contains("no reply within")));
+}
+
+/// A result waits while a gesture (or dynamic trim) is in progress, then lands as one step.
+#[test]
+fn results_wait_for_gestures() {
+    let mut f = fixture("gesture", Script::default());
+    let id = f.s.execute("ai.echo", json!({})).unwrap()["job"].as_u64().unwrap();
+    ready(&f.s, id);
+    f.s.gesture_in_progress = true;
+    super::poll(&mut f.s);
+    assert_eq!(markers(&f.s), 0);
+    assert!(job_error(&f.s, id).is_none() && !f.s.jobs.iter().find(|j| j.id == id).unwrap().progress.finished.load(Ordering::Relaxed));
+    f.s.gesture_in_progress = false;
+    super::poll(&mut f.s);
+    assert_eq!(markers(&f.s), 1);
+}
+
+#[test]
+fn more_stale_causes_are_caught() {
+    stale(
+        "locked",
+        |f| {
+            f.s.edit_sequence("Lock", |q, _, _| {
+                q.video_tracks[0].locked = true;
+                Ok(())
+            })
+            .unwrap();
+        },
+        "a target track is locked",
+    );
+    stale(
+        "settings",
+        |f| {
+            f.s.edit_sequence("Settings", |q, _, _| {
+                q.settings.width = 36;
+                q.settings.height = 64;
+                Ok(())
+            })
+            .unwrap();
+        },
+        "the sequence settings changed",
+    );
+    stale(
+        "interpret",
+        |f| {
+            let item = f.item;
+            f.s.edit("Interpret", |pr, _| {
+                if let Some(ItemKind::Media(m)) = pr.item_mut(item).map(|i| &mut i.kind) {
+                    m.interpret.frame_rate = Some(FrameRate::FPS_25);
+                }
+                Ok(())
+            })
+            .unwrap();
+        },
+        "a target clip changed",
+    );
+    stale(
+        "effects",
+        |f| {
+            f.s.edit_sequence("Disable", |q, _, _| {
+                q.video_tracks[0].items[0].enabled = false;
+                Ok(())
+            })
+            .unwrap();
+        },
+        "a target clip changed",
+    );
+}
+
+/// Opening another project stops its jobs on the helper.
+#[test]
+fn switching_projects_cancels_running_jobs() {
+    let mut f = fixture("switchcancel", Script { steps: 100_000, ..Default::default() });
+    let id = f.s.execute("ai.echo", json!({})).unwrap()["job"].as_u64().unwrap();
+    f.s.execute("file.newProject", json!({"name": "Other"})).unwrap();
+    super::poll(&mut f.s);
+    finish(&mut f.s, id);
+    assert_eq!(job_error(&f.s, id).as_deref(), Some("stopped"));
+    assert_eq!(f.helper.cancelled(), ["j1"]);
+}
+
+/// A cancel that arrives after the result is in says so, and nothing is applied.
+#[test]
+fn a_late_cancel_reports_the_kept_result() {
+    let mut f = fixture("latecancel", Script::default());
+    let id = f.s.execute("ai.echo", json!({})).unwrap()["job"].as_u64().unwrap();
+    ready(&f.s, id);
+    f.s.execute("jobs.cancel", json!({"job": id})).unwrap();
+    super::poll(&mut f.s);
+    let e = job_error(&f.s, id).unwrap();
+    assert!(e.starts_with("stopped; the result was not applied (kept in"), "{e}");
+    assert_eq!(markers(&f.s), 0);
+}
+
+/// Project ids come from project files: anything but a UUID is replaced before it names a folder.
+#[test]
+fn hostile_project_ids_never_leave_the_cache() {
+    let mut f = fixture("hostile", Script::default());
+    let root = f.cache.join("AI");
+    for bad in ["", "/etc", "../../escape", "..", "a/b", "0b8e7d2c-5f1a-4c3e-9d6b-2a7f8e1c4b9/", "C:\\x", &"f".repeat(5000)] {
+        assert!(super::project_cache_dir(&f.s, bad).is_err(), "{bad:?}");
+        std::sync::Arc::make_mut(&mut f.s.project).id = bad.to_string();
+        let id = super::ensure_project_id(&mut f.s);
+        assert!(super::is_uuid(&id) && id != bad, "{bad:?} -> {id}");
+        let dir = super::project_cache_dir(&f.s, &id).unwrap();
+        assert_eq!(dir.parent(), Some(root.as_path()));
+    }
+    let r = f.s.execute("ai.echo", json!({"wait": true})).unwrap();
+    assert!(PathBuf::from(r["outDir"].as_str().unwrap()).starts_with(&root), "{r}");
+}
+
+/// Giving the project its id neither rewrites the undo history nor breaks a held undo mark; undo
+/// to a state from before keeps the id.
+#[test]
+fn the_project_id_leaves_history_alone() {
+    let mut f = fixture("history", Script::default());
+    f.s.execute("sequence.addEdit", json!({"seconds": 1.0})).unwrap();
+    let mark = f.s.undo_mark();
+    let snap = f.s.history.undo.last().unwrap().1.clone();
+    let id = super::ensure_project_id(&mut f.s);
+    assert_eq!(f.s.undo_mark(), mark);
+    assert!(std::sync::Arc::ptr_eq(&snap, &f.s.history.undo.last().unwrap().1));
+    assert!(snap.id.is_empty(), "the snapshot is untouched");
+    f.s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(f.s.project.id, id);
+    f.s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(f.s.project.id, id);
+}
+
+/// The cache stays under its cap: oldest finished job folders go first; running ones and young
+/// ones stay.
+#[test]
+fn the_cache_is_bounded() {
+    let root = cache_dir("prune").join("AI");
+    let proj = root.join("0b8e7d2c-5f1a-4c3e-9d6b-2a7f8e1c4b90");
+    let mut dirs = Vec::new();
+    for k in 0..4 {
+        let d = proj.join(format!("echo-{k}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("r.bin"), vec![0u8; 1000]).unwrap();
+        dirs.push(d);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // under the cap: nothing goes
+    assert_eq!(super::prune_cache(&root, 4000, &[], Duration::ZERO), 0);
+    // over it: the oldest finished folder goes, the running oldest-but-one is kept
+    let n = super::prune_cache(&root, 2500, &[dirs[1].clone()], Duration::ZERO);
+    assert_eq!(n, 2);
+    assert!(!dirs[0].exists() && dirs[1].exists() && !dirs[2].exists() && dirs[3].exists());
+    // young folders are never pruned
+    assert_eq!(super::prune_cache(&root, 0, &[], Duration::from_secs(600)), 0);
 }
