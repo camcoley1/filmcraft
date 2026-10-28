@@ -317,3 +317,123 @@ fn bundle_info_over_the_size_cap_is_refused_before_it_is_read() {
     assert!(e.contains("larger than"), "{e}");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn real_silent_movie_drops_the_assumed_audio_and_a_movie_with_sound_keeps_it() {
+    use crate::media_test_util::make_movie_with;
+    let d = dir("silent-e2e");
+    let silent = d.join("silent.mov");
+    let loud = d.join("loud.mov");
+    make_movie_with(&silent, filmcraft_media::DemoScene::Aurora, 160, 90, 24, false);
+    make_movie_with(&loud, filmcraft_media::DemoScene::Aurora, 160, 90, 24, true);
+    let draft = d.join("draft_content.json");
+    for (movie, audio_clips) in [(&silent, 0), (&loud, 1)] {
+        std::fs::write(&draft, draft_for(&movie.to_string_lossy())).unwrap();
+        let mut s = Session::default();
+        let r = s.execute("file.import", json!({"paths": [draft.to_string_lossy()]})).unwrap();
+        assert_eq!(r["documents"][0]["linkedMedia"], 1, "{r}");
+        let q = s.active_sequence().unwrap();
+        assert_eq!(q.audio_tracks.iter().map(|t| t.items.len()).sum::<usize>(), audio_clips, "{r}");
+        if audio_clips == 0 {
+            assert!(q.video_tracks[0].items[0].link.is_none());
+            assert!(r["documents"][0]["report"].as_array().unwrap().iter().any(|e| e.as_str().unwrap_or("").contains("have no audio")), "{r}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn nested_hostile_values_in_unread_places_are_skipped_not_buffered() {
+    // ~10 MB of numbers in one array nested in a material entry and in a text content
+    let nums = vec!["0"; 5_000_000].join(",");
+    let doc = format!(
+        r#"{{"canvas_config":{{"width":160,"height":90}},"fps":24,"tracks":[{{"type":"video","segments":[]}},{{"type":"text","segments":[{{"material_id":"x","target_timerange":{{"start":0,"duration":1000}}}}]}}],"materials":{{"videos":[],"effects":[[{nums}]],"speeds":[{{"mode":[{nums}],"extra":[{nums}]}}],"texts":[{{"id":"x","content":[{nums}]}}]}}}}"#
+    );
+    let d = dir("nested");
+    let path = d.join("draft_content.json");
+    std::fs::write(&path, doc).unwrap();
+    let mut s = Session::default();
+    let t = std::time::Instant::now();
+    let r = s.execute("file.import", json!({"paths": [path.to_string_lossy()]}));
+    assert!(t.elapsed().as_secs() < 30);
+    // the text has no usable content: the draft still imports (or is refused), never blows up
+    let _ = r;
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn media_in_a_sibling_folder_sharing_the_drafts_name_prefix_links() {
+    use crate::media_test_util::make_movie;
+    let d = dir("prefix");
+    let folder = d.join("Trip");
+    let sibling = d.join("Trip 2");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::create_dir_all(&sibling).unwrap();
+    let movie = sibling.join("m.mov");
+    make_movie(&movie, filmcraft_media::DemoScene::Aurora, 160, 90, 12);
+    std::fs::write(folder.join("draft_content.json"), draft_for(&movie.to_string_lossy())).unwrap();
+    let mut s = Session::default();
+    let r = s.execute("file.import", json!({"paths": [folder.to_string_lossy()]})).unwrap();
+    assert_eq!(r["documents"][0]["linkedMedia"], 1, "{r}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn missing_media_under_the_draft_is_offline_not_an_escape() {
+    let d = dir("missing");
+    let folder = d.join("Draft");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("draft_content.json"), draft_for("##_draftpath_placeholder_X_##/media/gone.mp4")).unwrap();
+    let mut s = Session::default();
+    let r = s.execute("file.import", json!({"paths": [folder.to_string_lossy()]})).unwrap();
+    assert_eq!(r["documents"][0]["offlineMedia"].as_array().map(Vec::len), Some(1), "{r}");
+    assert!(!r["documents"][0]["report"].as_array().unwrap().iter().any(|e| e.as_str().unwrap_or("").contains("resolve outside")), "{r}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn imports_are_one_undo_step() {
+    let d = dir("undo");
+    let folder = d.join("Draft");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("draft_content.json"), DRAFT).unwrap();
+    let mut s = Session::default();
+    let before = s.history.undo.len();
+    s.execute("file.importFolder", json!({"path": folder.to_string_lossy()})).unwrap();
+    assert_eq!(s.history.undo.len(), before + 1);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(unix)]
+#[test]
+fn directly_imported_draft_file_keeps_its_own_media_inside_the_folder() {
+    use crate::media_test_util::make_movie;
+    let d = dir("direct-link");
+    let outside = d.join("outside.mov");
+    make_movie(&outside, filmcraft_media::DemoScene::Aurora, 160, 90, 12);
+    let folder = d.join("Draft");
+    std::fs::create_dir_all(folder.join("media")).unwrap();
+    std::os::unix::fs::symlink(&outside, folder.join("media/m.mov")).unwrap();
+    let draft = folder.join("draft_content.json");
+    std::fs::write(&draft, draft_for("##_draftpath_placeholder_X_##/media/m.mov")).unwrap();
+    let mut s = Session::default();
+    let r = s.execute("file.import", json!({"paths": [draft.to_string_lossy()]})).unwrap();
+    assert_eq!(r["documents"][0]["linkedMedia"], 0, "{r}");
+    assert!(r["documents"][0]["report"].as_array().unwrap().iter().any(|e| e.as_str().unwrap_or("").contains("resolve outside")), "{r}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn draft_in_a_very_wide_folder_is_still_found() {
+    let d = dir("wide-draft");
+    let folder = d.join("Draft");
+    std::fs::create_dir_all(&folder).unwrap();
+    for i in 0..20_100 {
+        std::fs::write(folder.join(format!("a{i:05}")), b"").unwrap();
+    }
+    std::fs::write(folder.join("draft_content.json"), DRAFT).unwrap();
+    let mut s = Session::default();
+    let r = s.execute("file.import", json!({"paths": [folder.to_string_lossy()]})).unwrap();
+    assert_eq!(r["sequences"].as_array().map(Vec::len), Some(1), "{r}");
+    let _ = std::fs::remove_dir_all(&d);
+}

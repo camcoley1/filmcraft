@@ -31,7 +31,10 @@ pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format) -> Resu
     let p = std::path::Path::new(path);
     // a CapCut draft is named after its folder, not `draft_content`
     let name = if format == Format::CapCut { p.parent().and_then(|d| d.file_name()) } else { p.file_stem() };
-    import_doc(s, path, p.parent().map(|d| d.to_string_lossy().to_string()), name.map(|n| n.to_string_lossy().to_string()), None, bytes, format)
+    let dir = p.parent().map(|d| d.to_string_lossy().to_string());
+    // a CapCut draft's own files stay inside its folder
+    let contain = if format == Format::CapCut { dir.clone() } else { None };
+    import_doc(s, path, dir, name.map(|n| n.to_string_lossy().to_string()), contain, bytes, format)
 }
 
 /// Most entries read from one folder of a document directory.
@@ -50,6 +53,8 @@ fn contained(s: &Session, root: &str, path: &str) -> bool {
     match (canonical(s, root), canonical(s, path)) {
         (Some(Ok(r)), Some(Ok(p))) => std::path::Path::new(&p).starts_with(&r),
         (None, _) | (_, None) => true,
+        // a file that is not there leads nowhere (it stays offline); only a real location counts
+        (Some(Ok(_)), Some(Err(e))) => e.kind() == std::io::ErrorKind::NotFound,
         _ => false,
     }
 }
@@ -75,17 +80,22 @@ pub fn import_directory(s: &mut Session, path: &str) -> Option<Result<Value>> {
     let trimmed = Some(path.trim_end_matches(['/', '\\'])).filter(|t| !t.is_empty()).unwrap_or(path);
     let ext = std::path::Path::new(trimmed).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
     let package = matches!(ext.as_deref(), Some("fcpxmld" | "fcpbundle"));
-    let (entries, _) = match s.services.list_entries_capped(trimmed, DIR_MAX_ENTRIES)? {
-        Ok(v) => v,
-        Err(e) => return package.then(|| Err(EngineError::Other(format!("{path}: {e}")))),
+    // packages are listed (capped); a draft folder is recognised by its draft file directly
+    let names: Vec<String> = if package {
+        match s.services.list_entries_capped(trimmed, DIR_MAX_ENTRIES)? {
+            Ok((v, _)) => v.into_iter().map(|e| e.name).collect(),
+            Err(e) => return Some(Err(EngineError::Other(format!("{path}: {e}")))),
+        }
+    } else {
+        Vec::new()
     };
-    let names: Vec<String> = entries.into_iter().map(|e| e.name).collect();
     match ext.as_deref() {
         Some("fcpxmld") => Some(import_fcpxmld(s, trimmed, &names, std::path::Path::new(trimmed).file_stem().map(|n| n.to_string_lossy().to_string()))),
         Some("fcpbundle") => Some(import_fcpbundle(s, trimmed)),
         _ => {
             // draft_content.json, else draft_info.json: the first that is a readable draft
-            let present: Vec<&str> = filmcraft_interchange::capcut::DRAFT_FILES.into_iter().filter(|f| names.iter().any(|n| n == f)).collect();
+            let present: Vec<&str> =
+                filmcraft_interchange::capcut::DRAFT_FILES.into_iter().filter(|f| s.services.file_size(&format!("{trimmed}/{f}")).is_ok()).collect();
             if present.is_empty() {
                 return None;
             }
@@ -307,7 +317,7 @@ fn import_doc(
             // a path under the bundle or draft folder must not reach outside it (`../`, links);
             // a path elsewhere is the file's own location
             if let Some(root) = &contain
-                && candidate.starts_with(root.as_str())
+                && std::path::Path::new(&candidate).starts_with(root)
                 && !contained(s, root, &candidate)
             {
                 escaped += 1;

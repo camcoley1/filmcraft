@@ -29,7 +29,7 @@ use filmcraft_media::MediaKind;
 use filmcraft_project::{Caption, CaptionFormat, CaptionTrack, ClipId, ItemId, TrackId, TrackKind, validate_frame_size};
 use filmcraft_time::{FrameRate, Tick};
 use serde::Deserialize;
-use serde::de::{Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
 use crate::common::{Builder, MediaSpec, empty_sequence, file_name, gain_to_db, is_absolute, media_info, rate_from_f64, resolve_path, settings_for};
 use crate::{Error, Format, ImportOptions, Imported, Level, Report, Result};
@@ -156,16 +156,6 @@ impl<'de> Deserialize<'de> for AnyObject {
     }
 }
 
-/// Whether a field holds a value other than `null`.
-#[derive(Default, Clone, Copy)]
-struct Present(bool);
-
-impl<'de> Deserialize<'de> for Present {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        Option::<IgnoredAny>::deserialize(d).map(|o| Present(o.is_some()))
-    }
-}
-
 /// What the entries of an array of materials that are not read say about them.
 #[derive(Default)]
 struct Tally {
@@ -176,19 +166,137 @@ struct Tally {
     animated: u32,
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct TallyEntry {
-    mode: Option<i64>,
-    curve_speed: Present,
-    animations: Option<Len>,
+/// Visitor methods for the JSON scalars (and `null`) of a value that is read for a summary only.
+macro_rules! scalars {
+    ($v:expr) => {
+        fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+            Ok($v)
+        }
+        fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+            Ok($v)
+        }
+        fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+            Ok($v)
+        }
+        fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+            Ok($v)
+        }
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok($v)
+        }
+    };
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum TallyElem {
-    Entry(TallyEntry),
-    Other(IgnoredAny),
+/// What any JSON value says about itself, read without buffering it: its number, whether it is
+/// there (not `null`) and, for an array, its length.
+#[derive(Default, Clone, Copy)]
+struct Probe {
+    number: Option<f64>,
+    present: bool,
+    len: usize,
+}
+
+impl<'de> Deserialize<'de> for Probe {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Probe;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Probe, E> {
+                Ok(Probe { present: true, ..Probe::default() })
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Probe, E> {
+                Ok(Probe { number: Some(v as f64), present: true, len: 0 })
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Probe, E> {
+                Ok(Probe { number: Some(v as f64), present: true, len: 0 })
+            }
+            fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Probe, E> {
+                Ok(Probe { number: Some(v), present: true, len: 0 })
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Probe, E> {
+                Ok(Probe { present: true, ..Probe::default() })
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<Probe, E> {
+                Ok(Probe::default())
+            }
+            fn visit_none<E: de::Error>(self) -> std::result::Result<Probe, E> {
+                Ok(Probe::default())
+            }
+            fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> std::result::Result<Probe, D2::Error> {
+                Probe::deserialize(d)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Probe, A::Error> {
+                let mut len = 0usize;
+                while seq.next_element::<IgnoredAny>()?.is_some() {
+                    len += 1;
+                }
+                Ok(Probe { number: None, present: true, len })
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Probe, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(Probe { present: true, ..Probe::default() })
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// An entry of an array of materials that is not read: only the fields that tell apart a plain
+/// entry from one with a speed curve or an animation. Anything else (a nested array, a string) is
+/// skipped as it is read, never held.
+#[derive(Default)]
+struct TallyEntry {
+    curved: bool,
+    animated: bool,
+}
+
+impl<'de> Deserialize<'de> for TallyEntry {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        enum Field {
+            #[serde(rename = "mode")]
+            Mode,
+            #[serde(rename = "curve_speed")]
+            CurveSpeed,
+            #[serde(rename = "animations")]
+            Animations,
+            #[serde(other)]
+            Other,
+        }
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = TallyEntry;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a material")
+            }
+            scalars!(TallyEntry::default());
+            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<TallyEntry, E> {
+                Ok(TallyEntry::default())
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<TallyEntry, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(TallyEntry::default())
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<TallyEntry, A::Error> {
+                let mut e = TallyEntry::default();
+                while let Some(k) = map.next_key::<Field>()? {
+                    match k {
+                        Field::Mode => e.curved |= map.next_value::<Probe>()?.number.is_some_and(|m| m != 0.0),
+                        Field::CurveSpeed => e.curved |= map.next_value::<Probe>()?.present,
+                        Field::Animations => e.animated |= map.next_value::<Probe>()?.len > 0,
+                        Field::Other => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(e)
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 impl<'de> Deserialize<'de> for Tally {
@@ -201,16 +309,10 @@ impl<'de> Deserialize<'de> for Tally {
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Tally, A::Error> {
                 let mut t = Tally::default();
-                while let Some(e) = seq.next_element::<TallyElem>()? {
+                while let Some(e) = seq.next_element::<TallyEntry>()? {
                     t.total = t.total.saturating_add(1);
-                    if let TallyElem::Entry(e) = e {
-                        if e.mode.is_some_and(|m| m != 0) || e.curve_speed.0 {
-                            t.curved = t.curved.saturating_add(1);
-                        }
-                        if e.animations.is_some_and(|a| a.0 > 0) {
-                            t.animated = t.animated.saturating_add(1);
-                        }
-                    }
+                    t.curved = t.curved.saturating_add(u32::from(e.curved));
+                    t.animated = t.animated.saturating_add(u32::from(e.animated));
                 }
                 Ok(t)
             }
@@ -360,19 +462,84 @@ struct TextDoc {
     content: Option<Content>,
 }
 
-/// `content` of a text material: markup or a JSON string with a `text` field, or an object.
-#[derive(Deserialize)]
-#[serde(untagged)]
+/// `content` of a text material: a string (markup or JSON with a `text` field) or an object with
+/// `text`; anything else (a number, an array) is no text. Read without buffering the value.
 enum Content {
     Str(String),
-    Obj(TextObj),
-    Other(IgnoredAny),
+    Obj(Option<String>),
+    Other,
 }
 
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct TextObj {
-    text: Option<String>,
+impl<'de> Deserialize<'de> for Content {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        enum Field {
+            #[serde(rename = "text")]
+            Text,
+            #[serde(other)]
+            Other,
+        }
+        /// `text` when it is a string.
+        struct Str(Option<String>);
+        impl<'de> Deserialize<'de> for Str {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+                struct V;
+                impl<'de> Visitor<'de> for V {
+                    type Value = Str;
+                    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                        f.write_str("any value")
+                    }
+                    scalars!(Str(None));
+                    fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Str, E> {
+                        Ok(Str(Some(v.to_string())))
+                    }
+                    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Str, A::Error> {
+                        while seq.next_element::<IgnoredAny>()?.is_some() {}
+                        Ok(Str(None))
+                    }
+                    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Str, A::Error> {
+                        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                        Ok(Str(None))
+                    }
+                }
+                d.deserialize_any(V)
+            }
+        }
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Content;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("text content")
+            }
+            scalars!(Content::Other);
+            fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Content, E> {
+                Ok(Content::Str(v.to_string()))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Content, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(Content::Other)
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Content, A::Error> {
+                let mut text = None;
+                while let Some(k) = map.next_key::<Field>()? {
+                    match k {
+                        Field::Text => text = map.next_value::<Str>()?.0.or(text),
+                        Field::Other => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(Content::Obj(text))
+            }
+            fn visit_none<E: de::Error>(self) -> std::result::Result<Content, E> {
+                Ok(Content::Other)
+            }
+            fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> std::result::Result<Content, D2::Error> {
+                Content::deserialize(d)
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 fn perr(message: impl Into<String>) -> Error {
@@ -797,12 +964,12 @@ fn resolve_draft_path(raw: &str, base: Option<&str>) -> Option<String> {
 /// `text` field, legacy markup (`<font ...>[text]</font>`) or plain text.
 fn text_of(content: Option<&Content>) -> (String, bool) {
     match content {
-        Some(Content::Obj(o)) => (o.text.clone().unwrap_or_default(), false),
+        Some(Content::Obj(t)) => (t.clone().unwrap_or_default(), false),
         Some(Content::Str(s)) => {
             if s.trim_start().starts_with('{')
-                && let Ok(Content::Obj(o)) = serde_json::from_str::<Content>(s)
+                && let Ok(Content::Obj(t)) = serde_json::from_str::<Content>(s)
             {
-                return (o.text.unwrap_or_default(), s.contains("\"styles\""));
+                return (t.unwrap_or_default(), s.contains("\"styles\""));
             }
             let styled = s.contains('<');
             (strip_markup(s), styled)

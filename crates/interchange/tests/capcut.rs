@@ -355,3 +355,18 @@ fn segments_beyond_the_cap_are_skipped_while_reading_and_reported() {
 fn otio_with_a_json_extension_is_still_otio() {
     assert_eq!(detect(br#"{"OTIO_SCHEMA":"Timeline.1","name":"x","tracks":{}}"#, Some("json")), Some(Format::Otio));
 }
+
+#[test]
+fn nested_arrays_in_unread_fields_cost_neither_memory_nor_time() {
+    // 5 million numbers nested in a material entry, in an unknown field and in a text content:
+    // read once through a skipping visitor, never buffered
+    let nums = vec!["0"; 5_000_000].join(",");
+    let doc = format!(
+        r#"{{"canvas_config":{{"width":160,"height":90}},"fps":24,"tracks":[{{"type":"text","segments":[{{"material_id":"x","target_timerange":{{"start":0,"duration":1000}}}}]}}],"materials":{{"videos":[],"effects":[[{nums}]],"speeds":[{{"mode":[{nums}],"extra":[{nums}]}}],"texts":[{{"id":"x","content":[{nums}]}}]}}}}"#
+    );
+    let t = std::time::Instant::now();
+    let (_, report) = import_with(doc.as_bytes(), Format::CapCut, &opts()).unwrap();
+    assert!(t.elapsed().as_secs() < 30, "{:?}", t.elapsed());
+    assert!(report.mentions("no text"));
+    assert!(report.mentions("effects were not imported"));
+}
