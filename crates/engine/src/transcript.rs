@@ -357,10 +357,10 @@ fn remove_ranges(s: &mut Session, label: &str, ranges: Vec<TimeRange>) -> Result
 }
 
 /// `onsetGuardMs`: how close a cut may come to the neighbouring words, in milliseconds (default
-/// [`tx::DEFAULT_ONSET_GUARD_MS`]). Numbers are rounded and clamped to `0..=500`; anything else is
+/// the `mediaAnalysis.onsetGuardMs` preference, 40 out of the box). Numbers are rounded and clamped to `0..=500`; anything else is
 /// refused.
-fn onset_guard_p(p: &Value, cmd: &str) -> Result<Tick> {
-    let Some(v) = p.get("onsetGuardMs").filter(|v| !v.is_null()) else { return Ok(tx::onset_guard(tx::DEFAULT_ONSET_GUARD_MS)) };
+fn onset_guard_p(p: &Value, cmd: &str, default_ms: u32) -> Result<Tick> {
+    let Some(v) = p.get("onsetGuardMs").filter(|v| !v.is_null()) else { return Ok(tx::onset_guard(default_ms)) };
     let ms = v.as_f64().filter(|x| x.is_finite()).ok_or_else(|| bad(cmd, "`onsetGuardMs` must be a number of milliseconds from 0 to 500"))?;
     Ok(tx::onset_guard(ms.round().clamp(0.0, f64::from(tx::MAX_ONSET_GUARD_MS)) as u32))
 }
@@ -390,7 +390,7 @@ fn remove_pauses(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let min = Tick::from_seconds_f64(seconds_p(p, "minSeconds", CMD)?.unwrap_or(preset_min));
     let keep = Tick::from_seconds_f64(seconds_p(p, "keepSeconds", CMD)?.unwrap_or(preset_keep));
-    let guard = onset_guard_p(p, CMD)?;
+    let guard = onset_guard_p(p, CMD, s.prefs.media_analysis.onset_guard_ms)?;
     let words = sequence_words(s);
     let ranges = tx::find_pauses(&words, min, keep, guard, s.sequence_rate());
     remove_ranges(s, "Remove Pauses", ranges)
@@ -400,10 +400,10 @@ fn remove_fillers(s: &mut Session, p: &Value) -> Result<Value> {
     let words = sequence_words(s);
     let fillers: Vec<String> = match p.get("fillers").and_then(Value::as_array) {
         Some(a) => a.iter().filter_map(Value::as_str).map(str::to_string).collect(),
-        None => tx::DEFAULT_FILLERS.iter().map(|f| f.to_string()).collect(),
+        None => s.prefs.media_analysis.fillers(),
     };
     let hits = tx::find_fillers(&words, &fillers);
-    let guard = onset_guard_p(p, "transcript.removeFillers")?;
+    let guard = onset_guard_p(p, "transcript.removeFillers", s.prefs.media_analysis.onset_guard_ms)?;
     let ranges = tx::filler_ranges(&words, &hits, guard, s.sequence_rate());
     remove_ranges(s, "Remove Filler Words", ranges)
 }

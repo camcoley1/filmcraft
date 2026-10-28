@@ -30,10 +30,35 @@ the control channel and MCP agents can do the same.
 | `transcript.select` | Mark In/Out around words `from..=to` (frame-snapped outward) and move the playhead there. |
 | `transcript.extract` / `transcript.lift` | Extract (ripple) or lift the words' frames on the targeted tracks. |
 | `transcript.renameSpeaker` | Rename a speaker by name (every transcript) or by index in one `item`. |
-| `transcript.removeFillers` | Ripple-delete filler words (`fillers`, default um/uh/erm/…; phrases such as "you know" allowed). |
-| `transcript.removePauses` | Ripple-delete pauses longer than `minSeconds`, keeping `keepSeconds` of air on both sides. |
+| `transcript.removeFillers` | Ripple-delete filler words (`fillers`, else the Settings list, default um/uh/erm/…; phrases such as "you know" allowed). `onsetGuardMs`: see below. |
+| `transcript.removePauses` | Ripple-delete pauses longer than `minSeconds`, keeping `keepSeconds` of air on both sides. `preset` and `onsetGuardMs`: see below. |
 | `transcript.createCaptions` | Lay the words out as captions on a new caption track (`maxChars`, `lines`, `minSeconds`, `maxSeconds`, `gapFrames`). |
 | `transcript.models` / `transcript.downloadModel` | List the speech models (size, licence, installed) / download one. |
+
+## Tightening speech: presets and the onset guard
+
+`transcript.removePauses` and `transcript.removeFillers` never cut closer than `onsetGuardMs` to the
+word before or after the removed range (default 40, from Settings ▸ Media Analysis & Transcription;
+numbers are rounded and clamped to 0 to 500, anything else is refused). Whisper word times often
+start a little late, so the margin protects the attack of the next word and the tail of the last one.
+A pause cut keeps the larger of `keepSeconds` and the guard. A filler that touches its neighbours keeps
+a guard-wide sliver of itself instead of clipping them.
+
+`transcript.removePauses` also takes `preset`, which sets `minSeconds` and `keepSeconds` together:
+
+| Preset | `minSeconds` | `keepSeconds` |
+|---|---|---|
+| `gentle` | 1.5 | 0.3 |
+| `balanced` (default) | 1.0 | 0.15 |
+| `aggressive` | 0.5 | 0.08 |
+
+An explicit `minSeconds` or `keepSeconds` in the same call wins over the preset. An unknown preset is
+an error.
+
+The filler list (comma separated, phrases allowed; blank means the built-in list) and the default
+onset guard are the preferences `mediaAnalysis.fillerWords` and `mediaAnalysis.onsetGuardMs`
+(automation ids `settings.mediaAnalysis.fillerWords` and `settings.mediaAnalysis.onsetGuardMs`), also
+reachable with `prefs.get` and `prefs.set`.
 
 ## Speech recognition
 

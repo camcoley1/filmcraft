@@ -251,3 +251,36 @@ fn pause_presets_map_to_thresholds_and_explicit_values_win() {
     }
     assert_eq!(s.active_sequence().unwrap().duration(), before);
 }
+
+#[test]
+fn filler_list_and_onset_guard_come_from_preferences() {
+    let (mut s, item, _) = session();
+    s.execute("transcript.generate", json!({"items": [item.0]})).unwrap();
+    let get = |s: &mut Session, k: &str| s.execute("prefs.get", json!({"key": k})).unwrap();
+    assert_eq!(get(&mut s, "mediaAnalysis.onsetGuardMs"), json!(40));
+    assert!(get(&mut s, "mediaAnalysis.fillerWords").as_str().unwrap().contains("um"));
+    // hostile values are refused or clamped
+    assert!(s.execute("prefs.set", json!({"key": "mediaAnalysis.fillerWords", "value": 5})).is_err());
+    assert!(s.execute("prefs.set", json!({"key": "mediaAnalysis.fillerWords", "value": "x".repeat(5000)})).is_err());
+    // a list without "um" removes nothing; a list with "hello" removes that word
+    s.execute("prefs.set", json!({"key": "mediaAnalysis.fillerWords", "value": "like, you know"})).unwrap();
+    assert_eq!(s.execute("transcript.removeFillers", json!({})).unwrap()["removed"], 0);
+    s.execute("prefs.set", json!({"key": "mediaAnalysis.fillerWords", "value": " Hello , "})).unwrap();
+    assert_eq!(s.execute("transcript.removeFillers", json!({})).unwrap()["removed"], 1);
+    assert!(!words(&mut s).contains(&"Hello".to_string()));
+    s.execute("edit.undo", json!({})).unwrap();
+    // a blank list falls back to the built-in one; an explicit `fillers` param still wins
+    s.execute("prefs.set", json!({"key": "mediaAnalysis.fillerWords", "value": ""})).unwrap();
+    assert_eq!(s.execute("transcript.removeFillers", json!({"fillers": ["world"]})).unwrap()["removed"], 1);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(s.execute("transcript.removeFillers", json!({})).unwrap()["removed"], 1, "built-in um");
+    s.execute("edit.undo", json!({})).unwrap();
+    // the default guard preference feeds both commands and an explicit param overrides it
+    s.execute("prefs.set", json!({"key": "mediaAnalysis.onsetGuardMs", "value": 500})).unwrap();
+    let ticks = |s: &mut Session, p: serde_json::Value| s.execute("transcript.removePauses", p).unwrap()["ticks"].as_i64().unwrap();
+    let from_pref = ticks(&mut s, json!({"minSeconds": 1.0, "keepSeconds": 0.0}));
+    s.execute("edit.undo", json!({})).unwrap();
+    let explicit = ticks(&mut s, json!({"minSeconds": 1.0, "keepSeconds": 0.0, "onsetGuardMs": 0}));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(Tick(explicit - from_pref).seconds() > 0.9, "500 ms guards trim ~1 s off a 1.2 s cut: {explicit} vs {from_pref}");
+}

@@ -640,6 +640,10 @@ pub struct MediaAnalysisPrefs {
     pub default_language: String,
     /// Speech model (`transcript.models`).
     pub whisper_model: String,
+    /// Filler words and phrases for Remove Filler Words, comma separated. Blank = the built-in list.
+    pub filler_words: String,
+    /// Default onset guard for Remove Pauses / Remove Filler Words, in milliseconds (0 to 500).
+    pub onset_guard_ms: u32,
 }
 
 impl Default for MediaAnalysisPrefs {
@@ -653,7 +657,17 @@ impl Default for MediaAnalysisPrefs {
             language_auto_detect: false,
             default_language: "en".into(),
             whisper_model: filmcraft_speech::models::DEFAULT_MODEL.into(),
+            filler_words: filmcraft_edit::transcript::DEFAULT_FILLERS.join(", "),
+            onset_guard_ms: filmcraft_edit::transcript::DEFAULT_ONSET_GUARD_MS,
         }
+    }
+}
+
+impl MediaAnalysisPrefs {
+    /// The filler list: the comma separated entries (phrases allowed), or the built-in list when blank.
+    pub fn fillers(&self) -> Vec<String> {
+        let list: Vec<String> = self.filler_words.split(',').map(|w| w.trim().to_string()).filter(|w| !w.is_empty()).collect();
+        if list.is_empty() { filmcraft_edit::transcript::DEFAULT_FILLERS.iter().map(|f| f.to_string()).collect() } else { list }
     }
 }
 
@@ -1255,6 +1269,8 @@ static CATEGORIES: &[Category] = &[
                     b("mediaAnalysis.languageAutoDetect", "Enable language auto-detection", true),
                     f("mediaAnalysis.defaultLanguage", "Default language", Kind::Choice(LANGUAGES), true),
                     f("mediaAnalysis.whisperModel", "Speech model", Kind::Choice(MODELS), true),
+                    f("mediaAnalysis.fillerWords", "Filler words (comma separated)", Kind::Text, true),
+                    f("mediaAnalysis.onsetGuardMs", "Word onset guard when removing pauses and fillers", int(0.0, 500.0, "ms"), true),
                 ],
             ),
         ],
@@ -1401,6 +1417,12 @@ pub fn validate(key: &str, v: &Value) -> std::result::Result<(), String> {
             seen.push(id);
         }
         return Ok(());
+    }
+    if key == "mediaAnalysis.fillerWords" {
+        return match v.as_str() {
+            Some(s) if s.len() <= 4000 => Ok(()),
+            _ => Err("`mediaAnalysis.fillerWords` must be a comma separated text of at most 4000 characters".into()),
+        };
     }
     let kind = match field(key) {
         Some(f) => f.kind,
