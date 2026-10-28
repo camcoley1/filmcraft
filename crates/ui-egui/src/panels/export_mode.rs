@@ -789,6 +789,20 @@ fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &T
                     }
                 });
             }
+            // VideoToolbox (macOS) H.264 and H.265 can reorder frames; off by default
+            let videotoolbox = cfg!(target_os = "macos") && (f == Format::Hevc || s.hardware_encoding == HardwareEncoding::Auto);
+            if videotoolbox && f != Format::Av1 {
+                row(ui, t, "B-Frames", |ui| {
+                    let label = "Let the hardware encoder use B-frames";
+                    let r = ui.checkbox(&mut s.hardware_b_frames, label);
+                    reg.add("export.video.hardwareBFrames", r.rect, label);
+                    r.on_hover_text(
+                        "B-frames (frame reordering) can make files smaller at the same quality. Off keeps every frame in display order, \
+                         which lands closer to the target bitrate; on, the file carries composition offsets and an edit list (every \
+                         player FilmCraft targets reads them).",
+                    );
+                });
+            }
         }
         Format::ProRes => {
             row(ui, t, tl!("Profile"), |ui| {

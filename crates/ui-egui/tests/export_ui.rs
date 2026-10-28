@@ -229,6 +229,11 @@ fn h265_shows_the_h264_family_controls_without_the_h264_only_ones() {
     for id in ["export.video.profile", "export.video.level", "export.video.hardwareEncoding", "export.video.bitrateMode"] {
         assert!(d.has(id), "H.264: {id}");
     }
+    // H.264 with hardware encoding off (the default) has no B-frames checkbox: the built-in encoder has its own
+    assert!(!d.has("export.video.hardwareBFrames"), "H.264, hardware encoding off");
+    d.app().ui.export.settings.hardware_encoding = filmcraft_engine::export::HardwareEncoding::Auto;
+    d.frames(4);
+    assert_eq!(d.has("export.video.hardwareBFrames"), cfg!(target_os = "macos"), "H.264, hardware encoding on");
     d.app().ui.export.settings = ExportSettings { format: Format::Hevc, ..Default::default() };
     d.frames(4);
     for id in [
@@ -248,6 +253,14 @@ fn h265_shows_the_h264_family_controls_without_the_h264_only_ones() {
     }
     let sum = d.ok("ui.elements", json!({"prefix": "export.summary"}))[0]["label"].as_str().unwrap().to_string();
     assert!(sum.contains("HEVC Main") && sum.contains("Target 20.00 Mbps"), "{sum}");
+    // the B-frames checkbox is VideoToolbox's: H.265 always, H.264 only with hardware encoding on; off by default
+    assert_eq!(d.has("export.video.hardwareBFrames"), cfg!(target_os = "macos"), "H.265 B-frames checkbox");
+    assert!(!d.app().ui.export.settings.hardware_b_frames);
+    if cfg!(target_os = "macos") {
+        d.click("export.video.hardwareBFrames");
+        d.frames(2);
+        assert!(d.app().ui.export.settings.hardware_b_frames, "the checkbox sets the setting");
+    }
     d.snapshot("export-h265");
 }
 
