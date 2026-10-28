@@ -140,15 +140,11 @@ fn a_linked_clip_gets_its_anchor_from_the_real_size_of_the_media() {
     let mut t = Session::default();
     t.execute("file.open", json!({"path": path})).unwrap();
     assert_eq!(*t.project, *s.project);
-    // undo: Link Media takes the real size and the anchor back together, then the import itself
+    // undo: the import and its Link Media step are one entry, so one undo takes the sequence, the
+    // media and the real size back together
     let linked = s.project.clone();
     s.execute("edit.undo", json!({})).unwrap();
-    let clip = first_clip(&s, seq);
-    assert_eq!(s.project.source_size(clip.item), Some((3840, 2160)), "the size the document declared");
-    assert!(motion_point(&clip, "anchor").x.is_nan());
-    s.execute("edit.undo", json!({})).unwrap();
     assert_eq!(*s.project, *before);
-    s.execute("edit.redo", json!({})).unwrap();
     s.execute("edit.redo", json!({})).unwrap();
     assert_eq!(*s.project, *linked);
     let _ = std::fs::remove_dir_all(&d);

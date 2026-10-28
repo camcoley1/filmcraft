@@ -362,11 +362,14 @@ fn nested_arrays_in_unread_fields_cost_neither_memory_nor_time() {
     // read once through a skipping visitor, never buffered
     let nums = vec!["0"; 5_000_000].join(",");
     let doc = format!(
-        r#"{{"canvas_config":{{"width":160,"height":90}},"fps":24,"tracks":[{{"type":"text","segments":[{{"material_id":"x","target_timerange":{{"start":0,"duration":1000}}}}]}}],"materials":{{"videos":[],"effects":[[{nums}]],"speeds":[{{"mode":[{nums}],"extra":[{nums}]}}],"texts":[{{"id":"x","content":[{nums}]}}]}}}}"#
+        r#"{{"canvas_config":{{"width":160,"height":90}},"fps":24,"tracks":[{{"type":"video","segments":[{{"material_id":"v1","target_timerange":{{"start":0,"duration":1000000}}}}]}},{{"type":"text","segments":[{{"material_id":"x","target_timerange":{{"start":0,"duration":1000}}}}]}}],"materials":{{"videos":[{{"id":"v1","path":"/a.mp4"}}],"effects":[[{nums}]],"speeds":[{{"mode":[{nums}],"extra":[{nums}]}}],"texts":[{{"id":"x","content":[{nums}]}}]}}}}"#
     );
     let t = std::time::Instant::now();
-    let (_, report) = import_with(doc.as_bytes(), Format::CapCut, &opts()).unwrap();
+    let (im, report) = import_with(doc.as_bytes(), Format::CapCut, &opts()).unwrap();
     assert!(t.elapsed().as_secs() < 30, "{:?}", t.elapsed());
+    let seq = im.project.sequence(im.sequences[0]).unwrap();
+    assert_eq!(seq.tracks(TrackKind::Video)[0].items.len(), 1);
+    assert!(seq.caption_tracks.is_empty());
     assert!(report.mentions("no text"));
     assert!(report.mentions("effects were not imported"));
 }

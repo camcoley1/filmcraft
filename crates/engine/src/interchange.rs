@@ -31,9 +31,11 @@ pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format) -> Resu
     let p = std::path::Path::new(path);
     // a CapCut draft is named after its folder, not `draft_content`
     let name = if format == Format::CapCut { p.parent().and_then(|d| d.file_name()) } else { p.file_stem() };
-    let dir = p.parent().map(|d| d.to_string_lossy().to_string());
-    // a CapCut draft's own files stay inside its folder
-    let contain = if format == Format::CapCut { dir.clone() } else { None };
+    // a CapCut draft's own files stay inside its folder; a bare relative name is made absolute
+    // first (an empty folder would contain nothing)
+    let abs = if format == Format::CapCut { canonical(s, path).and_then(|r| r.ok()) } else { None };
+    let dir = abs.as_deref().map(std::path::Path::new).unwrap_or(p).parent().map(|d| d.to_string_lossy().to_string());
+    let contain = if format == Format::CapCut { dir.clone().filter(|d| !d.is_empty()) } else { None };
     import_doc(s, path, dir, name.map(|n| n.to_string_lossy().to_string()), contain, bytes, format)
 }
 
@@ -53,8 +55,12 @@ fn contained(s: &Session, root: &str, path: &str) -> bool {
     match (canonical(s, root), canonical(s, path)) {
         (Some(Ok(r)), Some(Ok(p))) => std::path::Path::new(&p).starts_with(&r),
         (None, _) | (_, None) => true,
-        // a file that is not there leads nowhere (it stays offline); only a real location counts
-        (Some(Ok(_)), Some(Err(e))) => e.kind() == std::io::ErrorKind::NotFound,
+        // the nearest part that exists decides: a missing file behind a link out is an escape
+        (Some(Ok(r)), Some(Err(e))) if e.kind() == std::io::ErrorKind::NotFound => std::path::Path::new(path)
+            .ancestors()
+            .skip(1)
+            .find_map(|a| canonical(s, &a.to_string_lossy()).and_then(|c| c.ok()))
+            .is_some_and(|a| std::path::Path::new(&a).starts_with(&r)),
         _ => false,
     }
 }
@@ -248,6 +254,22 @@ fn import_fcpbundle(s: &mut Session, dir: &str) -> Result<Value> {
 
 /// `contain`: the bundle or draft folder whose own references (paths under it) must stay inside it.
 fn import_doc(
+    s: &mut Session,
+    path: &str,
+    base_dir: Option<String>,
+    name: Option<String>,
+    contain: Option<String>,
+    bytes: &[u8],
+    format: Format,
+) -> Result<Value> {
+    // the merge, every Link Media step and the dropping of silent audio are one undo entry; a
+    // failing step rolls the project back to before the import (the opened-file cache is not
+    // part of the project and keeps what was opened)
+    let label = format!("Import {}", name.as_deref().filter(|n| !n.is_empty()).unwrap_or_else(|| format.name()));
+    s.edit_group(&label, |s| import_doc_steps(s, path, base_dir, name, contain, bytes, format))
+}
+
+fn import_doc_steps(
     s: &mut Session,
     path: &str,
     base_dir: Option<String>,

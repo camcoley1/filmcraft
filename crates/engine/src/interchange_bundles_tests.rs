@@ -347,7 +347,7 @@ fn nested_hostile_values_in_unread_places_are_skipped_not_buffered() {
     // ~10 MB of numbers in one array nested in a material entry and in a text content
     let nums = vec!["0"; 5_000_000].join(",");
     let doc = format!(
-        r#"{{"canvas_config":{{"width":160,"height":90}},"fps":24,"tracks":[{{"type":"video","segments":[]}},{{"type":"text","segments":[{{"material_id":"x","target_timerange":{{"start":0,"duration":1000}}}}]}}],"materials":{{"videos":[],"effects":[[{nums}]],"speeds":[{{"mode":[{nums}],"extra":[{nums}]}}],"texts":[{{"id":"x","content":[{nums}]}}]}}}}"#
+        r#"{{"canvas_config":{{"width":160,"height":90}},"fps":24,"tracks":[{{"type":"video","segments":[{{"material_id":"v1","target_timerange":{{"start":0,"duration":1000000}}}}]}},{{"type":"text","segments":[{{"material_id":"x","target_timerange":{{"start":0,"duration":1000}}}}]}}],"materials":{{"videos":[{{"id":"v1","path":"/nonexistent/a.mp4","width":160,"height":90}}],"effects":[[{nums}]],"speeds":[{{"mode":[{nums}],"extra":[{nums}]}}],"texts":[{{"id":"x","content":[{nums}]}}]}}}}"#
     );
     let d = dir("nested");
     let path = d.join("draft_content.json");
@@ -356,8 +356,13 @@ fn nested_hostile_values_in_unread_places_are_skipped_not_buffered() {
     let t = std::time::Instant::now();
     let r = s.execute("file.import", json!({"paths": [path.to_string_lossy()]}));
     assert!(t.elapsed().as_secs() < 30);
-    // the text has no usable content: the draft still imports (or is refused), never blows up
-    let _ = r;
+    // the text has no usable content: the video clip is still imported, with no caption
+    let r = r.unwrap();
+    assert_eq!(r["sequences"].as_array().map(Vec::len), Some(1), "{r}");
+    let q = s.active_sequence().unwrap();
+    assert_eq!(q.video_tracks[0].items.len(), 1);
+    assert!(q.caption_tracks.is_empty());
+    assert!(r["documents"][0]["report"].as_array().unwrap().iter().any(|e| e.as_str().unwrap_or("").contains("no text")), "{r}");
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -392,15 +397,62 @@ fn missing_media_under_the_draft_is_offline_not_an_escape() {
 }
 
 #[test]
-fn imports_are_one_undo_step() {
+fn imports_with_linked_media_are_one_undo_step_and_undo_restores_the_project() {
+    use crate::media_test_util::make_movie;
     let d = dir("undo");
+    let movie = d.join("m.mov");
+    make_movie(&movie, filmcraft_media::DemoScene::Aurora, 160, 90, 24);
     let folder = d.join("Draft");
     std::fs::create_dir_all(&folder).unwrap();
-    std::fs::write(folder.join("draft_content.json"), DRAFT).unwrap();
+    std::fs::write(folder.join("draft_content.json"), draft_for(&movie.to_string_lossy())).unwrap();
+    for how in ["folder", "importFolder", "file"] {
+        let mut s = Session::default();
+        let items_before = s.project.items.len();
+        let before = s.history.undo.len();
+        let r = match how {
+            "folder" => s.execute("file.import", json!({"paths": [folder.to_string_lossy()]})),
+            "importFolder" => s.execute("file.importFolder", json!({"path": folder.to_string_lossy()})),
+            _ => s.execute("file.import", json!({"paths": [folder.join("draft_content.json").to_string_lossy()]})),
+        }
+        .unwrap();
+        assert_eq!(r["documents"][0]["linkedMedia"], 1, "the Link Media step really ran: {r}");
+        assert_eq!(s.history.undo.len(), before + 1, "{how}: Import + Link Media is one entry");
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(s.project.items.len(), items_before, "{how}: one undo removes the sequence and the media");
+        assert!(s.project.items.values().all(|i| i.as_sequence().is_none()));
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_bare_relative_draft_path_does_not_make_every_path_an_escape() {
+    use crate::media_test_util::make_movie;
+    let d = dir("relative");
+    let movie = d.join("m.mov");
+    make_movie(&movie, filmcraft_media::DemoScene::Aurora, 160, 90, 12);
     let mut s = Session::default();
-    let before = s.history.undo.len();
-    s.execute("file.importFolder", json!({"path": folder.to_string_lossy()})).unwrap();
-    assert_eq!(s.history.undo.len(), before + 1);
+    let bytes = draft_for(&movie.to_string_lossy());
+    // no folder part: the file does not exist relative to the test's directory either
+    let r = crate::interchange::import(&mut s, "draft_content.json", bytes.as_bytes(), filmcraft_interchange::Format::CapCut).unwrap();
+    assert_eq!(r["linkedMedia"], 1, "absolute media still links: {r}");
+    assert!(!r["report"].as_array().unwrap().iter().any(|e| e.as_str().unwrap_or("").contains("resolve outside")), "{r}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_media_behind_a_link_out_of_the_draft_is_an_escape() {
+    let d = dir("missing-behind-link");
+    let outside = d.join("elsewhere");
+    std::fs::create_dir_all(&outside).unwrap();
+    let folder = d.join("Draft");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::os::unix::fs::symlink(&outside, folder.join("media")).unwrap();
+    std::fs::write(folder.join("draft_content.json"), draft_for("##_draftpath_placeholder_X_##/media/not-yet.mov")).unwrap();
+    let mut s = Session::default();
+    let r = s.execute("file.import", json!({"paths": [folder.to_string_lossy()]})).unwrap();
+    assert_eq!(r["documents"][0]["offlineMedia"].as_array().map(Vec::len), Some(1), "{r}");
+    assert!(r["documents"][0]["report"].as_array().unwrap().iter().any(|e| e.as_str().unwrap_or("").contains("resolve outside")), "{r}");
     let _ = std::fs::remove_dir_all(&d);
 }
 
