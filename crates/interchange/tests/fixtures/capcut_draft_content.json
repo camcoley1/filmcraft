@@ -1,0 +1,31 @@
+{
+  "canvas_config": {"width": 1080, "height": 1920, "ratio": "9:16"},
+  "fps": 30.0,
+  "duration": 6000000,
+  "tracks": [
+    {"type": "video", "id": "t1", "segments": [
+      {"material_id": "v1", "target_timerange": {"start": 0, "duration": 2000000}, "source_timerange": {"start": 1000000, "duration": 2000000}, "speed": 1.0, "volume": 1.0, "visible": true,
+       "clip": {"scale": {"x": 1.5, "y": 1.5}, "transform": {"x": 0.0, "y": 0.0}, "rotation": 0.0}},
+      {"material_id": "v1", "target_timerange": {"start": 2000000, "duration": 1000000}, "source_timerange": {"start": 0, "duration": 2000000}, "speed": 2.0, "common_keyframes": [{"x": 1}]}
+    ]},
+    {"type": "audio", "id": "t2", "segments": [
+      {"material_id": "a1", "target_timerange": {"start": 0, "duration": 3000000}, "source_timerange": {"start": 0, "duration": 3000000}, "speed": 1.0, "volume": 0.5}
+    ]},
+    {"type": "text", "id": "t3", "segments": [
+      {"material_id": "x1", "target_timerange": {"start": 500000, "duration": 1000000}},
+      {"material_id": "x2", "target_timerange": {"start": 1500000, "duration": 500000}}
+    ]},
+    {"type": "sticker", "segments": []}
+  ],
+  "materials": {
+    "videos": [{"id": "v1", "path": "##_draftpath_placeholder_ABC_##/media/clip.mp4", "material_name": "clip.mp4", "duration": 10000000, "width": 1080, "height": 1920, "type": "video"}],
+    "audios": [{"id": "a1", "path": "/music/song.mp3", "name": "song.mp3", "duration": 30000000}],
+    "texts": [
+      {"id": "x1", "content": "{\"text\":\"Hello world\",\"styles\":[{\"size\":8}]}"},
+      {"id": "x2", "content": "Plain caption"}
+    ],
+    "effects": [{"id": "e1"}, {"id": "e2"}],
+    "transitions": [{"id": "tr1"}],
+    "canvases": [{"id": "c1"}]
+  }
+}

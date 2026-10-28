@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.10">
+  <resources>
+    <format id="r1" frameDuration="1001/24000s" width="1920" height="1080"/>
+    <asset id="r2" name="Boats" start="0s" duration="120s" hasVideo="1" format="r1">
+      <media-rep kind="original-media" src="media/boats.mov"/>
+    </asset>
+  </resources>
+  <library>
+    <event name="Day 1">
+      <project name="Harbour">
+        <sequence format="r1" tcStart="0s" tcFormat="NDF" audioRate="48k">
+          <spine>
+            <asset-clip ref="r2" name="Boats" offset="0s" start="0s" duration="240240/24000s"/>
+          </spine>
+        </sequence>
+      </project>
+    </event>
+  </library>
+</fcpxml>

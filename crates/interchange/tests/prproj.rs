@@ -967,7 +967,7 @@ fn premiere_projects_are_import_only() {
     let e = export(&im.project, seq, Format::Prproj, &Default::default()).unwrap_err();
     assert!(e.to_string().contains("imported but not exported"), "{e}");
     assert!(Format::Prproj.is_import_only());
-    assert!(Format::ALL.iter().filter(|f| **f != Format::Prproj).all(|f| !f.is_import_only()));
+    assert!(Format::ALL.iter().filter(|f| !matches!(**f, Format::Prproj | Format::CapCut)).all(|f| !f.is_import_only()));
 }
 
 #[test]

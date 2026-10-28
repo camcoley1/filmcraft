@@ -8,7 +8,8 @@
 //! - **OpenTimelineIO** JSON (`.otio`) ([`otio`]);
 //! - **AAF** (`.aaf`, Edit Protocol, structured storage) ([`aaf`]);
 //! - **OMF Interchange 2.0** (`.omf`, Bento) for audio post ([`omf`]);
-//! - **Premiere Pro projects** (`.prproj`, plain or gzip XML), import only ([`prproj`]).
+//! - **Premiere Pro projects** (`.prproj`, plain or gzip XML), import only ([`prproj`]);
+//! - **CapCut drafts** (`draft_content.json`), import only ([`capcut`]).
 //!
 //! AAF and OMF can embed or consolidate audio: [`essence::audio_needs`] lists what the caller
 //! (the engine) has to render, and [`essence::MediaOptions`] passes the result back in.
@@ -28,6 +29,7 @@
 
 pub mod aaf;
 pub mod ale;
+pub mod capcut;
 pub mod edl;
 pub mod essence;
 pub mod fcp7;
@@ -67,10 +69,12 @@ pub enum Format {
     Omf,
     /// Adobe Premiere Pro project (`.prproj`, plain or gzip-compressed XML). Import only.
     Prproj,
+    /// CapCut desktop draft (`draft_content.json` / `draft_info.json`). Import only.
+    CapCut,
 }
 
 impl Format {
-    pub const ALL: [Format; 7] = [Format::Edl, Format::Fcp7Xml, Format::Fcpxml, Format::Otio, Format::Aaf, Format::Omf, Format::Prproj];
+    pub const ALL: [Format; 8] = [Format::Edl, Format::Fcp7Xml, Format::Fcpxml, Format::Otio, Format::Aaf, Format::Omf, Format::Prproj, Format::CapCut];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -81,6 +85,7 @@ impl Format {
             Format::Aaf => "AAF",
             Format::Omf => "OMF",
             Format::Prproj => "Premiere Pro Project",
+            Format::CapCut => "CapCut Draft",
         }
     }
 
@@ -94,12 +99,13 @@ impl Format {
             Format::Aaf => "aaf",
             Format::Omf => "omf",
             Format::Prproj => "prproj",
+            Format::CapCut => "json",
         }
     }
 
     /// Whether FilmCraft only reads this format (Premiere Pro projects): [`export`] refuses it.
     pub fn is_import_only(self) -> bool {
-        self == Format::Prproj
+        matches!(self, Format::Prproj | Format::CapCut)
     }
 
     /// Format for a file extension (case-insensitive, with or without the dot). `.xml` is ambiguous
@@ -113,6 +119,7 @@ impl Format {
             "aaf" => Some(Format::Aaf),
             "omf" | "omfi" => Some(Format::Omf),
             "prproj" => Some(Format::Prproj),
+            "json" => Some(Format::CapCut),
             _ => None,
         }
     }
@@ -144,6 +151,9 @@ pub fn detect(bytes: &[u8], extension: Option<&str>) -> Option<Format> {
     if head.starts_with('{') {
         if head.contains("\"OTIO_SCHEMA\"") {
             return Some(Format::Otio);
+        }
+        if capcut::sniff(bytes) {
+            return Some(Format::CapCut);
         }
         return extension.and_then(Format::from_extension).filter(|f| *f == Format::Otio);
     }
@@ -285,6 +295,9 @@ pub fn import_with(bytes: &[u8], format: Format, opts: &ImportOptions) -> Result
     if format == Format::Prproj {
         return prproj::import(bytes, opts);
     }
+    if format == Format::CapCut {
+        return capcut::import(bytes, opts);
+    }
     let text = decode_text(bytes);
     let mut report = Report::default();
     let imported = match format {
@@ -292,7 +305,9 @@ pub fn import_with(bytes: &[u8], format: Format, opts: &ImportOptions) -> Result
         Format::Fcp7Xml => fcp7::import(&text, opts, &mut report)?,
         Format::Fcpxml => fcpxml::import(&text, opts, &mut report)?,
         Format::Otio => otio::import(&text, opts, &mut report)?,
-        Format::Aaf | Format::Omf | Format::Prproj => return Err(Error::Other("AAF / OMF / Premiere Pro projects are read above".into())),
+        Format::Aaf | Format::Omf | Format::Prproj | Format::CapCut => {
+            return Err(Error::Other("AAF / OMF / Premiere Pro / CapCut documents are read above".into()));
+        }
     };
     Ok((imported, report))
 }
@@ -412,7 +427,7 @@ pub fn export(project: &Project, sequence: ItemId, format: Format, opts: &Export
         Format::Fcp7Xml => fcp7::export(project, sequence, opts, &mut report)?,
         Format::Fcpxml => fcpxml::export(project, sequence, opts, &mut report)?,
         Format::Otio => otio::export(project, sequence, opts, &mut report)?,
-        Format::Aaf | Format::Omf | Format::Prproj => return Err(Error::Other(format!("{} is not written as text", format.name()))),
+        Format::Aaf | Format::Omf | Format::Prproj | Format::CapCut => return Err(Error::Other(format!("{} is not written as text", format.name()))),
     };
     Ok((text.into_bytes(), report))
 }
