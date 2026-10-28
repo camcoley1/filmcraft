@@ -176,26 +176,33 @@ pub fn onset_guard(ms: u32) -> Tick {
     Tick(i64::from(ms.min(MAX_ONSET_GUARD_MS)) * (TICKS_PER_SECOND / 1000))
 }
 
-/// Pauses between consecutive words of at least `min`, as the ranges to remove: each keeps
+/// `t` snapped up to the next frame boundary (itself when already on one). Goes through the
+/// frame index, since `frame_duration()` rounds down at fractional rates and could land a tick
+/// before the real boundary.
+fn snap_up(rate: FrameRate, t: Tick) -> Tick {
+    let down = rate.snap(t);
+    if down < t { rate.tick_of(rate.frame_at(t).saturating_add(1)) } else { down }
+}
+
+/// Pauses between the words of at least `min`, as the ranges to remove: each keeps
 /// `max(keep, guard)` of silence next to both words and is snapped inward to frames (pauses shorter
 /// than one frame after that are skipped). The `guard` (onset guard) is the least distance a cut may
 /// come to either neighbouring word, so word timings that start a little late never lose the
-/// attack of the word after the cut, nor the tail of the word before it.
+/// attack of the word after the cut, nor the tail of the word before it. A pause is measured from
+/// the latest end of every word before it, so words overlapping across tracks are never cut into.
 pub fn find_pauses(words: &[SeqWord], min: Tick, keep: Tick, guard: Tick, rate: FrameRate) -> Vec<TimeRange> {
     let keep = keep.max(guard).max(Tick::ZERO);
     let mut out = Vec::new();
-    for p in words.windows(2) {
-        let (a, b) = (p[0].end, p[1].start);
+    let mut max_end: Option<Tick> = None;
+    for w in words {
+        let prev_end = max_end.replace(max_end.map_or(w.end, |m| m.max(w.end)));
+        let Some(a) = prev_end else { continue };
+        let b = w.start;
         if b - a < min || b <= a {
             continue;
         }
-        let s = a + keep;
-        let e = b - keep;
-        let mut s2 = rate.snap(s);
-        if s2 < s {
-            s2 += rate.frame_duration();
-        }
-        let e2 = rate.snap(e);
+        let s2 = snap_up(rate, a + keep);
+        let e2 = rate.snap(b - keep);
         if e2 > s2 {
             out.push(TimeRange::from_bounds(s2, e2));
         }
@@ -206,8 +213,12 @@ pub fn find_pauses(words: &[SeqWord], min: Tick, keep: Tick, guard: Tick, rate: 
 /// The default filler words and phrases (configurable in preferences and per command).
 pub const DEFAULT_FILLERS: &[&str] = &["um", "uh", "umm", "uhm", "erm", "er", "ah", "hmm", "mm", "mhm"];
 
+/// Longest silence between two words of a filler phrase such as "you know".
+pub const MAX_PHRASE_GAP: Tick = Tick(TICKS_PER_SECOND / 2);
+
 /// Filler words: word index ranges matching one of `fillers` (each a word or a phrase such as
-/// "you know"; case and punctuation ignored).
+/// "you know"; case and punctuation ignored). The words of a phrase must follow each other in one
+/// clip and one speaker with no more than [`MAX_PHRASE_GAP`] between them.
 pub fn find_fillers(words: &[SeqWord], fillers: &[String]) -> Vec<std::ops::Range<usize>> {
     let norm: Vec<String> = words.iter().map(SeqWord::normalized).collect();
     let mut phrases: Vec<Vec<String>> = fillers
@@ -217,10 +228,13 @@ pub fn find_fillers(words: &[SeqWord], fillers: &[String]) -> Vec<std::ops::Rang
         .collect();
     // longest phrases first, so "you know" wins over a lone "you"
     phrases.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    let joined = |a: &SeqWord, b: &SeqWord| a.clip == b.clip && a.speaker == b.speaker && b.start - a.end <= MAX_PHRASE_GAP;
     let mut out = Vec::new();
     let mut i = 0;
     while i < norm.len() {
-        let hit = phrases.iter().find(|p| i + p.len() <= norm.len() && p.iter().enumerate().all(|(k, w)| norm[i + k] == *w));
+        let hit = phrases.iter().find(|p| {
+            i + p.len() <= norm.len() && p.iter().enumerate().all(|(k, w)| norm[i + k] == *w) && words[i..i + p.len()].windows(2).all(|x| joined(&x[0], &x[1]))
+        });
         match hit {
             Some(p) => {
                 out.push(i..i + p.len());
@@ -232,29 +246,32 @@ pub fn find_fillers(words: &[SeqWord], fillers: &[String]) -> Vec<std::ops::Rang
     out
 }
 
-/// Timeline ranges removing the filler words `hits`: each word range snapped to the nearest frames,
-/// then pulled inward so no cut comes closer than `guard` to the word before or after it (a filler
-/// touching its neighbour keeps a `guard` sliver rather than clipping the neighbour).
+/// Timeline ranges removing the filler words `hits`: each word range (touching hits count as one)
+/// snapped to the nearest frames, then pulled inward so no cut comes closer than `guard` to any
+/// other word it reaches (a filler touching its neighbour keeps a `guard` sliver rather than
+/// clipping the neighbour; words overlapping it from other tracks are protected the same way).
 pub fn filler_ranges(words: &[SeqWord], hits: &[std::ops::Range<usize>], guard: Tick, rate: FrameRate) -> Vec<TimeRange> {
     let guard = guard.max(Tick::ZERO);
-    let mut out = Vec::new();
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
     for h in hits {
+        match merged.last_mut() {
+            Some(l) if l.end == h.start && h.end > h.start => l.end = h.end,
+            _ => merged.push(h.clone()),
+        }
+    }
+    let mut out = Vec::new();
+    for h in &merged {
         let (Some(first), Some(last)) = (words.get(h.start), h.end.checked_sub(1).and_then(|b| words.get(b))) else { continue };
         let mut s = rate.snap_nearest(first.start);
         let mut e = rate.snap_nearest(last.end);
-        if let Some(prev) = h.start.checked_sub(1).and_then(|i| words.get(i)) {
-            let lo = prev.end + guard;
-            if s < lo {
-                s = rate.snap(lo);
-                if s < lo {
-                    s += rate.frame_duration();
-                }
+        for (i, w) in words.iter().enumerate() {
+            if h.contains(&i) || w.end + guard <= s || w.start - guard >= e {
+                continue;
             }
-        }
-        if let Some(next) = words.get(h.end) {
-            let hi = next.start - guard;
-            if e > hi {
-                e = rate.snap(hi);
+            if w.start < first.start {
+                s = s.max(snap_up(rate, w.end + guard));
+            } else {
+                e = e.min(rate.snap(w.start - guard));
             }
         }
         if e > s {

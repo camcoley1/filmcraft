@@ -851,3 +851,21 @@ fn builtin_label_presets_are_complete_and_distinct() {
     }
     assert!(!settings::is_builtin_label_preset("Team"));
 }
+
+#[test]
+fn a_badly_typed_filler_list_on_load_resets_only_that_value() {
+    let default = Preferences::default();
+    let long_ok = "é".repeat(3000);
+    for (bad, want) in [
+        (json!(["um", "uh"]), default.media_analysis.filler_words.clone()),
+        (json!(5), default.media_analysis.filler_words.clone()),
+        (json!("x".repeat(10_000)), default.media_analysis.filler_words.clone()),
+        // the limit counts characters, not bytes
+        (json!(long_ok.clone()), long_ok),
+    ] {
+        let p = Preferences::from_value(json!({"mediaAnalysis": {"fillerWords": bad, "onsetGuardMs": 77}, "trim": {"largeTrimOffset": 9}}));
+        assert_eq!(p.media_analysis.filler_words, want);
+        assert_eq!(p.media_analysis.onset_guard_ms, 77, "the rest of the file survives");
+        assert_eq!(p.trim.large_trim_offset, 9);
+    }
+}

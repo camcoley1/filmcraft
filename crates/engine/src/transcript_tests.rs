@@ -246,10 +246,49 @@ fn pause_presets_map_to_thresholds_and_explicit_values_win() {
     let keep = run(&mut s, json!({"keepSeconds": 0.4, "onsetGuardMs": 0}));
     assert!(keep["ticks"].as_i64().unwrap() < balanced["ticks"].as_i64().unwrap());
     s.execute("edit.undo", json!({})).unwrap();
-    for bad in [json!({"preset": "extreme"}), json!({"preset": 3}), json!({"minSeconds": -1}), json!({"keepSeconds": "x"}), json!({"minSeconds": 1e30})] {
+    for bad in [
+        json!({"preset": "extreme"}),
+        json!({"preset": 3}),
+        json!({"preset": null, "minSeconds": -1}),
+        json!({"minSeconds": -1}),
+        json!({"keepSeconds": "x"}),
+        json!({"minSeconds": 1e30}),
+    ] {
         assert!(s.execute("transcript.removePauses", bad.clone()).is_err(), "{bad}");
     }
+    // a null preset is the default (balanced)
+    assert_eq!(run(&mut s, json!({"preset": null}))["removed"], 1);
+    s.execute("edit.undo", json!({})).unwrap();
     assert_eq!(s.active_sequence().unwrap().duration(), before);
+}
+
+#[test]
+fn malformed_fillers_params_are_refused() {
+    let (mut s, item, _) = session();
+    s.execute("transcript.generate", json!({"items": [item.0]})).unwrap();
+    let before = s.active_sequence().unwrap().duration();
+    let many: Vec<String> = (0..201).map(|i| format!("w{i}")).collect();
+    for bad in [json!("um"), json!(5), json!({}), json!(["um", 5]), json!([["um"]]), json!([null]), json!(["x".repeat(101)]), json!(many)] {
+        let e = s.execute("transcript.removeFillers", json!({"fillers": bad})).unwrap_err().to_string();
+        assert!(e.contains("fillers"), "{bad}: {e}");
+        assert_eq!(s.active_sequence().unwrap().duration(), before);
+    }
+    // null falls back to the preferences; a full-size list is accepted
+    assert_eq!(s.execute("transcript.removeFillers", json!({"fillers": null})).unwrap()["removed"], 1);
+    s.execute("edit.undo", json!({})).unwrap();
+    let ok: Vec<String> = (0..200).map(|i| format!("w{i}")).collect();
+    assert_eq!(s.execute("transcript.removeFillers", json!({"fillers": ok})).unwrap()["removed"], 0);
+}
+
+#[test]
+fn a_phrase_filler_from_the_preference_goes_through_remove_fillers() {
+    let (mut s, item, _) = session();
+    s.execute("transcript.generate", json!({"items": [item.0]})).unwrap();
+    // "Hello um" is contiguous (0.1 s apart); "world. Second" is a 1.2 s pause apart
+    s.execute("prefs.set", json!({"key": "mediaAnalysis.fillerWords", "value": "world second, hello um"})).unwrap();
+    assert_eq!(s.execute("transcript.removeFillers", json!({})).unwrap()["removed"], 1);
+    let left = words(&mut s);
+    assert_eq!(left, ["world.", "Second", "speaker", "here."]);
 }
 
 #[test]

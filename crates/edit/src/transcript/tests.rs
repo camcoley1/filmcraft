@@ -2,6 +2,8 @@
 //! hand-made interview transcript (`tests/fixtures/interview.transcript.json`, 10 s, two speakers,
 //! a 2 s pause after "show.", fillers "Um," and "uh", phrase "you know.").
 
+#![allow(clippy::single_range_in_vec_init)] // word-index ranges are the data under test
+
 use super::*;
 use filmcraft_project::{Label, Project, SequenceSettings, TrackItem};
 use filmcraft_time::FrameRate;
@@ -410,7 +412,7 @@ fn overlapping_unsorted_or_out_of_range_words_do_not_panic() {
                 assert!(r.duration > Tick::ZERO);
             }
         }
-        for hits in [vec![0..0], vec![2..3], vec![0..5], vec![3..9], vec![9..10], vec![4..2]] {
+        for hits in [vec![0..0], vec![2..3], vec![0..5], vec![3..9], vec![9..10], vec![std::ops::Range { start: 4, end: 2 }]] {
             for r in filler_ranges(&w, &hits, g, R) {
                 assert!(r.duration > Tick::ZERO);
             }
@@ -420,4 +422,74 @@ fn overlapping_unsorted_or_out_of_range_words_do_not_panic() {
     assert!(find_pauses(&[], Tick::ZERO, Tick::ZERO, s(0.04), R).is_empty());
     // a negative guard is treated as none
     assert_eq!(find_pauses(&[word("a", 0.0, 1.0), word("b", 3.0, 4.0)], s(1.0), Tick::ZERO, Tick(-5), R).len(), 1);
+}
+
+#[test]
+fn back_to_back_fillers_are_one_cut() {
+    let w = [word("so", 0.5, 1.0), word("um", 1.0, 1.3), word("uh", 1.3, 1.6), word("then", 1.6, 2.0)];
+    let g = s(0.04);
+    let hits = find_fillers(&w, &["um".to_string(), "uh".to_string()]);
+    assert_eq!(hits, [1..2, 2..3]);
+    let r = filler_ranges(&w, &hits, g, R);
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert!(r[0].start >= w[0].end + g && r[0].end() <= w[3].start - g, "{r:?}");
+    assert_eq!((r[0].start, r[0].end()), (s(1.04), s(1.56)));
+}
+
+#[test]
+fn words_overlapping_a_cut_from_another_track_are_protected() {
+    // sorted by start: A [0,5] spans B [1,2] and C [4,6]
+    let w = [word("a", 0.0, 5.0), word("b", 1.0, 2.0), word("c", 4.0, 6.0), word("d", 9.0, 10.0)];
+    // the gap B..C lies inside A, so only the real silence 6..9 may be cut
+    let p = find_pauses(&w, s(0.5), Tick::ZERO, s(0.04), R);
+    assert_eq!(p.len(), 1, "{p:?}");
+    assert!(p[0].start >= s(6.04) && p[0].end() <= s(8.96), "{p:?}");
+    // a filler inside A never cuts into it
+    let f = [word("a", 0.0, 5.0), word("um", 1.0, 2.0), word("c", 4.0, 6.0)];
+    assert!(filler_ranges(&f, &[1..2], s(0.04), R).is_empty());
+    // a filler sticking out past the long word keeps clear of it
+    let f = [word("a", 0.0, 1.5), word("um", 1.0, 2.0), word("c", 3.0, 4.0)];
+    let r = filler_ranges(&f, &[1..2], s(0.04), R);
+    assert!(r[0].start >= s(1.54) && r[0].end() <= s(2.0), "{r:?}");
+}
+
+#[test]
+fn an_upward_snap_never_lands_before_the_boundary_at_fractional_rates() {
+    for rate in [FrameRate::new(30000, 1001), FrameRate::new(24000, 1001), FrameRate::new(60000, 1001), FrameRate::new(37516, 1000)] {
+        let (a, b) = (s(1.0) + Tick(7), s(5.0) + Tick(11));
+        let w = [SeqWord { end: a, ..word("a", 0.0, 0.0) }, SeqWord { start: b, end: b + s(1.0), ..word("b", 0.0, 0.0) }];
+        for keep in [Tick::ZERO, Tick(12_345), s(0.1)] {
+            let r = find_pauses(&w, Tick::ZERO, keep, Tick::ZERO, rate);
+            assert_eq!(r.len(), 1);
+            assert!(r[0].start >= a + keep, "{:?} vs {:?}", r[0].start, a + keep);
+            assert_eq!(rate.snap(r[0].start), r[0].start, "on a frame boundary");
+            assert!(r[0].end() <= b - keep);
+            // the filler lower bound too
+            let f = [SeqWord { end: a, ..word("a", 0.0, 0.0) }, SeqWord { start: a, end: b, ..word("um", 0.0, 0.0) }];
+            for fr in filler_ranges(&f, &[1..2], keep, rate) {
+                assert!(fr.start >= a + keep && rate.snap(fr.start) == fr.start);
+            }
+        }
+    }
+}
+
+#[test]
+fn phrase_fillers_must_be_contiguous() {
+    let you_know = ["you know".to_string()];
+    let ok = [word("you", 0.0, 0.3), word("know", 0.4, 0.7)];
+    assert_eq!(find_fillers(&ok, &you_know), [0..2]);
+    // a long gap between the words
+    let gap = [word("you", 0.0, 0.3), word("know", 1.5, 1.8)];
+    assert!(find_fillers(&gap, &you_know).is_empty());
+    // different clips
+    let mut cross = ok.clone();
+    cross[1].clip = ClipId(2);
+    assert!(find_fillers(&cross, &you_know).is_empty());
+    // different speakers
+    let mut spk = ok.clone();
+    spk[0].speaker = Some("A".into());
+    spk[1].speaker = Some("B".into());
+    assert!(find_fillers(&spk, &you_know).is_empty());
+    // a single word is unaffected by any of this
+    assert_eq!(find_fillers(&cross, &["know".to_string()]), [1..2]);
 }

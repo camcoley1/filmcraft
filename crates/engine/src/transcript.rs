@@ -366,7 +366,14 @@ fn onset_guard_p(p: &Value, cmd: &str, default_ms: u32) -> Result<Tick> {
 }
 
 /// Aggressiveness presets for Remove Pauses: (name, `minSeconds`, `keepSeconds`).
-const PAUSE_PRESETS: &[(&str, f64, f64)] = &[("gentle", 1.5, 0.3), ("balanced", 1.0, 0.15), ("aggressive", 0.5, 0.08)];
+const PAUSE_PRESETS: &[(&str, f64, f64)] = &[("gentle", 1.5, 0.3), ("balanced", BALANCED.0, BALANCED.1), ("aggressive", 0.5, 0.08)];
+
+/// The `balanced` preset's (`minSeconds`, `keepSeconds`), which is also the default.
+const BALANCED: (f64, f64) = (1.0, 0.15);
+
+/// Most entries and longest entry (in characters) of an explicit `fillers` list.
+const MAX_FILLERS: usize = 200;
+const MAX_FILLER_CHARS: usize = 100;
 
 /// A seconds parameter: a finite number from 0 to 3600, else refused.
 fn seconds_p(p: &Value, key: &str, cmd: &str) -> Result<Option<f64>> {
@@ -380,7 +387,7 @@ fn seconds_p(p: &Value, key: &str, cmd: &str) -> Result<Option<f64>> {
 fn remove_pauses(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "transcript.removePauses";
     let (preset_min, preset_keep) = match p.get("preset").filter(|v| !v.is_null()) {
-        None => (1.0, 0.15),
+        None => BALANCED,
         Some(v) => {
             let hit = v.as_str().and_then(|n| PAUSE_PRESETS.iter().find(|(name, ..)| *name == n));
             let names: Vec<&str> = PAUSE_PRESETS.iter().map(|x| x.0).collect();
@@ -398,8 +405,15 @@ fn remove_pauses(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn remove_fillers(s: &mut Session, p: &Value) -> Result<Value> {
     let words = sequence_words(s);
-    let fillers: Vec<String> = match p.get("fillers").and_then(Value::as_array) {
-        Some(a) => a.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+    let fillers: Vec<String> = match p.get("fillers").filter(|v| !v.is_null()) {
+        Some(v) => {
+            let list = v.as_array().filter(|a| a.len() <= MAX_FILLERS);
+            let list: Option<Vec<String>> =
+                list.and_then(|a| a.iter().map(|x| x.as_str().filter(|s| s.chars().count() <= MAX_FILLER_CHARS).map(str::to_string)).collect());
+            list.ok_or_else(|| {
+                bad("transcript.removeFillers", format!("`fillers` must be a list of at most {MAX_FILLERS} strings of at most {MAX_FILLER_CHARS} characters"))
+            })?
+        }
         None => s.prefs.media_analysis.fillers(),
     };
     let hits = tx::find_fillers(&words, &fillers);
