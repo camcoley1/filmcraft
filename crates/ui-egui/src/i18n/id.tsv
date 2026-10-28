@@ -2923,6 +2923,9 @@
 	Maximum Bitrate	Bitrate Maksimum
 	Quality (CRF)	Kualitas (CRF)
 	Key Frame Distance	Jarak Bingkai Kunci
+	B-Frames	Bingkai B
+	Let the hardware encoder use B-frames	Izinkan encoder perangkat keras memakai bingkai B
+	Smaller files at the same quality. Off keeps the frames in display order and lands closer to the target bitrate.	File lebih kecil dengan kualitas yang sama. Jika mati, bingkai tetap dalam urutan tampilan dan bitrate lebih dekat ke target.
 	Quality	Kualitas
 	Render at Maximum Depth	Render pada Kedalaman Maksimum
 	Use Maximum Render Quality	Gunakan Kualitas Render Maksimum

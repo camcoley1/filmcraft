@@ -2920,6 +2920,9 @@
 	Maximum Bitrate	Taxa de bits máxima
 	Quality (CRF)	Qualidade (CRF)
 	Key Frame Distance	Distância entre quadros-chave
+	B-Frames	Quadros B
+	Let the hardware encoder use B-frames	Permitir que o codificador de hardware use quadros B
+	Smaller files at the same quality. Off keeps the frames in display order and lands closer to the target bitrate.	Arquivos menores com a mesma qualidade. Desativado, os quadros ficam na ordem de exibição e a taxa de bits fica mais perto da meta.
 	Quality	Qualidade
 	Render at Maximum Depth	Renderizar na profundidade máxima
 	Use Maximum Render Quality	Usar a qualidade máxima de renderização

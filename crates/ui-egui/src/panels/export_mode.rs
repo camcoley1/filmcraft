@@ -789,18 +789,17 @@ fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &T
                     }
                 });
             }
-            // VideoToolbox (macOS) H.264 and H.265 can reorder frames; off by default
-            let videotoolbox = cfg!(target_os = "macos") && (f == Format::Hevc || s.hardware_encoding == HardwareEncoding::Auto);
-            if videotoolbox && f != Format::Av1 {
-                row(ui, t, "B-Frames", |ui| {
-                    let label = "Let the hardware encoder use B-frames";
+            // VideoToolbox (macOS) H.264 and H.265 can reorder frames; off by default. Hidden where the
+            // hardware path declines the export anyway (CRF, two-pass, MXF), so it never does nothing.
+            let videotoolbox = cfg!(target_os = "macos") && f != Format::Av1 && (f == Format::Hevc || s.hardware_encoding == HardwareEncoding::Auto);
+            let declined = s.format.is_mxf() || matches!(s.bitrate_mode, BitrateMode::Crf | BitrateMode::Vbr2Pass);
+            if videotoolbox && !declined {
+                row(ui, t, tl!("B-Frames"), |ui| {
+                    let label = tl!("Let the hardware encoder use B-frames");
+                    // `check`, with a hover note on the trade-off
                     let r = ui.checkbox(&mut s.hardware_b_frames, label);
                     reg.add("export.video.hardwareBFrames", r.rect, label);
-                    r.on_hover_text(
-                        "B-frames (frame reordering) can make files smaller at the same quality. Off keeps every frame in display order, \
-                         which lands closer to the target bitrate; on, the file carries composition offsets and an edit list (every \
-                         player FilmCraft targets reads them).",
-                    );
+                    r.on_hover_text(tl!("Smaller files at the same quality. Off keeps the frames in display order and lands closer to the target bitrate."));
                 });
             }
         }

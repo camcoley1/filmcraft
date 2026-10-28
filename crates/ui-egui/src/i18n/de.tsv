@@ -2933,6 +2933,9 @@
 	Maximum Bitrate	Maximale Bitrate
 	Quality (CRF)	Qualität (CRF)
 	Key Frame Distance	Keyframe-Abstand
+	B-Frames	B-Frames
+	Let the hardware encoder use B-frames	Hardware-Encoder darf B-Frames verwenden
+	Smaller files at the same quality. Off keeps the frames in display order and lands closer to the target bitrate.	Kleinere Dateien bei gleicher Qualität. Aus: Die Bilder bleiben in Anzeigereihenfolge und die Ziel-Bitrate wird genauer eingehalten.
 	Quality	Qualität
 	Render at Maximum Depth	Mit maximaler Bittiefe rendern
 	Use Maximum Render Quality	Maximale Renderqualität verwenden

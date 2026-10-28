@@ -2901,6 +2901,9 @@
 	Maximum Bitrate	最大码率
 	Quality (CRF)	质量 (CRF)
 	Key Frame Distance	关键帧间隔
+	B-Frames	B 帧
+	Let the hardware encoder use B-frames	允许硬件编码器使用 B 帧
+	Smaller files at the same quality. Off keeps the frames in display order and lands closer to the target bitrate.	同等画质下文件更小。关闭时帧保持显示顺序，码率更接近目标。
 	Quality	质量
 	Render at Maximum Depth	以最大深度渲染
 	Use Maximum Render Quality	使用最大渲染质量

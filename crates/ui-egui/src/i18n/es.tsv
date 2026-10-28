@@ -2921,6 +2921,9 @@
 	Maximum Bitrate	Velocidad de bits máxima
 	Quality (CRF)	Calidad (CRF)
 	Key Frame Distance	Distancia entre fotogramas clave
+	B-Frames	Fotogramas B
+	Let the hardware encoder use B-frames	Permitir que el codificador por hardware use fotogramas B
+	Smaller files at the same quality. Off keeps the frames in display order and lands closer to the target bitrate.	Archivos más pequeños con la misma calidad. Desactivado, los fotogramas quedan en orden de visualización y la velocidad de bits se acerca más al objetivo.
 	Quality	Calidad
 	Render at Maximum Depth	Procesar a la máxima profundidad
 	Use Maximum Render Quality	Usar la máxima calidad de procesamiento

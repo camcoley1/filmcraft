@@ -2907,6 +2907,9 @@
 	Maximum Bitrate	最大ビットレート
 	Quality (CRF)	品質 (CRF)
 	Key Frame Distance	キーフレーム間隔
+	B-Frames	Bフレーム
+	Let the hardware encoder use B-frames	ハードウェアエンコーダーでBフレームを使用
+	Smaller files at the same quality. Off keeps the frames in display order and lands closer to the target bitrate.	同じ画質でファイルが小さくなります。オフにすると、フレームは表示順のままで、ビットレートが目標値に近くなります。
 	Quality	画質
 	Render at Maximum Depth	最大深度でレンダリングする
 	Use Maximum Render Quality	最高レンダリング画質を使用する
