@@ -1364,6 +1364,17 @@ fn build() -> Vec<CommandSpec> {
                     }
                     continue;
                 }
+                // Bundles and draft folders are documents, not files.
+                if let Some(r) = crate::interchange::import_directory(s, &path) {
+                    match r {
+                        Ok(r) => {
+                            sequences.extend(r["sequences"].as_array().cloned().unwrap_or_default());
+                            reports.push(r);
+                        }
+                        Err(e) => errors.push(e.to_string()),
+                    }
+                    continue;
+                }
                 // Media files through the host's reader (no whole-file read) when it has one.
                 let streamed = filmcraft_media::is_importable(std::path::Path::new(&path)) && s.services.reader(&path).is_some();
                 let read = if streamed { Ok(Vec::new()) } else { s.services.read_file(&path) };

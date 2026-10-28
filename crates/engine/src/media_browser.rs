@@ -75,7 +75,11 @@ pub const DEFAULT_COLUMNS: [&str; 5] = ["Name", "Frame Rate", "Media Duration", 
 
 /// Project and interchange files the browser can import. Avid Log Exchange (`.ale`) is left out:
 /// FilmCraft writes it (File ▸ Export) but, like Premiere, does not read it (#1292).
-const PROJECT_EXTENSIONS: [&str; 6] = ["fcproj", "edl", "xml", "fcpxml", "otio", "prproj"];
+const PROJECT_EXTENSIONS: [&str; 8] = ["fcproj", "edl", "xml", "fcpxml", "otio", "prproj", "fcpxmld", "fcpbundle"];
+/// Package folders the browser lists as one project file (macOS shows them as files).
+const PACKAGE_EXTENSIONS: [&str; 2] = ["fcpxmld", "fcpbundle"];
+/// CapCut draft file names, listed as projects.
+const CAPCUT_DRAFTS: [&str; 2] = ["draft_content.json", "draft_info.json"];
 const CAPTION_EXTENSIONS: [&str; 3] = ["srt", "vtt", "scc"];
 const RECENT_MAX: usize = 10;
 
@@ -156,7 +160,7 @@ pub fn kind_of(name: &str) -> Option<&'static str> {
         Some("audio")
     } else if filmcraft_media::STILL_EXTENSIONS.contains(&e.as_str()) {
         Some("image")
-    } else if PROJECT_EXTENSIONS.contains(&e.as_str()) {
+    } else if PROJECT_EXTENSIONS.contains(&e.as_str()) || CAPCUT_DRAFTS.contains(&name.to_ascii_lowercase().as_str()) {
         Some("project")
     } else if CAPTION_EXTENSIONS.contains(&e.as_str()) {
         Some("caption")
@@ -236,10 +240,13 @@ pub fn list(services: &dyn Services, dir: &str, filter: &str) -> std::io::Result
         .filter(|e| !e.name.starts_with('.'))
         .filter_map(|e| {
             let path = join(dir, &e.name);
-            if e.is_dir {
+            if e.is_dir && !PACKAGE_EXTENSIONS.contains(&ext_of(&e.name).as_str()) {
                 return Some(Entry { numbered: false, name: e.name, path, is_dir: true, kind: "folder", size: None, modified: e.modified });
             }
             let kind = kind_of(&e.name)?;
+            if e.is_dir && kind != "project" {
+                return None;
+            }
             if !passes(filter, kind, &e.name) {
                 return None;
             }

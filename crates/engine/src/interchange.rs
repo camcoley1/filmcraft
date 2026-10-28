@@ -11,7 +11,7 @@ use crate::{EngineError, Result, Session};
 /// The interchange format of a file, if it is one (by content, with the extension as a hint).
 pub fn detect(path: &str, bytes: &[u8]) -> Option<Format> {
     let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
-    if !matches!(ext.as_deref(), Some("edl" | "xml" | "fcpxml" | "otio" | "aaf" | "omf" | "omfi" | "prproj")) {
+    if !matches!(ext.as_deref(), Some("edl" | "xml" | "fcpxml" | "otio" | "aaf" | "omf" | "omfi" | "prproj" | "json")) {
         return None;
     }
     filmcraft_interchange::detect(bytes, ext.as_deref())
@@ -29,11 +29,123 @@ fn is_file_media(item: &filmcraft_project::ProjectItem) -> bool {
 /// link each media file that exists on disk. Returns the new sequences.
 pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format) -> Result<Value> {
     let p = std::path::Path::new(path);
-    let opts = ImportOptions {
-        base_dir: p.parent().map(|d| d.to_string_lossy().to_string()),
-        name: p.file_stem().map(|n| n.to_string_lossy().to_string()),
-        ..Default::default()
+    import_doc(s, path, p.parent().map(|d| d.to_string_lossy().to_string()), p.file_stem().map(|n| n.to_string_lossy().to_string()), bytes, format)
+}
+
+/// Directories the importer opens as one document: Final Cut `.fcpxmld` bundles and `.fcpbundle`
+/// libraries, and CapCut draft folders. `None`: not one of those (an ordinary path).
+pub fn import_directory(s: &mut Session, path: &str) -> Option<Result<Value>> {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    let ext = std::path::Path::new(trimmed).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    let names = match s.services.list_dir(trimmed)? {
+        Ok(n) => n,
+        Err(e) => return matches!(ext.as_deref(), Some("fcpxmld" | "fcpbundle")).then(|| Err(EngineError::Other(format!("{path}: {e}")))),
     };
+    let stem = std::path::Path::new(trimmed).file_stem().map(|n| n.to_string_lossy().to_string());
+    match ext.as_deref() {
+        Some("fcpxmld") => Some(import_fcpxmld(s, trimmed, &names, stem)),
+        Some("fcpbundle") => Some(import_fcpbundle(s, trimmed)),
+        _ => {
+            let draft = filmcraft_interchange::capcut::DRAFT_FILES.into_iter().find(|f| names.iter().any(|n| n == f))?;
+            let file = format!("{trimmed}/{draft}");
+            Some(s.services.read_file(&file).map_err(|e| EngineError::Other(format!("{file}: {e}"))).and_then(|b| {
+                if filmcraft_interchange::capcut::sniff(&b) {
+                    import_doc(s, &file, Some(trimmed.to_string()), stem.or_else(|| Some("CapCut Draft".into())), &b, Format::CapCut)
+                } else {
+                    Err(EngineError::Other(format!("{file} is not a CapCut draft (newer CapCut versions encrypt drafts; export FCPXML or XML from CapCut)")))
+                }
+            }))
+        }
+    }
+}
+
+/// A `.fcpxmld` bundle: `Info.fcpxml` is the document; relative media paths resolve against the bundle.
+fn import_fcpxmld(s: &mut Session, dir: &str, names: &[String], name: Option<String>) -> Result<Value> {
+    let Some(doc) = names.iter().find(|n| n.eq_ignore_ascii_case("Info.fcpxml")) else {
+        return Err(EngineError::Other(format!("{dir}: the bundle has no Info.fcpxml")));
+    };
+    let file = format!("{dir}/{doc}");
+    let bytes = s.services.read_file(&file).map_err(|e| EngineError::Other(format!("{file}: {e}")))?;
+    import_doc(s, &file, Some(dir.to_string()), name, &bytes, Format::Fcpxml)
+}
+
+/// Most folders / documents looked at inside a library.
+const LIBRARY_MAX_DEPTH: usize = 4;
+const LIBRARY_MAX_DIRS: usize = 500;
+const LIBRARY_MAX_DOCS: usize = 16;
+
+/// A `.fcpbundle` library keeps its events in `CurrentVersion.fcpevent` (a Core Data store, not
+/// FCPXML), which is not read. Any `.fcpxml` / `.fcpxmld` exported into the library folder is.
+fn import_fcpbundle(s: &mut Session, dir: &str) -> Result<Value> {
+    let mut docs = Vec::new();
+    let mut stack = vec![(dir.to_string(), 0usize)];
+    let mut visited = 0;
+    while let Some((d, depth)) = stack.pop() {
+        visited += 1;
+        if visited > LIBRARY_MAX_DIRS || docs.len() >= LIBRARY_MAX_DOCS {
+            break;
+        }
+        let Some(Ok(entries)) = s.services.list_entries(&d) else { continue };
+        for e in entries {
+            let path = format!("{d}/{}", e.name);
+            let lower = e.name.to_ascii_lowercase();
+            if lower.ends_with(".fcpxmld") && e.is_dir || lower.ends_with(".fcpxml") && !e.is_dir {
+                docs.push(path);
+            } else if e.is_dir && depth < LIBRARY_MAX_DEPTH && !e.name.starts_with('.') {
+                stack.push((path, depth + 1));
+            }
+        }
+    }
+    docs.sort();
+    docs.truncate(LIBRARY_MAX_DOCS);
+    if docs.is_empty() {
+        return Err(EngineError::Other(format!(
+            "{dir}: Final Cut libraries are not readable directly: in Final Cut choose File > Export XML, then import the .fcpxmld"
+        )));
+    }
+    let mut sequences = Vec::new();
+    let mut report = Vec::new();
+    let mut linked = 0;
+    let mut offline = Vec::new();
+    for d in docs {
+        let r = if d.to_ascii_lowercase().ends_with(".fcpxmld") {
+            let names = s.services.list_dir(&d).and_then(|r| r.ok()).unwrap_or_default();
+            import_fcpxmld(s, &d, &names, std::path::Path::new(&d).file_stem().map(|n| n.to_string_lossy().to_string()))
+        } else {
+            let p = std::path::Path::new(&d);
+            s.services.read_file(&d).map_err(|e| EngineError::Other(format!("{d}: {e}"))).and_then(|b| {
+                import_doc(
+                    s,
+                    &d,
+                    p.parent().map(|x| x.to_string_lossy().to_string()),
+                    p.file_stem().map(|n| n.to_string_lossy().to_string()),
+                    &b,
+                    Format::Fcpxml,
+                )
+            })
+        };
+        match r {
+            Ok(v) => {
+                sequences.extend(v["sequences"].as_array().cloned().unwrap_or_default());
+                linked += v["linkedMedia"].as_u64().unwrap_or(0);
+                offline.extend(v["offlineMedia"].as_array().cloned().unwrap_or_default());
+                report.extend(v["report"].as_array().cloned().unwrap_or_default());
+            }
+            Err(e) => report.push(json!(format!("{e}"))),
+        }
+    }
+    if sequences.is_empty() {
+        return Err(EngineError::Other(format!(
+            "{dir}: no document in the library could be imported: {}",
+            report.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; ")
+        )));
+    }
+    report.insert(0, json!("Final Cut libraries are not readable directly; only the FCPXML documents found inside were imported"));
+    Ok(json!({"format": "Final Cut Library", "sequences": sequences, "linkedMedia": linked, "offlineMedia": offline, "report": report}))
+}
+
+fn import_doc(s: &mut Session, path: &str, base_dir: Option<String>, name: Option<String>, bytes: &[u8], format: Format) -> Result<Value> {
+    let opts = ImportOptions { base_dir, name, ..Default::default() };
     let (fragment, report) = match format {
         // AAF / OMF may embed audio: write it next to the document (the media items point there)
         Format::Aaf | Format::Omf => {
