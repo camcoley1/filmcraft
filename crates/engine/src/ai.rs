@@ -5,7 +5,8 @@
 //! | `ai.status` | (none) | probes the helper; `{connected, probing, port, version, protocol, features, reason}` |
 //! | `ai.connect {port=9877}` | Clip ▸ AI | connects to the helper on another port |
 //! | `ai.reframe` | Clip ▸ AI | M6a: [`reframe`] |
-//! | `ai.enhanceSpeech` `ai.stems` `ai.upscale` `ai.interpolate` `ai.generativeExtend` | Clip ▸ AI | M6b to M6f |
+//! | `ai.stems` | Clip ▸ AI | M6b: [`stems`] |
+//! | `ai.enhanceSpeech` `ai.upscale` `ai.interpolate` `ai.generativeExtend` | Clip ▸ AI | M6c to M6f |
 //! | `ai.beatGrid` `ai.musicFit` | Sequence ▸ AI | M6d |
 //! | `ai.search {query}` | (Project panel search) | M6e |
 //! | `ai.echo` | (none) | the protocol test kind |
@@ -273,7 +274,16 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             Needs::Clips,
             r#"{"clips":[id]?,"strength":0..1=1,"wait":bool=false}"#
         ),
-        feature!("ai.stems", "Extract Stems…", ["Clip", "AI"], "stems", "M6b", Needs::Clips, r#"{"clips":[id]?,"wait":bool=false}"#),
+        CommandSpec {
+            id: "ai.stems",
+            label: "Extract Stems…",
+            menu: &["Clip", "AI"],
+            shortcut: None,
+            params: stems::PARAMS,
+            enabled: stems::enabled,
+            run: stems::run,
+            journal: true,
+        },
         feature!("ai.upscale", "Upscale…", ["Clip", "AI"], "upscale", "M6f", Needs::Clips, r#"{"clips":[id]?,"factor":2|4=2,"wait":bool=false}"#),
         feature!(
             "ai.interpolate",
@@ -563,7 +573,21 @@ pub fn prune_cache(ai_root: &Path, cap: u64, keep: &[PathBuf], min_age: Duration
 
 /// Start a `kind` job on `clips` of the active sequence (see the module docs). `wait` runs it to
 /// the end, result applied, before returning (not in a [`AiState::background`] host).
-pub fn start_job(s: &mut Session, kind: &'static str, label: &str, clips: &[ClipId], params: Value, context: Value, wait: bool) -> Result<Value> {
+/// One AI job to start ([`start_job`]).
+pub struct JobSpec<'a> {
+    pub kind: &'static str,
+    pub label: &'a str,
+    pub clips: &'a [ClipId],
+    /// Sent to the helper.
+    pub params: Value,
+    /// Kept for the apply step.
+    pub context: Value,
+    /// Wall-clock limit for this job (default: [`Limits::timeout`]).
+    pub timeout: Option<Duration>,
+}
+
+pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
+    let JobSpec { kind, label, clips, params, context, timeout } = spec;
     let client = s.sidecar.clone().ok_or_else(|| EngineError::Other(NOT_CONNECTED.into()))?;
     helper_ready(s, kind).map_err(EngineError::Other)?;
     let wait = wait && !s.ai.background;
@@ -592,7 +616,8 @@ pub fn start_job(s: &mut Session, kind: &'static str, label: &str, clips: &[Clip
     let job = crate::Job { id, label: label.to_string(), progress: Default::default(), result: Default::default() };
     job.progress.total.store(1000, Ordering::Relaxed);
     let outcome: Arc<Mutex<Option<Ready>>> = Arc::default();
-    let (prog, res, out, limits) = (job.progress.clone(), job.result.clone(), outcome.clone(), s.ai.limits);
+    let limits = Limits { timeout: timeout.unwrap_or(s.ai.limits.timeout).min(s.ai.limits.timeout), ..s.ai.limits };
+    let (prog, res, out) = (job.progress.clone(), job.result.clone(), outcome.clone());
     let run = move || {
         let beat = PathBuf::from(&req.out_dir).join(HEARTBEAT);
         let _ = std::fs::write(&beat, b"running\n");
@@ -738,6 +763,7 @@ fn apply(s: &mut Session, pj: &PendingAi, result: &JobResult, files: &[PathBuf])
     match pj.kind {
         "echo" => apply_echo(s, &pj.fingerprint, result, files),
         "reframe" => reframe::apply(s, pj, files),
+        "stems" => stems::apply(s, pj, files),
         k => Err(EngineError::Other(format!("results of `{k}` jobs cannot be applied yet"))),
     }
 }
@@ -752,7 +778,8 @@ fn echo(s: &mut Session, p: &Value) -> Result<Value> {
             params[k] = json!(n);
         }
     }
-    start_job(s, "echo", "AI Echo", &clips, params, Value::Null, bool_p(p, "wait").unwrap_or(false))
+    let spec = JobSpec { kind: "echo", label: "AI Echo", clips: &clips, params, context: Value::Null, timeout: None };
+    start_job(s, spec, bool_p(p, "wait").unwrap_or(false))
 }
 
 /// Echo results: (1) a sequence marker at each target clip, (2) the result file's name in each
@@ -802,6 +829,8 @@ fn apply_echo(s: &mut Session, fp: &Fingerprint, result: &JobResult, files: &[Pa
 
 #[path = "ai_reframe.rs"]
 pub mod reframe;
+#[path = "ai_stems.rs"]
+pub mod stems;
 
 #[cfg(test)]
 #[path = "ai_tests.rs"]
