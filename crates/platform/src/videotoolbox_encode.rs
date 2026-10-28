@@ -6,12 +6,15 @@
 //! encoder instead.
 //!
 //! A compression session is created with a hardware encoder *required*, so a machine without one
-//! is declined up front. Frame reordering (B-frames) is off, so compressed frames come out in
-//! presentation order with decode time = presentation time.
+//! is declined up front. Frame reordering (B-frames) is off unless [`VtConfig::b_frames`] asks for
+//! it: off, compressed frames come out in presentation order with decode time = presentation time;
+//! on, they come out in decoding order and each [`VtPacket`] carries its own decode time.
 //!
 //! Pictures go in as 8-bit 4:2:0 (NV12) pixel buffers filled from planar BT.709 limited-range
 //! Y'CbCr, the layout of `filmcraft_export::rgba_to_yuv420_8`, so the colours match the built-in
-//! encoder's. VideoToolbox encodes asynchronously; its output callback (on a VideoToolbox thread)
+//! encoder's. HEVC Main 10 takes 10-bit 4:2:0 (`x420`, P010-style: each code in the top 10 bits of
+//! 16) filled from the planar limited-range codes of `filmcraft_export::rgbf_to_yuv420_10`, and is
+//! tagged BT.2020 with PQ (plus the HDR10 static metadata) or HLG. VideoToolbox encodes asynchronously; its output callback (on a VideoToolbox thread)
 //! copies each compressed frame (length-prefixed NAL units) into a queue that [`VtEncoder::encode`]
 //! and [`VtEncoder::flush`] drain.
 //!
@@ -33,21 +36,26 @@ use objc2_core_media::{
 use objc2_core_video::{
     CVImageBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeightOfPlane,
     CVPixelBufferGetWidthOfPlane, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferPool, CVPixelBufferUnlockBaseAddress,
-    kCVImageBufferColorPrimaries_ITU_R_709_2, kCVImageBufferTransferFunction_ITU_R_709_2, kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVPixelBufferHeightKey,
-    kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey,
+    kCVImageBufferColorPrimaries_ITU_R_709_2, kCVImageBufferColorPrimaries_ITU_R_2020, kCVImageBufferTransferFunction_ITU_R_709_2,
+    kCVImageBufferTransferFunction_ITU_R_2100_HLG, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+    kCVImageBufferYCbCrMatrix_ITU_R_2020, kCVPixelBufferHeightKey, kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferPixelFormatTypeKey,
+    kCVPixelBufferWidthKey,
 };
 use objc2_video_toolbox::{
     VTCompressionSession, VTEncodeInfoFlags, VTSessionCopyProperty, VTSessionSetProperty, kVTCompressionPropertyKey_AllowFrameReordering,
     kVTCompressionPropertyKey_AllowOpenGOP, kVTCompressionPropertyKey_AverageBitRate, kVTCompressionPropertyKey_ColorPrimaries,
-    kVTCompressionPropertyKey_DataRateLimits, kVTCompressionPropertyKey_ExpectedFrameRate, kVTCompressionPropertyKey_MaxKeyFrameInterval,
-    kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime, kVTCompressionPropertyKey_TransferFunction,
-    kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, kVTCompressionPropertyKey_YCbCrMatrix, kVTProfileLevel_H264_Baseline_AutoLevel,
-    kVTProfileLevel_H264_High_AutoLevel, kVTProfileLevel_H264_Main_AutoLevel, kVTProfileLevel_HEVC_Main_AutoLevel,
-    kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
+    kVTCompressionPropertyKey_ContentLightLevelInfo, kVTCompressionPropertyKey_DataRateLimits, kVTCompressionPropertyKey_ExpectedFrameRate,
+    kVTCompressionPropertyKey_MasteringDisplayColorVolume, kVTCompressionPropertyKey_MaxKeyFrameInterval, kVTCompressionPropertyKey_ProfileLevel,
+    kVTCompressionPropertyKey_RealTime, kVTCompressionPropertyKey_TransferFunction, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+    kVTCompressionPropertyKey_YCbCrMatrix, kVTProfileLevel_H264_Baseline_AutoLevel, kVTProfileLevel_H264_High_AutoLevel, kVTProfileLevel_H264_Main_AutoLevel,
+    kVTProfileLevel_HEVC_Main_AutoLevel, kVTProfileLevel_HEVC_Main10_AutoLevel, kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
 };
 
 /// The pixel format of the buffers we hand over: biplanar Y + interleaved CbCr, video range.
 const NV12_VIDEO: u32 = u32::from_be_bytes(*b"420v");
+/// Main 10's: biplanar Y + interleaved CbCr, 10 bits in the top of 16, video range
+/// (`kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange`).
+const P010_VIDEO: u32 = u32::from_be_bytes(*b"x420");
 /// Largest compressed frame accepted from the callback (a sanity cap on a size we do not control).
 const MAX_FRAME_BYTES: usize = 256 << 20;
 /// Largest picture the hardware encoder is asked for.
@@ -68,15 +76,40 @@ pub enum VtProfile {
     High,
     /// HEVC Main: 8-bit 4:2:0.
     HevcMain,
+    /// HEVC Main 10: 10-bit 4:2:0 (pictures go in through [`VtEncoder::encode_10`]).
+    HevcMain10,
 }
 
 impl VtProfile {
     pub fn codec(self) -> VtCodec {
         match self {
             VtProfile::Baseline | VtProfile::Main | VtProfile::High => VtCodec::H264,
-            VtProfile::HevcMain => VtCodec::Hevc,
+            VtProfile::HevcMain | VtProfile::HevcMain10 => VtCodec::Hevc,
         }
     }
+
+    /// Whether pictures are 10-bit.
+    pub fn is_ten_bit(self) -> bool {
+        self == VtProfile::HevcMain10
+    }
+
+    fn pixel_format(self) -> u32 {
+        if self.is_ten_bit() { P010_VIDEO } else { NV12_VIDEO }
+    }
+}
+
+/// The colour description written to the stream (VUI, and SEI for the HDR10 static metadata).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum VtColor {
+    /// BT.709 primaries, transfer and matrix (SDR).
+    #[default]
+    Bt709,
+    /// BT.2020 primaries and matrix (non-constant luminance) with the PQ transfer (SMPTE ST 2084), and the
+    /// HDR10 static metadata: the 24-byte mastering display colour volume and the 4-byte content light
+    /// level, laid out as their H.265 SEI messages (and the `mdcv` / `clli` boxes) are.
+    Bt2020Pq { mastering_display: Vec<u8>, content_light: Vec<u8> },
+    /// BT.2020 primaries and matrix with the HLG transfer (ARIB STD-B67); HLG has no static metadata.
+    Bt2020Hlg,
 }
 
 /// How the bitrate is controlled (kilobits per second).
@@ -102,9 +135,15 @@ pub struct VtConfig {
     /// The profile, which also says whether this is an H.264 or an HEVC session.
     pub profile: VtProfile,
     pub rate: VtRate,
+    /// Let the encoder reorder frames (B-frames): packets then come out in decoding order, with
+    /// decode times before their presentation times.
+    pub b_frames: bool,
+    /// The stream's colour description. HDR (PQ / HLG) needs [`VtProfile::HevcMain10`].
+    pub color: VtColor,
 }
 
-/// One compressed frame in decoding order, which is presentation order (times in the config's timescale).
+/// One compressed frame in decoding order (times in the config's timescale). Without B-frames that is
+/// presentation order and `dts == pts`.
 #[derive(Clone, Debug)]
 pub struct VtPacket {
     /// Length-prefixed NAL units (4-byte lengths, as in an `avcC` / `hvcC` MP4 sample).
@@ -400,8 +439,47 @@ fn fill(pb: &CVImageBuffer, w: usize, h: usize, y: &[u8], u: &[u8], v: &[u8]) ->
     Ok(())
 }
 
-/// A hardware H.264 or HEVC encoder: feed pictures, collect compressed frames (in presentation
-/// order, which is decoding order since nothing is reordered).
+/// Copy planar 10-bit Y / U / V codes (0..1023, the layout of [`fill`]) into an `x420` buffer: two
+/// bytes per sample in native (little-endian) order, the code in the top 10 bits.
+fn fill_10(pb: &CVImageBuffer, w: usize, h: usize, y: &[u16], u: &[u16], v: &[u16]) -> Result<(), String> {
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    if y.len() < w * h || u.len() < cw * ch || v.len() < cw * ch {
+        return Err("the Y'CbCr planes are smaller than the picture".into());
+    }
+    let put = |dst: &mut [u8; 2], code: u16| *dst = (code.min(1023) << 6).to_ne_bytes();
+    // SAFETY: `pb` is a valid pixel buffer (the caller holds it retained).
+    if unsafe { CVPixelBufferLockBaseAddress(pb, CVPixelBufferLockFlags(0)) } != 0 {
+        return Err("cannot lock the input buffer".into());
+    }
+    let mut lock = Locked(pb);
+    let (luma, ls, lw, lh) = plane_mut(pb, &mut lock, 0)?;
+    if lw < w || lh < h || ls < w * 2 {
+        return Err("the input buffer's luma plane is smaller than the picture".into());
+    }
+    for (row, src) in luma.chunks_mut(ls).zip(y.chunks_exact(w)).take(h) {
+        for (dst, &c) in row.as_chunks_mut::<2>().0.iter_mut().zip(src) {
+            put(dst, c);
+        }
+    }
+    let (chroma, cs, cpw, cph) = plane_mut(pb, &mut lock, 1)?;
+    if cpw < cw || cph < ch || cs < cw * 4 {
+        return Err("the input buffer's chroma plane is smaller than the picture".into());
+    }
+    for ((row, us), vs) in chroma.chunks_mut(cs).zip(u.chunks_exact(cw)).zip(v.chunks_exact(cw)).take(ch) {
+        for ((quad, &cb), &cr) in row.as_chunks_mut::<4>().0.iter_mut().zip(us).zip(vs) {
+            let (lo, hi) = quad.split_at_mut(2);
+            if let (Ok(lo), Ok(hi)) = (<&mut [u8; 2]>::try_from(lo), <&mut [u8; 2]>::try_from(hi)) {
+                put(lo, cb);
+                put(hi, cr);
+            }
+        }
+    }
+    drop(lock);
+    Ok(())
+}
+
+/// A hardware H.264 or HEVC encoder: feed pictures, collect compressed frames (in decoding order:
+/// presentation order too unless B-frames were asked for).
 pub struct VtEncoder {
     session: Session,
     config: VtConfig,
@@ -474,7 +552,7 @@ impl VtEncoder {
         let require_key: &CFString = unsafe { kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder };
         let spec = CFDictionary::<CFString, CFType>::from_slices(&[require_key], &[CFBoolean::new(true).as_ref()]);
 
-        let (pf, cw, ch) = (CFNumber::new_i32(NV12_VIDEO as i32), CFNumber::new_i32(w as i32), CFNumber::new_i32(h as i32));
+        let (pf, cw, ch) = (CFNumber::new_i32(config.profile.pixel_format() as i32), CFNumber::new_i32(w as i32), CFNumber::new_i32(h as i32));
         let io = CFDictionary::<CFString, CFType>::from_slices(&[], &[]);
         // SAFETY: reading immutable framework constants.
         let (pf_key, w_key, h_key, io_key): (&CFString, &CFString, &CFString, &CFString) =
@@ -524,6 +602,7 @@ impl VtEncoder {
                     VtProfile::Main => kVTProfileLevel_H264_Main_AutoLevel,
                     VtProfile::High => kVTProfileLevel_H264_High_AutoLevel,
                     VtProfile::HevcMain => kVTProfileLevel_HEVC_Main_AutoLevel,
+                    VtProfile::HevcMain10 => kVTProfileLevel_HEVC_Main10_AutoLevel,
                 },
             )
         };
@@ -532,10 +611,11 @@ impl VtEncoder {
         let (realtime, reorder, open_gop) =
             unsafe { (kVTCompressionPropertyKey_RealTime, kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AllowOpenGOP) };
         require(set_bool(session, realtime, false), "offline encoding")?;
-        // No B-frames: on real 1080p footage the hardware encoder's quality is the same with and
-        // without them (±0.3 dB at equal bitrate), the bitrate lands closer to the target, and
-        // decode and presentation order coincide, so the muxer needs no composition offsets or edit list.
-        require(set_bool(session, reorder, false), "frame reordering")?;
+        // No B-frames unless asked for: on real 1080p footage the hardware encoder's quality is the
+        // same with and without them (±0.3 dB at equal bitrate), the bitrate lands closer to the
+        // target, and decode and presentation order coincide, so the muxer needs no composition
+        // offsets or edit list. With them, packets carry their decode times (see `VtPacket`).
+        require(set_bool(session, reorder, c.b_frames), "frame reordering")?;
         // closed GOPs: every keyframe is an IDR picture, so every MP4 sync sample is a clean seek point
         let _ = set_bool(session, open_gop, false);
 
@@ -570,21 +650,49 @@ impl VtEncoder {
             }
         }
 
-        // BT.709, like the pictures we convert: written to the stream's VUI
+        Self::configure_color(session, c)
+    }
+
+    /// The colour description of the pictures we convert, written to the stream's VUI: BT.709 for
+    /// SDR; BT.2020 with PQ (and the HDR10 static metadata as SEI) or HLG for Main 10 HDR.
+    fn configure_color(session: &VTCompressionSession, c: &VtConfig) -> Result<(), String> {
+        let hdr = c.color != VtColor::Bt709;
+        if hdr && !c.profile.is_ten_bit() {
+            return Err("HDR needs HEVC Main 10".into());
+        }
         // SAFETY: reading immutable framework constants.
-        let (pk, tk, mk, pv, tv, mv): (&CFString, &CFString, &CFString, &CFString, &CFString, &CFString) = unsafe {
-            (
-                kVTCompressionPropertyKey_ColorPrimaries,
-                kVTCompressionPropertyKey_TransferFunction,
-                kVTCompressionPropertyKey_YCbCrMatrix,
-                kCVImageBufferColorPrimaries_ITU_R_709_2,
-                kCVImageBufferTransferFunction_ITU_R_709_2,
-                kCVImageBufferYCbCrMatrix_ITU_R_709_2,
-            )
+        let (pk, tk, mk): (&CFString, &CFString, &CFString) =
+            unsafe { (kVTCompressionPropertyKey_ColorPrimaries, kVTCompressionPropertyKey_TransferFunction, kVTCompressionPropertyKey_YCbCrMatrix) };
+        // SAFETY: reading immutable framework constants.
+        let (pv, tv, mv): (&CFString, &CFString, &CFString) = unsafe {
+            match c.color {
+                VtColor::Bt709 => (kCVImageBufferColorPrimaries_ITU_R_709_2, kCVImageBufferTransferFunction_ITU_R_709_2, kCVImageBufferYCbCrMatrix_ITU_R_709_2),
+                VtColor::Bt2020Pq { .. } => {
+                    (kCVImageBufferColorPrimaries_ITU_R_2020, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, kCVImageBufferYCbCrMatrix_ITU_R_2020)
+                }
+                VtColor::Bt2020Hlg => {
+                    (kCVImageBufferColorPrimaries_ITU_R_2020, kCVImageBufferTransferFunction_ITU_R_2100_HLG, kCVImageBufferYCbCrMatrix_ITU_R_2020)
+                }
+            }
         };
-        let _ = set_value(session, pk, pv.as_ref());
-        let _ = set_value(session, tk, tv.as_ref());
-        let _ = set_value(session, mk, mv.as_ref());
+        // an SDR stream keeps its pictures whatever the VUI says; an HDR one without its tags would be
+        // shown as SDR, so those must be accepted
+        let (sp, st, sm) = (set_value(session, pk, pv.as_ref()), set_value(session, tk, tv.as_ref()), set_value(session, mk, mv.as_ref()));
+        if hdr {
+            require(sp, "the BT.2020 primaries")?;
+            require(st, "the HDR transfer function")?;
+            require(sm, "the BT.2020 matrix")?;
+        }
+        if let VtColor::Bt2020Pq { mastering_display, content_light } = &c.color {
+            if mastering_display.len() != 24 || content_light.len() != 4 {
+                return Err("malformed HDR10 static metadata".into());
+            }
+            // SAFETY: reading immutable framework constants.
+            let (mdk, cllk): (&CFString, &CFString) =
+                unsafe { (kVTCompressionPropertyKey_MasteringDisplayColorVolume, kVTCompressionPropertyKey_ContentLightLevelInfo) };
+            require(set_value(session, mdk, CFData::from_bytes(mastering_display).as_ref()), "the mastering display colour volume")?;
+            require(set_value(session, cllk, CFData::from_bytes(content_light).as_ref()), "the content light level")?;
+        }
         Ok(())
     }
 
@@ -625,7 +733,7 @@ impl VtEncoder {
                     None,
                     self.config.width as usize,
                     self.config.height as usize,
-                    NV12_VIDEO,
+                    self.config.profile.pixel_format(),
                     Some(self.attrs.as_ref()),
                     NonNull::from(&mut raw),
                 )
@@ -639,13 +747,32 @@ impl VtEncoder {
     /// Submit picture number `index` (planar BT.709 limited-range Y'CbCr, tightly packed) and return
     /// the compressed frames that came out meanwhile.
     pub fn encode(&mut self, index: u64, y: &[u8], u: &[u8], v: &[u8]) -> Result<Vec<VtPacket>, String> {
+        if self.config.profile.is_ten_bit() {
+            return Err("a Main 10 encoder takes 10-bit pictures (encode_10)".into());
+        }
         let buffer = self.new_buffer()?;
         fill(&buffer, self.config.width as usize, self.config.height as usize, y, u, v)?;
+        self.submit(index, &buffer)
+    }
+
+    /// Submit picture number `index` as planar 10-bit limited-range Y'CbCr codes (tightly packed,
+    /// the layout of `filmcraft_export::rgbf_to_yuv420_10`) to a Main 10 encoder and return the
+    /// compressed frames that came out meanwhile.
+    pub fn encode_10(&mut self, index: u64, y: &[u16], u: &[u16], v: &[u16]) -> Result<Vec<VtPacket>, String> {
+        if !self.config.profile.is_ten_bit() {
+            return Err("an 8-bit encoder takes 8-bit pictures (encode)".into());
+        }
+        let buffer = self.new_buffer()?;
+        fill_10(&buffer, self.config.width as usize, self.config.height as usize, y, u, v)?;
+        self.submit(index, &buffer)
+    }
+
+    fn submit(&mut self, index: u64, buffer: &CVImageBuffer) -> Result<Vec<VtPacket>, String> {
         let value = i64::try_from(index).ok().and_then(|i| i.checked_mul(i64::from(self.config.frame_duration))).ok_or("frame index out of range")?;
         let (pts, duration) = (cm_time(value, self.config.timescale), cm_time(i64::from(self.config.frame_duration), self.config.timescale));
         // SAFETY: the session and buffer are valid (VideoToolbox retains the buffer as long as it
         // needs it); no frame properties, refcon or info-flags out-pointer.
-        let status = unsafe { self.session.session.encode_frame(&buffer, pts, duration, None, std::ptr::null_mut(), std::ptr::null_mut()) };
+        let status = unsafe { self.session.session.encode_frame(buffer, pts, duration, None, std::ptr::null_mut(), std::ptr::null_mut()) };
         if status != 0 {
             return Err(format!("VTCompressionSessionEncodeFrame failed ({status})"));
         }
