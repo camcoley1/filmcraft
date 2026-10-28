@@ -409,9 +409,15 @@ impl Exporter {
         let file = Out::create(&self.settings)?;
         let mut opts = WriterOptions::new(self.brand);
         opts.metadata = self.settings.metadata.udta();
+        let media_start = self.venc.media_start();
+        if media_start.is_some() && self.venc.timescale() > 0 {
+            // the B-frame edit list's duration in the video's own timescale: in milliseconds,
+            // 45 frames at 29.97 (1501.5 ms) would round down to less than 45 frames
+            opts.movie_timescale = self.venc.timescale();
+        }
         let mut mux = Mp4Writer::new(file, opts).map_err(|e| ExportError::Io(e.to_string()))?;
         let mut vcfg = TrackConfig::new(self.venc.sample_entry(), self.venc.timescale());
-        vcfg.media_start = self.venc.media_start();
+        vcfg.media_start = media_start;
         self.vt = mux.add_track(vcfg).map_err(|e| ExportError::Io(e.to_string()))?;
         self.at = match (&self.audio, &self.aenc) {
             (None, _) => None,

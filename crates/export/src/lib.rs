@@ -374,6 +374,10 @@ pub struct ExportSettings {
     /// byte-reproducible like the built-in encoder's (`determinism_tests`).
     #[serde(default)]
     pub hardware_encoding: HardwareEncoding,
+    /// Let the hardware encoder reorder frames (B-frames) where it supports them (VideoToolbox H.264
+    /// and H.265 on macOS). Off by default: off, every frame is decoded in presentation order.
+    #[serde(default)]
+    pub hardware_b_frames: bool,
     /// Composite the exported frames on the GPU instead of the CPU reference renderer (Export ▸
     /// GPU rendering: Auto / Off, Off by default). Off = the CPU reference renderer exactly.
     #[serde(default)]
@@ -574,6 +578,7 @@ impl Default for ExportSettings {
             bitrate_mode: BitrateMode::default(),
             crf: DEFAULT_CRF,
             hardware_encoding: HardwareEncoding::default(),
+            hardware_b_frames: false,
             gpu_rendering: GpuRendering::Off,
             max_bitrate_kbps: None,
             adaptive_bitrate: None,
