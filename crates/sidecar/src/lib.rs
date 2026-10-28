@@ -68,6 +68,9 @@ pub enum SidecarError {
     Cancelled,
     #[error("AI job result: {0}")]
     BadResult(String),
+    /// Preparing the job on this side failed (decoding its input…).
+    #[error("{0}")]
+    Local(String),
 }
 
 pub type Result<T> = std::result::Result<T, SidecarError>;

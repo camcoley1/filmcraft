@@ -67,7 +67,13 @@ fn stems_land_in_a_bin_in_one_undo_step() {
     let r = f.s.execute("ai.stems", json!({"wait": true})).unwrap();
     assert_eq!(r["applied"], true, "{r}");
     let req = f.helper.started()[0].clone();
-    assert_eq!((req.kind.as_str(), req.inputs.clone()), ("stems", vec!["/media/interview.mov".to_string()]));
+    // the helper gets the source decoded by FilmCraft: 2 s of 44.1 kHz float stereo in the job folder
+    assert_eq!(req.kind, "stems");
+    assert!(req.inputs.len() == 1 && req.inputs[0].ends_with("source.wav"), "{:?}", req.inputs);
+    let wav = std::fs::read(&req.inputs[0]).unwrap();
+    assert_eq!(&wav[..4], b"RIFF");
+    assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 44_100);
+    assert_eq!(wav.len(), 44 + 2 * 44_100 * 2 * 4);
     assert_eq!(req.params["stems"], json!(["vocals", "drums", "bass", "other"]));
     assert_eq!(bin_items(&f, "Stems: interview"), ["vocals.wav", "drums.wav", "bass.wav", "other.wav"]);
     assert_eq!(f.s.history.undo.len(), undo + 1);

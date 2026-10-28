@@ -1,8 +1,10 @@
 //! `ai.stems` (M6b): split a clip's audio into vocals, drums, bass and other.
 //!
 //! `ai.stems {clips?, place=false, wait=false}` starts one helper job per selected clip whose media
-//! has audio. The helper separates the clip's WHOLE source file (at most [`MAX_SECONDS`]), so every
-//! stem is time-aligned with the source: same length and sample rate. The result is applied in one
+//! has audio. The job's thread decodes the clip's WHOLE source (at most [`MAX_SECONDS`]) to a
+//! 44.1 kHz float WAV in the job folder (FilmCraft's own decoders: the helper needs none), and the
+//! helper splits that, so every stem is time-aligned with the source: same length, 44.1 kHz (the
+//! model's rate), the source's channels (mono stays mono, more than two become the first two). The result is applied in one
 //! undo step ("Extract Stems"): the four WAV files are imported into a new bin "Stems: <clip>"
 //! and, with `place`, put on four new audio tracks under the clip with its exact placement
 //! (start, source In, duration, speed, direction). A stem whose length differs from the source's
@@ -62,6 +64,8 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         let name = s.active_sequence().and_then(|q| q.find_item(c)).map(|(_, it)| it.name.clone()).unwrap_or_default();
         // CPU separation runs at a few times real time: allow 6x the source plus 10 minutes
         let timeout = Duration::from_secs_f64(seconds * 6.0 + 600.0);
+        let item = s.active_sequence().and_then(|q| q.find_item(c)).map(|(_, it)| it.item).ok_or(EngineError::NoSequence)?;
+        let src = s.source(item).ok_or_else(|| EngineError::Other(format!("{name}: the media cannot be read")))?;
         let spec = super::JobSpec {
             kind: "stems",
             label: "Extract Stems",
@@ -69,6 +73,11 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
             params: json!({"stems": STEMS, "maxSeconds": MAX_SECONDS}),
             context: json!({"name": name, "place": place, "seconds": seconds}),
             timeout: Some(timeout),
+            prepare: Some(Box::new(move |dir: &std::path::Path, cancelled: &dyn Fn() -> bool| {
+                let path = dir.join("source.wav");
+                decode_to_wav(&*src, seconds, &path, cancelled)?;
+                Ok(vec![path.to_string_lossy().to_string()])
+            })),
         };
         jobs.push(super::start_job(s, spec, wait)?);
     }
@@ -76,6 +85,64 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::Other("select a clip with audio in the timeline".into()));
     }
     Ok(if jobs.len() == 1 { jobs.remove(0) } else { json!({"jobs": jobs}) })
+}
+
+/// The model's sample rate.
+pub const RATE: u32 = 44_100;
+
+/// Write `seconds` of `src`'s audio, resampled to [`RATE`], as a 32-bit float WAV (streamed, ten
+/// seconds at a time; stops when `cancelled`).
+fn decode_to_wav(
+    src: &dyn filmcraft_media::MediaSource,
+    seconds: f64,
+    path: &std::path::Path,
+    cancelled: &dyn Fn() -> bool,
+) -> std::result::Result<(), String> {
+    use std::io::Write;
+    let channels = src.info().audio().map_or(2, |a| a.channels.clamp(1, 2) as usize);
+    let total = (seconds.clamp(0.0, MAX_SECONDS) * RATE as f64).round() as u64;
+    let bytes = total.saturating_mul(channels as u64 * 4);
+    let size = u32::try_from(bytes).map_err(|_| "the source is too long for a WAV file".to_string())?;
+    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let mut w = std::io::BufWriter::new(file);
+    let ch = channels as u16;
+    let mut head = Vec::with_capacity(44);
+    head.extend_from_slice(b"RIFF");
+    head.extend_from_slice(&size.saturating_add(36).to_le_bytes());
+    head.extend_from_slice(b"WAVEfmt ");
+    for v in [
+        16u32.to_le_bytes().as_slice(),
+        &3u16.to_le_bytes(),
+        &ch.to_le_bytes(),
+        &RATE.to_le_bytes(),
+        &(RATE * u32::from(ch) * 4).to_le_bytes(),
+        &(ch * 4).to_le_bytes(),
+        &32u16.to_le_bytes(),
+    ] {
+        head.extend_from_slice(v);
+    }
+    head.extend_from_slice(b"data");
+    head.extend_from_slice(&size.to_le_bytes());
+    w.write_all(&head).map_err(|e| e.to_string())?;
+    let step = RATE as u64 * 10;
+    let mut start = 0u64;
+    while start < total {
+        if cancelled() {
+            return Err("stopped".into());
+        }
+        let n = step.min(total - start) as usize;
+        let buf = src.audio(start as i64, n, RATE).map_err(|e| e.to_string())?;
+        let mut out = Vec::with_capacity(n * channels * 4);
+        for i in 0..n {
+            for c in 0..channels {
+                let v = buf.channels.get(c).or(buf.channels.first()).and_then(|ch| ch.get(i)).copied().unwrap_or(0.0);
+                out.extend_from_slice(&(if v.is_finite() { v } else { 0.0 }).to_le_bytes());
+            }
+        }
+        w.write_all(&out).map_err(|e| e.to_string())?;
+        start += n as u64;
+    }
+    w.flush().map_err(|e| e.to_string())
 }
 
 pub(crate) fn apply(s: &mut Session, pj: &super::PendingAi, files: &[std::path::PathBuf]) -> Result<()> {

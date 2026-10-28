@@ -584,10 +584,17 @@ pub struct JobSpec<'a> {
     pub context: Value,
     /// Wall-clock limit for this job (default: [`Limits::timeout`]).
     pub timeout: Option<Duration>,
+    /// Runs on the job's thread before the helper is asked: writes the helper's input files into
+    /// the job folder (decoded audio…) and returns them in place of the media paths. Gets the
+    /// folder and whether the job was cancelled.
+    pub prepare: Option<Prepare>,
 }
 
+/// See [`JobSpec::prepare`].
+pub type Prepare = Box<dyn FnOnce(&std::path::Path, &dyn Fn() -> bool) -> std::result::Result<Vec<String>, String> + Send>;
+
 pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
-    let JobSpec { kind, label, clips, params, context, timeout } = spec;
+    let JobSpec { kind, label, clips, params, context, timeout, prepare } = spec;
     let client = s.sidecar.clone().ok_or_else(|| EngineError::Other(NOT_CONNECTED.into()))?;
     helper_ready(s, kind).map_err(EngineError::Other)?;
     let wait = wait && !s.ai.background;
@@ -633,7 +640,19 @@ pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
                 let _ = std::fs::write(&beat, b"running\n");
             }
         };
-        let r = filmcraft_sidecar::drive(&*client, &req, &limits, &cancelled, &mut on_progress);
+        let mut req = req;
+        let prepared = match prepare {
+            Some(prepare) => {
+                *lock(&prog.status) = "Preparing the input".into();
+                prepare(std::path::Path::new(&req.out_dir), &cancelled).map(|inputs| req.inputs = inputs)
+            }
+            None => Ok(()),
+        };
+        let r = match prepared {
+            Ok(()) => filmcraft_sidecar::drive(&*client, &req, &limits, &cancelled, &mut on_progress),
+            Err(_) if cancelled() => Err(SidecarError::Cancelled),
+            Err(e) => Err(SidecarError::Local(format!("preparing the input: {e}"))),
+        };
         let _ = std::fs::remove_file(&beat);
         match r {
             // finished by `poll` once the result is applied (or dropped)
@@ -778,7 +797,7 @@ fn echo(s: &mut Session, p: &Value) -> Result<Value> {
             params[k] = json!(n);
         }
     }
-    let spec = JobSpec { kind: "echo", label: "AI Echo", clips: &clips, params, context: Value::Null, timeout: None };
+    let spec = JobSpec { kind: "echo", label: "AI Echo", clips: &clips, params, context: Value::Null, timeout: None, prepare: None };
     start_job(s, spec, bool_p(p, "wait").unwrap_or(false))
 }
 
