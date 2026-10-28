@@ -12,8 +12,11 @@ use serde_json::{Value, json};
 
 use crate::{JobRequest, PROTOCOL_VERSION};
 
+/// Files a scripted job writes: `(name in out_dir, bytes)`.
+pub type Writer = fn(&JobRequest) -> Vec<(String, Vec<u8>)>;
+
 /// What the result of a finished job is.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum ResultMode {
     /// `echo.json` (the request) in `out_dir`; `meta` = the job's params.
     Echo,
@@ -25,6 +28,8 @@ pub enum ResultMode {
     Outside,
     /// The job fails with this message.
     Fail(String),
+    /// These files, made from the request (a feature's result format).
+    Custom(Writer),
 }
 
 /// Which reply is not JSON, or how the helper misbehaves on the wire.
@@ -215,6 +220,16 @@ fn finish(job: &JobRequest, id: &Value, mode: &ResultMode) -> Value {
     let _ = std::fs::create_dir_all(dir);
     let file = match mode {
         ResultMode::Fail(m) => return json!({"type": "error", "job": id, "message": m}),
+        ResultMode::Custom(write) => {
+            let names: Vec<String> = write(job)
+                .into_iter()
+                .map(|(name, bytes)| {
+                    let _ = std::fs::write(dir.join(&name), bytes);
+                    name
+                })
+                .collect();
+            return json!({"type": "result", "job": id, "files": names, "meta": job.params});
+        }
         ResultMode::Echo => {
             let path = dir.join("echo.json");
             let _ = std::fs::write(&path, serde_json::to_vec(job).unwrap_or_default());
