@@ -936,6 +936,82 @@ mod tests {
         }
     }
 
+    /// The version byte of the first `name` box in `file`.
+    fn box_version(file: &[u8], name: &[u8; 4]) -> Option<u8> {
+        file.windows(4).position(|w| w == name).and_then(|p| file.get(p + 4).copied())
+    }
+
+    /// An HEVC-style reordered group of pictures as an encoder hands it over (decoding order):
+    /// presentation index of each picture, and whether it is a sync sample.
+    const REORDERED: [(i64, bool); 10] = [(0, true), (4, false), (2, false), (1, false), (3, false), (5, true), (9, false), (7, false), (6, false), (8, false)];
+
+    #[test]
+    fn reordered_samples_get_non_negative_ctts_and_an_edit_list_that_starts_at_the_first_picture() {
+        // a 30000/1001 stream two frames deep: decoded at n x 1001, presented 2 frames later
+        let (dur, delay) = (1001i64, 2 * 1001i64);
+        for fast in [false, true] {
+            let mut w = Mp4Writer::new(Cursor::new(Vec::new()), WriterOptions::new(Brand::Mp4)).unwrap();
+            let mut cfg = TrackConfig::new(avc_entry(), 30000);
+            cfg.media_start = Some(delay);
+            let v = w.add_track(cfg).unwrap();
+            for (n, &(pts, key)) in REORDERED.iter().enumerate() {
+                let offset = pts * dur + delay - n as i64 * dur;
+                assert!(offset >= 0);
+                w.write_sample(v, WriteSample { data: &[n as u8; 20], duration: dur as u32, composition_offset: offset as i32, is_sync: key }).unwrap();
+            }
+            let out = if fast { w.finish_faststart() } else { w.finish() }.unwrap().into_inner();
+            assert_eq!(box_version(&out, b"ctts"), Some(0), "non-negative offsets: ctts version 0");
+            assert_eq!(box_version(&out, b"elst"), Some(0));
+            let f = crate::open(out.as_slice()).unwrap();
+            let t = &f.tracks[0];
+            assert_eq!(t.edits.len(), 1);
+            assert_eq!(t.edits[0].media_time, delay, "the edit starts at the first picture");
+            // 10 frames of 1001/30000 s in the 1000 movie timescale
+            assert_eq!(t.edits[0].segment_duration, 10 * dur as u64 * 1000 / 30000);
+            assert_eq!(t.edits[0].media_rate, 0x10000);
+            for (n, (s, &(pts, key))) in t.samples.iter().zip(&REORDERED).enumerate() {
+                assert_eq!(s.dts, n as i64 * dur, "decode times are monotonic, one frame apart");
+                assert_eq!(s.pts + t.edit_offset, pts * dur, "sample {n}: presentation time after the edit");
+                assert!(s.pts >= s.dts, "never presented before it is decoded");
+                assert_eq!(s.is_sync, key, "sample {n}");
+            }
+            let mut presented: Vec<i64> = t.samples.iter().map(|s| s.pts + t.edit_offset).collect();
+            presented.sort_unstable();
+            assert_eq!(presented, (0..10).map(|i| i * dur).collect::<Vec<_>>(), "every picture once, the first at 0");
+            assert_eq!(t.sync_sample_before(9), 5);
+        }
+    }
+
+    #[test]
+    fn negative_composition_offsets_write_ctts_version_1() {
+        // the same pictures without a decode delay: B pictures are presented before their decode time
+        let dur = 1001i64;
+        let mut w = Mp4Writer::new(Cursor::new(Vec::new()), WriterOptions::new(Brand::Mp4)).unwrap();
+        let v = w.add_track(TrackConfig::new(avc_entry(), 30000)).unwrap();
+        for (n, &(pts, key)) in REORDERED.iter().enumerate() {
+            let offset = (pts - n as i64) * dur;
+            w.write_sample(v, WriteSample { data: &[n as u8; 20], duration: dur as u32, composition_offset: offset as i32, is_sync: key }).unwrap();
+        }
+        let out = w.finish().unwrap().into_inner();
+        assert_eq!(box_version(&out, b"ctts"), Some(1), "signed offsets need ctts version 1");
+        assert_eq!(box_version(&out, b"elst"), None, "no edit list asked for");
+        let f = crate::open(out.as_slice()).unwrap();
+        for (s, &(pts, _)) in f.tracks[0].samples.iter().zip(&REORDERED) {
+            assert_eq!(s.pts, pts * dur);
+        }
+    }
+
+    #[test]
+    fn in_order_samples_write_no_ctts() {
+        let mut w = Mp4Writer::new(Cursor::new(Vec::new()), WriterOptions::new(Brand::Mp4)).unwrap();
+        let v = w.add_track(TrackConfig::new(avc_entry(), 30000)).unwrap();
+        for n in 0..4u8 {
+            w.write_sample(v, WriteSample { data: &[n; 20], duration: 1001, composition_offset: 0, is_sync: n == 0 }).unwrap();
+        }
+        let out = w.finish().unwrap().into_inner();
+        assert_eq!((box_version(&out, b"ctts"), box_version(&out, b"elst")), (None, None));
+    }
+
     #[test]
     fn fragmented_roundtrip() {
         let mut w = FragmentedWriter::new(Vec::new(), WriterOptions::new(Brand::Mp4));
