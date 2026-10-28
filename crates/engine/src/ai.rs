@@ -4,7 +4,8 @@
 //! |---|---|---|
 //! | `ai.status` | (none) | probes the helper; `{connected, probing, port, version, protocol, features, reason}` |
 //! | `ai.connect {port=9877}` | Clip ▸ AI | connects to the helper on another port |
-//! | `ai.reframe` `ai.enhanceSpeech` `ai.stems` `ai.upscale` `ai.interpolate` `ai.generativeExtend` | Clip ▸ AI | M6a to M6f |
+//! | `ai.reframe` | Clip ▸ AI | M6a: [`reframe`] |
+//! | `ai.enhanceSpeech` `ai.stems` `ai.upscale` `ai.interpolate` `ai.generativeExtend` | Clip ▸ AI | M6b to M6f |
 //! | `ai.beatGrid` `ai.musicFit` | Sequence ▸ AI | M6d |
 //! | `ai.search {query}` | (Project panel search) | M6e |
 //! | `ai.echo` | (none) | the protocol test kind |
@@ -181,6 +182,8 @@ pub struct PendingAi {
     pub fingerprint: Fingerprint,
     pub out_dir: PathBuf,
     pub outcome: Arc<Mutex<Option<Ready>>>,
+    /// What the feature's apply step needs besides the result (sample times…).
+    pub context: Value,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -251,15 +254,16 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             run: connect,
             journal: false,
         },
-        feature!(
-            "ai.reframe",
-            "Auto Reframe (Tracked)…",
-            ["Clip", "AI"],
-            "reframe",
-            "M6a",
-            Needs::Clips,
-            r#"{"clips":[id]?,"aspect":"9:16"?,"wait":bool=false}"#
-        ),
+        CommandSpec {
+            id: "ai.reframe",
+            label: "Auto Reframe (Tracked)…",
+            menu: &["Clip", "AI"],
+            shortcut: None,
+            params: reframe::PARAMS,
+            enabled: reframe::enabled,
+            run: reframe::run,
+            journal: true,
+        },
         feature!(
             "ai.enhanceSpeech",
             "Enhance Speech…",
@@ -559,7 +563,7 @@ pub fn prune_cache(ai_root: &Path, cap: u64, keep: &[PathBuf], min_age: Duration
 
 /// Start a `kind` job on `clips` of the active sequence (see the module docs). `wait` runs it to
 /// the end, result applied, before returning (not in a [`AiState::background`] host).
-pub fn start_job(s: &mut Session, kind: &'static str, label: &str, clips: &[ClipId], params: Value, wait: bool) -> Result<Value> {
+pub fn start_job(s: &mut Session, kind: &'static str, label: &str, clips: &[ClipId], params: Value, context: Value, wait: bool) -> Result<Value> {
     let client = s.sidecar.clone().ok_or_else(|| EngineError::Other(NOT_CONNECTED.into()))?;
     helper_ready(s, kind).map_err(EngineError::Other)?;
     let wait = wait && !s.ai.background;
@@ -631,7 +635,7 @@ pub fn start_job(s: &mut Session, kind: &'static str, label: &str, clips: &[Clip
     let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
     let (prog, res) = (job.progress.clone(), job.result.clone());
     s.jobs.push(job);
-    s.ai.jobs.push(PendingAi { job: id, kind, label: label.to_string(), fingerprint, out_dir: out_dir.clone(), outcome });
+    s.ai.jobs.push(PendingAi { job: id, kind, label: label.to_string(), fingerprint, out_dir: out_dir.clone(), outcome, context });
     if wait || cfg!(target_arch = "wasm32") {
         run();
         poll(s);
@@ -733,6 +737,7 @@ pub fn apply_atomic(s: &mut Session, label: &str, steps: Vec<Step>) -> Result<()
 fn apply(s: &mut Session, pj: &PendingAi, result: &JobResult, files: &[PathBuf]) -> Result<()> {
     match pj.kind {
         "echo" => apply_echo(s, &pj.fingerprint, result, files),
+        "reframe" => reframe::apply(s, pj, files),
         k => Err(EngineError::Other(format!("results of `{k}` jobs cannot be applied yet"))),
     }
 }
@@ -747,7 +752,7 @@ fn echo(s: &mut Session, p: &Value) -> Result<Value> {
             params[k] = json!(n);
         }
     }
-    start_job(s, "echo", "AI Echo", &clips, params, bool_p(p, "wait").unwrap_or(false))
+    start_job(s, "echo", "AI Echo", &clips, params, Value::Null, bool_p(p, "wait").unwrap_or(false))
 }
 
 /// Echo results: (1) a sequence marker at each target clip, (2) the result file's name in each
@@ -794,6 +799,9 @@ fn apply_echo(s: &mut Session, fp: &Fingerprint, result: &JobResult, files: &[Pa
     });
     apply_atomic(s, "AI Echo", vec![mark, note])
 }
+
+#[path = "ai_reframe.rs"]
+pub mod reframe;
 
 #[cfg(test)]
 #[path = "ai_tests.rs"]

@@ -20,12 +20,12 @@ use crate::{Event, Session};
 const FEATURES: [&str; 9] =
     ["ai.reframe", "ai.stems", "ai.enhanceSpeech", "ai.beatGrid", "ai.musicFit", "ai.search", "ai.upscale", "ai.interpolate", "ai.generativeExtend"];
 
-struct Fixture {
-    s: Session,
-    helper: FakeHelper,
-    clip: ClipId,
-    item: ItemId,
-    cache: PathBuf,
+pub(super) struct Fixture {
+    pub(super) s: Session,
+    pub(super) helper: FakeHelper,
+    pub(super) clip: ClipId,
+    pub(super) item: ItemId,
+    pub(super) cache: PathBuf,
 }
 
 fn cache_dir(name: &str) -> PathBuf {
@@ -36,7 +36,7 @@ fn cache_dir(name: &str) -> PathBuf {
 
 /// A session with one 2 s clip of `/media/interview.mov` on V1 (selected), connected to a fake
 /// helper running `script`.
-fn fixture(name: &str, script: Script) -> Fixture {
+pub(super) fn fixture(name: &str, script: Script) -> Fixture {
     let mut s = Session::default();
     let rate = FrameRate::FPS_24;
     let dur = rate.tick_of(48);
@@ -71,7 +71,7 @@ fn fixture(name: &str, script: Script) -> Fixture {
 }
 
 /// Poll (apply results) until job `id` is finished.
-fn finish(s: &mut Session, id: u64) {
+pub(super) fn finish(s: &mut Session, id: u64) {
     let t0 = std::time::Instant::now();
     loop {
         super::poll(s);
@@ -84,13 +84,13 @@ fn finish(s: &mut Session, id: u64) {
     }
 }
 
-fn job_error(s: &Session, id: u64) -> Option<String> {
+pub(super) fn job_error(s: &Session, id: u64) -> Option<String> {
     let j = s.jobs.iter().find(|j| j.id == id)?;
     j.result.lock().unwrap().clone()?.err()
 }
 
 /// The project as JSON (motion's automatic position is NaN, so `Project` never equals itself).
-fn snapshot(s: &Session) -> serde_json::Value {
+pub(super) fn snapshot(s: &Session) -> serde_json::Value {
     serde_json::to_value(&*s.project).unwrap()
 }
 
@@ -108,7 +108,7 @@ fn toasts(s: &mut Session) -> Vec<String> {
         .collect()
 }
 
-fn reason(s: &Session, id: &str) -> String {
+pub(super) fn reason(s: &Session, id: &str) -> String {
     (crate::find_command(id).unwrap().enabled)(s).unwrap_err()
 }
 
@@ -140,11 +140,11 @@ fn the_ai_commands_sit_in_existing_menus() {
 
 #[test]
 fn handshake_reports_the_helper_and_features_wait_for_their_milestone() {
-    let mut f = fixture("hello", Script { features: vec!["echo".into(), "reframe".into()], ..Default::default() });
+    let mut f = fixture("hello", Script { features: vec!["echo".into(), "upscale".into()], ..Default::default() });
     let st = f.s.execute("ai.status", json!({})).unwrap();
     assert_eq!(st["connected"], true, "{st}");
-    assert_eq!(st["features"], json!(["echo", "reframe"]));
-    assert_eq!(reason(&f.s, "ai.reframe"), "not built yet (arrives in M6a)");
+    assert_eq!(st["features"], json!(["echo", "upscale"]));
+    assert_eq!(reason(&f.s, "ai.upscale"), "not built yet (arrives in M6f)");
     assert!(reason(&f.s, "ai.stems").contains("does not provide `stems`"));
     assert!(f.s.is_enabled("ai.echo"));
     f.s.state.selection.clear();
