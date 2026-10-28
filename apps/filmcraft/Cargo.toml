@@ -17,7 +17,7 @@ whisper = ["filmcraft-engine/whisper", "filmcraft-engine/speech-download"]
 # Natural Text to Speech voices (Kokoro-82M on the CPU, downloaded on first use).
 neural-voices = ["filmcraft-engine/neural-voices"]
 # AI features through the optional local helper `craft-ai` (Clip ▸ AI, Sequence ▸ AI; ADR 0002).
-sidecar = ["filmcraft-engine/sidecar"]
+sidecar = ["filmcraft-engine/sidecar", "filmcraft-ui-egui/sidecar"]
 
 [dependencies]
 filmcraft-engine = { workspace = true }

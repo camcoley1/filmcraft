@@ -9,6 +9,12 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# The AI commands (`ai.*`, Clip ▸ AI / Sequence ▸ AI) from the engine's `sidecar` feature, so the
+# menus and their translations can be tested with them.
+sidecar = ["filmcraft-engine/sidecar"]
+
 [dependencies]
 craft-ui = { workspace = true }
 filmcraft-time = { workspace = true }
