@@ -29,44 +29,107 @@ fn is_file_media(item: &filmcraft_project::ProjectItem) -> bool {
 /// link each media file that exists on disk. Returns the new sequences.
 pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format) -> Result<Value> {
     let p = std::path::Path::new(path);
-    import_doc(s, path, p.parent().map(|d| d.to_string_lossy().to_string()), p.file_stem().map(|n| n.to_string_lossy().to_string()), bytes, format)
+    // a CapCut draft is named after its folder, not `draft_content`
+    let name = if format == Format::CapCut { p.parent().and_then(|d| d.file_name()) } else { p.file_stem() };
+    import_doc(s, path, p.parent().map(|d| d.to_string_lossy().to_string()), name.map(|n| n.to_string_lossy().to_string()), None, bytes, format)
+}
+
+/// Most entries read from one folder of a document directory.
+const DIR_MAX_ENTRIES: usize = 20_000;
+/// Largest document read out of a bundle (an `Info.fcpxml`).
+const DOC_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The real location of `path`, when the host has links. `Err` when it cannot be resolved.
+fn canonical(s: &Session, path: &str) -> Option<std::io::Result<String>> {
+    s.services.canonical_path(path)
+}
+
+/// Whether `path` is `root` or lies under it once links are resolved. Hosts without links (`None`)
+/// have nothing to escape through.
+fn contained(s: &Session, root: &str, path: &str) -> bool {
+    match (canonical(s, root), canonical(s, path)) {
+        (Some(Ok(r)), Some(Ok(p))) => std::path::Path::new(&p).starts_with(&r),
+        (None, _) | (_, None) => true,
+        _ => false,
+    }
+}
+
+/// Read a document that is part of `root`: it must resolve inside it and be of a sane size.
+fn read_owned(s: &Session, root: &str, file: &str, max: u64) -> Result<Vec<u8>> {
+    if !contained(s, root, file) {
+        return Err(EngineError::Other(format!("{file}: resolves outside {root}")));
+    }
+    if s.services.file_size(file).is_ok_and(|n| n > max) {
+        return Err(EngineError::Other(format!("{file}: larger than {} MiB", max / (1024 * 1024))));
+    }
+    s.services.read_file(file).map_err(|e| EngineError::Other(format!("{file}: {e}")))
+}
+
+fn dir_name(path: &str) -> Option<String> {
+    std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string())
 }
 
 /// Directories the importer opens as one document: Final Cut `.fcpxmld` bundles and `.fcpbundle`
 /// libraries, and CapCut draft folders. `None`: not one of those (an ordinary path).
 pub fn import_directory(s: &mut Session, path: &str) -> Option<Result<Value>> {
-    let trimmed = path.trim_end_matches(['/', '\\']);
+    let trimmed = Some(path.trim_end_matches(['/', '\\'])).filter(|t| !t.is_empty()).unwrap_or(path);
     let ext = std::path::Path::new(trimmed).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
-    let names = match s.services.list_dir(trimmed)? {
-        Ok(n) => n,
-        Err(e) => return matches!(ext.as_deref(), Some("fcpxmld" | "fcpbundle")).then(|| Err(EngineError::Other(format!("{path}: {e}")))),
+    let package = matches!(ext.as_deref(), Some("fcpxmld" | "fcpbundle"));
+    let (entries, _) = match s.services.list_entries_capped(trimmed, DIR_MAX_ENTRIES)? {
+        Ok(v) => v,
+        Err(e) => return package.then(|| Err(EngineError::Other(format!("{path}: {e}")))),
     };
-    let stem = std::path::Path::new(trimmed).file_stem().map(|n| n.to_string_lossy().to_string());
+    let names: Vec<String> = entries.into_iter().map(|e| e.name).collect();
     match ext.as_deref() {
-        Some("fcpxmld") => Some(import_fcpxmld(s, trimmed, &names, stem)),
+        Some("fcpxmld") => Some(import_fcpxmld(s, trimmed, &names, std::path::Path::new(trimmed).file_stem().map(|n| n.to_string_lossy().to_string()))),
         Some("fcpbundle") => Some(import_fcpbundle(s, trimmed)),
         _ => {
-            let draft = filmcraft_interchange::capcut::DRAFT_FILES.into_iter().find(|f| names.iter().any(|n| n == f))?;
-            let file = format!("{trimmed}/{draft}");
-            Some(s.services.read_file(&file).map_err(|e| EngineError::Other(format!("{file}: {e}"))).and_then(|b| {
-                if filmcraft_interchange::capcut::sniff(&b) {
-                    import_doc(s, &file, Some(trimmed.to_string()), stem.or_else(|| Some("CapCut Draft".into())), &b, Format::CapCut)
-                } else {
-                    Err(EngineError::Other(format!("{file} is not a CapCut draft (newer CapCut versions encrypt drafts; export FCPXML or XML from CapCut)")))
+            // draft_content.json, else draft_info.json: the first that is a readable draft
+            let present: Vec<&str> = filmcraft_interchange::capcut::DRAFT_FILES.into_iter().filter(|f| names.iter().any(|n| n == f)).collect();
+            if present.is_empty() {
+                return None;
+            }
+            let mut last = None;
+            for draft in &present {
+                let file = format!("{trimmed}/{draft}");
+                let bytes = match read_owned(s, trimmed, &file, filmcraft_interchange::capcut::MAX_BYTES as u64) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        last = Some(e);
+                        continue;
+                    }
+                };
+                if filmcraft_interchange::capcut::sniff(&bytes) {
+                    return Some(import_doc(
+                        s,
+                        &file,
+                        Some(trimmed.to_string()),
+                        dir_name(trimmed).or_else(|| Some("CapCut Draft".into())),
+                        Some(trimmed.to_string()),
+                        &bytes,
+                        Format::CapCut,
+                    ));
                 }
-            }))
+            }
+            Some(Err(last.unwrap_or_else(|| {
+                EngineError::Other(format!(
+                    "{trimmed}: {} is not a readable CapCut draft (newer CapCut versions encrypt drafts; export FCPXML or XML from CapCut)",
+                    present.join(" and ")
+                ))
+            })))
         }
     }
 }
 
-/// A `.fcpxmld` bundle: `Info.fcpxml` is the document; relative media paths resolve against the bundle.
+/// A `.fcpxmld` bundle: `Info.fcpxml` is the document; relative media paths resolve against the
+/// bundle, and bundle-owned references stay inside it.
 fn import_fcpxmld(s: &mut Session, dir: &str, names: &[String], name: Option<String>) -> Result<Value> {
     let Some(doc) = names.iter().find(|n| n.eq_ignore_ascii_case("Info.fcpxml")) else {
         return Err(EngineError::Other(format!("{dir}: the bundle has no Info.fcpxml")));
     };
     let file = format!("{dir}/{doc}");
-    let bytes = s.services.read_file(&file).map_err(|e| EngineError::Other(format!("{file}: {e}")))?;
-    import_doc(s, &file, Some(dir.to_string()), name, &bytes, Format::Fcpxml)
+    let bytes = read_owned(s, dir, &file, DOC_MAX_BYTES)?;
+    import_doc(s, &file, Some(dir.to_string()), name, Some(dir.to_string()), &bytes, Format::Fcpxml)
 }
 
 /// Most folders / documents looked at inside a library.
@@ -75,77 +138,115 @@ const LIBRARY_MAX_DIRS: usize = 500;
 const LIBRARY_MAX_DOCS: usize = 16;
 
 /// A `.fcpbundle` library keeps its events in `CurrentVersion.fcpevent` (a Core Data store, not
-/// FCPXML), which is not read. Any `.fcpxml` / `.fcpxmld` exported into the library folder is.
+/// FCPXML), which is not read. Any `.fcpxml` / `.fcpxmld` exported into the library folder is: the
+/// walk stays inside the library (links resolved, each real folder once) and stops at fixed
+/// limits, which it reports.
 fn import_fcpbundle(s: &mut Session, dir: &str) -> Result<Value> {
     let mut docs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut stack = vec![(dir.to_string(), 0usize)];
-    let mut visited = 0;
+    let mut truncated = false;
+    let mut skipped_links = 0u32;
     while let Some((d, depth)) = stack.pop() {
-        visited += 1;
-        if visited > LIBRARY_MAX_DIRS || docs.len() >= LIBRARY_MAX_DOCS {
+        if seen.len() >= LIBRARY_MAX_DIRS || docs.len() >= LIBRARY_MAX_DOCS {
+            truncated = true;
             break;
         }
-        let Some(Ok(entries)) = s.services.list_entries(&d) else { continue };
+        if !contained(s, dir, &d) {
+            skipped_links += 1;
+            continue;
+        }
+        // each real folder once (a link back up the tree is not followed again)
+        if !seen.insert(canonical(s, &d).and_then(|r| r.ok()).unwrap_or_else(|| d.clone())) {
+            continue;
+        }
+        let Some(Ok((mut entries, more))) = s.services.list_entries_capped(&d, DIR_MAX_ENTRIES) else { continue };
+        truncated |= more;
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut sub = Vec::new();
         for e in entries {
             let path = format!("{d}/{}", e.name);
             let lower = e.name.to_ascii_lowercase();
             if lower.ends_with(".fcpxmld") && e.is_dir || lower.ends_with(".fcpxml") && !e.is_dir {
-                docs.push(path);
+                if docs.len() < LIBRARY_MAX_DOCS {
+                    docs.push(path);
+                } else {
+                    truncated = true;
+                }
             } else if e.is_dir && depth < LIBRARY_MAX_DEPTH && !e.name.starts_with('.') {
-                stack.push((path, depth + 1));
+                // pending folders are bounded as well as visited ones
+                if seen.len() + stack.len() + sub.len() < LIBRARY_MAX_DIRS {
+                    sub.push((path, depth + 1));
+                } else {
+                    truncated = true;
+                }
             }
         }
+        // sorted order out of a stack
+        stack.extend(sub.into_iter().rev());
     }
     docs.sort();
-    docs.truncate(LIBRARY_MAX_DOCS);
+    docs.dedup();
     if docs.is_empty() {
         return Err(EngineError::Other(format!(
             "{dir}: Final Cut libraries are not readable directly: in Final Cut choose File > Export XML, then import the .fcpxmld"
         )));
     }
-    let mut sequences = Vec::new();
-    let mut report = Vec::new();
-    let mut linked = 0;
-    let mut offline = Vec::new();
-    for d in docs {
-        let r = if d.to_ascii_lowercase().ends_with(".fcpxmld") {
-            let names = s.services.list_dir(&d).and_then(|r| r.ok()).unwrap_or_default();
-            import_fcpxmld(s, &d, &names, std::path::Path::new(&d).file_stem().map(|n| n.to_string_lossy().to_string()))
-        } else {
-            let p = std::path::Path::new(&d);
-            s.services.read_file(&d).map_err(|e| EngineError::Other(format!("{d}: {e}"))).and_then(|b| {
-                import_doc(
-                    s,
-                    &d,
-                    p.parent().map(|x| x.to_string_lossy().to_string()),
-                    p.file_stem().map(|n| n.to_string_lossy().to_string()),
-                    &b,
-                    Format::Fcpxml,
-                )
-            })
-        };
-        match r {
-            Ok(v) => {
-                sequences.extend(v["sequences"].as_array().cloned().unwrap_or_default());
-                linked += v["linkedMedia"].as_u64().unwrap_or(0);
-                offline.extend(v["offlineMedia"].as_array().cloned().unwrap_or_default());
-                report.extend(v["report"].as_array().cloned().unwrap_or_default());
+    s.edit_group("Import Final Cut library", |s| {
+        let mut sequences = Vec::new();
+        let mut report = Vec::new();
+        let mut linked = 0;
+        let mut offline = Vec::new();
+        for d in docs {
+            let r = if d.to_ascii_lowercase().ends_with(".fcpxmld") {
+                match contained(s, dir, &d) {
+                    true => {
+                        let names = s.services.list_entries_capped(&d, DIR_MAX_ENTRIES).and_then(|r| r.ok()).map(|(v, _)| v.into_iter().map(|e| e.name).collect::<Vec<_>>()).unwrap_or_default();
+                        import_fcpxmld(s, &d, &names, std::path::Path::new(&d).file_stem().map(|n| n.to_string_lossy().to_string()))
+                    }
+                    false => Err(EngineError::Other(format!("{d}: resolves outside the library"))),
+                }
+            } else {
+                let p = std::path::Path::new(&d);
+                read_owned(s, dir, &d, DOC_MAX_BYTES).and_then(|b| {
+                    import_doc(s, &d, p.parent().map(|x| x.to_string_lossy().to_string()), p.file_stem().map(|n| n.to_string_lossy().to_string()), None, &b, Format::Fcpxml)
+                })
+            };
+            match r {
+                Ok(v) => {
+                    sequences.extend(v["sequences"].as_array().cloned().unwrap_or_default());
+                    linked += v["linkedMedia"].as_u64().unwrap_or(0);
+                    offline.extend(v["offlineMedia"].as_array().cloned().unwrap_or_default());
+                    report.extend(v["report"].as_array().cloned().unwrap_or_default());
+                }
+                Err(e) => report.push(json!(format!("{e}"))),
             }
-            Err(e) => report.push(json!(format!("{e}"))),
         }
-    }
-    if sequences.is_empty() {
-        return Err(EngineError::Other(format!(
-            "{dir}: no document in the library could be imported: {}",
-            report.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; ")
-        )));
-    }
-    report.insert(0, json!("Final Cut libraries are not readable directly; only the FCPXML documents found inside were imported"));
-    Ok(json!({"format": "Final Cut Library", "sequences": sequences, "linkedMedia": linked, "offlineMedia": offline, "report": report}))
+        if sequences.is_empty() {
+            return Err(EngineError::Other(format!("{dir}: no document in the library could be imported: {}", report.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; "))));
+        }
+        report.insert(0, json!("Final Cut libraries are not readable directly; only the FCPXML documents found inside were imported"));
+        if truncated {
+            report.push(json!(format!("the library was only partly searched (at most {LIBRARY_MAX_DOCS} documents, {LIBRARY_MAX_DIRS} folders, {LIBRARY_MAX_DEPTH} levels, {DIR_MAX_ENTRIES} entries per folder)")));
+        }
+        if skipped_links > 0 {
+            report.push(json!(format!("{skipped_links} folders that resolve outside the library were not searched")));
+        }
+        Ok(json!({"format": "Final Cut Library", "sequences": sequences, "linkedMedia": linked, "offlineMedia": offline, "report": report}))
+    })
 }
 
-fn import_doc(s: &mut Session, path: &str, base_dir: Option<String>, name: Option<String>, bytes: &[u8], format: Format) -> Result<Value> {
-    let opts = ImportOptions { base_dir, name, ..Default::default() };
+/// `contain`: the bundle or draft folder whose own references (paths under it) must stay inside it.
+fn import_doc(
+    s: &mut Session,
+    path: &str,
+    base_dir: Option<String>,
+    name: Option<String>,
+    contain: Option<String>,
+    bytes: &[u8],
+    format: Format,
+) -> Result<Value> {
+    let opts = ImportOptions { base_dir, name, contain: contain.is_some(), ..Default::default() };
     let (fragment, report) = match format {
         // AAF / OMF may embed audio: write it next to the document (the media items point there)
         Format::Aaf | Format::Omf => {
@@ -198,9 +299,20 @@ fn import_doc(s: &mut Session, path: &str, base_dir: Option<String>, name: Optio
     let mut linked = 0;
     let mut offline = Vec::new();
     let mut notes = Vec::new();
+    let mut escaped = 0u32;
+    let mut dropped_audio = 0usize;
     for (id, stored) in new_media {
         let mut opened = None;
         for candidate in std::iter::once(stored.clone()).chain(relative(s, id)) {
+            // a path under the bundle or draft folder must not reach outside it (`../`, links);
+            // a path elsewhere is the file's own location
+            if let Some(root) = &contain
+                && candidate.starts_with(root.as_str())
+                && !contained(s, root, &candidate)
+            {
+                escaped += 1;
+                continue;
+            }
             let file = match s.media.follow(&candidate) {
                 Ok(file) => file,
                 Err(why) => {
@@ -230,7 +342,13 @@ fn import_doc(s: &mut Session, path: &str, base_dir: Option<String>, name: Optio
         if let Some(note) = prproj_timecode_note(format, &mpath, info.start_timecode) {
             notes.push(note);
         }
+        // CapCut video segments came with a linked audio clip on the assumption the file has
+        // sound; a file without any has none
+        let silent = format == Format::CapCut && info.audio_streams.is_empty();
         s.edit("Link Media", |proj, _| {
+            if silent {
+                dropped_audio += drop_unheard_audio(proj, &before, id);
+            }
             if let Some(item) = proj.items.get_mut(&id)
                 && let ItemKind::Media(m) = &mut item.kind
             {
@@ -252,6 +370,15 @@ fn import_doc(s: &mut Session, path: &str, base_dir: Option<String>, name: Optio
         s.media.insert_file(id, &mpath, src);
         linked += 1;
     }
+    if escaped > 0 {
+        notes.push(format!("{escaped} media paths inside {} resolve outside it and were left offline", contain.as_deref().unwrap_or("the bundle")));
+    }
+    if dropped_audio > 0 {
+        notes.push(format!("{dropped_audio} linked audio clips were dropped: their files have no audio"));
+    }
+    if format == Format::CapCut && !offline.is_empty() {
+        notes.push(format!("{} offline media keep the linked audio clip of their video segments until they are relinked", offline.len()));
+    }
     if let Some(&first) = seqs.first() {
         s.state.active_sequence = Some(first);
         if !s.state.open_sequences.contains(&first) {
@@ -265,6 +392,33 @@ fn import_doc(s: &mut Session, path: &str, base_dir: Option<String>, name: Optio
         "offlineMedia": offline,
         "report": report_json(&report).into_iter().chain(notes).collect::<Vec<_>>(),
     }))
+}
+
+/// Remove the linked audio clips of `item` (audio clips with a link, made for a video segment of a
+/// CapCut draft) from the sequences of this import and unlink their video clips. Returns how many.
+pub(crate) fn drop_unheard_audio(proj: &mut filmcraft_project::Project, before: &std::collections::HashSet<ItemId>, item: ItemId) -> usize {
+    let ids: Vec<ItemId> = proj.items.keys().copied().filter(|i| !before.contains(i)).collect();
+    let mut n = 0;
+    for id in ids {
+        let Some(seq) = proj.sequence_mut(id) else { continue };
+        let mut gone = std::collections::HashSet::new();
+        for t in &mut seq.audio_tracks {
+            t.items.retain(|c| {
+                let drop = c.item == item && c.link.is_some();
+                if drop {
+                    gone.insert(c.link);
+                    n += 1;
+                }
+                !drop
+            });
+        }
+        for t in &mut seq.video_tracks {
+            for c in t.items.iter_mut().filter(|c| c.item == item && gone.contains(&c.link)) {
+                c.link = None;
+            }
+        }
+    }
+    n
 }
 
 /// For a Premiere Pro project, a report line naming a linked file whose start timecode is not

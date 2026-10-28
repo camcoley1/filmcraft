@@ -141,6 +141,22 @@ pub trait Services: Send + Sync {
     fn list_entries(&self, dir: &str) -> Option<std::io::Result<Vec<media_browser::DirEntry>>> {
         self.list_dir(dir).map(|r| r.map(|names| names.into_iter().map(|name| media_browser::DirEntry { name, ..Default::default() }).collect()))
     }
+    /// At most `max` entries of a directory (document folders: a wide directory must not be
+    /// listed in full), and whether there were more. The default lists in full and truncates.
+    fn list_entries_capped(&self, dir: &str, max: usize) -> Option<std::io::Result<(Vec<media_browser::DirEntry>, bool)>> {
+        self.list_entries(dir).map(|r| {
+            r.map(|mut v| {
+                let more = v.len() > max;
+                v.truncate(max);
+                (v, more)
+            })
+        })
+    }
+    /// The real location of a path with symlinks resolved, to keep the contents of a bundle inside
+    /// it. `None`: the host has no links (the web), so nothing can point outside.
+    fn canonical_path(&self, _path: &str) -> Option<std::io::Result<String>> {
+        None
+    }
     /// Drives and network locations (Media Browser ▸ Local Drives / Network).
     fn volumes(&self) -> Vec<media_browser::Volume> {
         Vec::new()
@@ -179,6 +195,12 @@ impl Services for FsServices {
     }
     fn list_entries(&self, dir: &str) -> Option<std::io::Result<Vec<media_browser::DirEntry>>> {
         Some(media_browser::std_list_entries(dir))
+    }
+    fn list_entries_capped(&self, dir: &str, max: usize) -> Option<std::io::Result<(Vec<media_browser::DirEntry>, bool)>> {
+        Some(media_browser::std_list_entries_capped(dir, max))
+    }
+    fn canonical_path(&self, path: &str) -> Option<std::io::Result<String>> {
+        Some(std::fs::canonicalize(path).map(|p| p.to_string_lossy().to_string()))
     }
     fn volumes(&self) -> Vec<media_browser::Volume> {
         media_browser::std_volumes()

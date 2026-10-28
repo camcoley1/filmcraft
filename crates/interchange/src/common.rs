@@ -133,6 +133,19 @@ pub fn resolve_path(reference: &str, base_dir: Option<&str>) -> String {
     }
 }
 
+/// [`resolve_path`] for documents inside a bundle (`contain`): a relative reference with a `..`
+/// step is not normalised away but kept under `base_dir` as written, so a check of where the path
+/// really leads (links resolved) sees that it climbs out of the bundle.
+pub(crate) fn resolve_path_in(reference: &str, base_dir: Option<&str>, contain: bool) -> String {
+    let p = file_url_to_path(reference.trim());
+    match base_dir {
+        Some(b) if contain && !b.is_empty() && !is_absolute(&p) && p.split(['/', '\\']).any(|c| c == "..") => {
+            format!("{}/{p}", b.trim_end_matches(['/', '\\']))
+        }
+        _ => resolve_path(reference, base_dir),
+    }
+}
+
 /// `path` relative to directory `base`, if `path` lies under it (or shares a prefix).
 pub(crate) fn relative_path(path: &str, base: &str) -> Option<String> {
     if !is_absolute(path) || !is_absolute(base) {

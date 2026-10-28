@@ -27,7 +27,7 @@ use roxmltree::Node;
 
 use crate::common::{
     Builder, MediaSpec, base_item, db_to_gain, empty_sequence, file_name, gain_to_db, generator_of, item_media, item_path, kind_from_ext, param,
-    param_modified, path_to_file_url, resolve_path, scaled, set_param, settings_for, standard_effects, transition_effect, transition_name,
+    param_modified, path_to_file_url, resolve_path_in, scaled, set_param, settings_for, standard_effects, transition_effect, transition_name,
 };
 use crate::xml::{child, children, elements, num};
 use crate::{Error, ExportOptions, Format, ImportOptions, Imported, Report, Result};
@@ -256,12 +256,12 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
         };
         let item = match src {
             Some(url) => {
-                let p = resolve_path(url, self.opts.base_dir.as_deref());
+                let p = resolve_path_in(url, self.opts.base_dir.as_deref(), self.opts.contain);
                 self.b.file_media(&format!("file:{p}"), &name, &p, &spec, bin)
             }
             None => {
                 self.report.warn(format!("asset \"{name}\" has no media; imported offline"));
-                let p = resolve_path(&name, self.opts.base_dir.as_deref());
+                let p = resolve_path_in(&name, self.opts.base_dir.as_deref(), self.opts.contain);
                 let it = self.b.file_media(&format!("asset:{id}"), &name, &p, &spec, bin);
                 if let Some(m) = self.b.p.item_mut(it).and_then(|i| i.as_media_mut()) {
                     m.offline = true;

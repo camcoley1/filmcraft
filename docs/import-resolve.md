@@ -18,6 +18,6 @@ FilmCraft has no Resolve-specific importer. Resolve exports two interchange form
 - Colour grades, Fusion effects, Fairlight settings and Resolve-only effects are not carried by either format; they appear in the import report with counts.
 - Compound clips and nested timelines come across as nested sequences where the format describes them.
 
-Other formats FilmCraft reads: Final Cut libraries (`.fcpbundle`) are not readable directly (the events are a Core Data store, not XML): in Final Cut choose File > Export XML, then import the `.fcpxmld`. CapCut drafts (`draft_content.json`, or the draft folder) import tracks, clips, speed, volume and text as a caption track.
+Other formats FilmCraft reads: Final Cut libraries (`.fcpbundle`) are not readable directly (the events are a Core Data store, not XML): in Final Cut choose File > Export XML, then import the `.fcpxmld`. CapCut drafts (`draft_content.json`, or the draft folder) import tracks, clips with their linked audio, speed, volume, reverse and text as a caption track. File > Import Folder or Bundle picks a bundle or draft folder where the file dialog cannot. Paths inside a bundle or draft folder may not climb or link out of it; absolute media paths are the file's own.
 
 `.mogrt` motion graphics templates wait for EffectCraft's `.aep` reader.

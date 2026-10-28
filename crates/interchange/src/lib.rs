@@ -216,6 +216,18 @@ impl Report {
             self.entries.push(ReportEntry { level, message, count: 1 });
         }
     }
+    /// [`Report::push`] for `n` occurrences at once (no per-occurrence work for huge counts).
+    pub fn push_n(&mut self, level: Level, message: impl Into<String>, n: u32) {
+        if n == 0 {
+            return;
+        }
+        let message = message.into();
+        if let Some(e) = self.entries.iter_mut().find(|e| e.level == level && e.message == message) {
+            e.count = e.count.saturating_add(n);
+        } else {
+            self.entries.push(ReportEntry { level, message, count: n });
+        }
+    }
     pub fn warn(&mut self, message: impl Into<String>) {
         self.push(Level::Warning, message);
     }
@@ -274,6 +286,10 @@ pub struct ImportOptions {
     pub edl_frame_rate: Option<FrameRate>,
     /// Name for documents without a title (EDL without `TITLE:`).
     pub name: Option<String>,
+    /// The document is inside a bundle: relative media references that climb out of `base_dir`
+    /// (`../`) are kept as written so the caller can refuse them, not normalised to a path outside.
+    #[serde(default)]
+    pub contain: bool,
 }
 
 /// Import a document. `base_dir` resolves relative media paths.

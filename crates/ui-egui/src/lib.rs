@@ -1359,6 +1359,15 @@ impl FilmcraftApp {
                     r
                 })
             }
+            // File ▸ Import Folder or Bundle: a .fcpxmld / .fcpbundle package or a CapCut draft folder
+            "file.importFolder" => self.pick(FileDialog::Folder { at: None }, |app, paths| {
+                let Some(path) = paths.into_iter().next() else { return Ok(Value::Null) };
+                let r = app.session.execute("file.importFolder", json!({"path": path})).map_err(|e| e.to_string());
+                if let Err(e) = &r {
+                    app.ui.status = e.clone();
+                }
+                r
+            }),
             // File ▸ Import with Image Sequence: choose the first numbered still
             "file.importImageSequence" => self.pick(FileDialog::open_files(filmcraft_media::STILL_EXTENSIONS), |app, paths| {
                 let Some(path) = paths.into_iter().next() else { return Ok(Value::Null) };

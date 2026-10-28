@@ -707,10 +707,17 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
 
 /// Directory entries through `std::fs` (the desktop host).
 pub fn std_list_entries(dir: &str) -> std::io::Result<Vec<DirEntry>> {
+    std_list_entries_capped(dir, usize::MAX).map(|(v, _)| v)
+}
+
+/// [`std_list_entries`] reading at most `max` entries (and whether the directory had more).
+pub fn std_list_entries_capped(dir: &str, max: usize) -> std::io::Result<(Vec<DirEntry>, bool)> {
     let dir = if dir.is_empty() { "." } else { dir };
-    let rd = std::fs::read_dir(dir)?;
-    Ok(rd
-        .flatten()
+    let mut rd = std::fs::read_dir(dir)?.flatten();
+    let first: Vec<_> = rd.by_ref().take(max).collect();
+    let more = rd.next().is_some();
+    let v = first
+        .into_iter()
         .map(|e| {
             // follow symlinks (aliases to folders show as folders)
             let md = std::fs::metadata(e.path()).ok();
@@ -722,7 +729,8 @@ pub fn std_list_entries(dir: &str) -> std::io::Result<Vec<DirEntry>> {
                 modified: md.and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()),
             }
         })
-        .collect())
+        .collect();
+    Ok((v, more))
 }
 
 /// Drives and network locations of the desktop host.

@@ -1331,6 +1331,10 @@ fn build() -> Vec<CommandSpec> {
                 Ok(json!({"items": ids.iter().map(|i| i.0).collect::<Vec<_>>()}))
             }
         ),
+        cmd!("file.importFolder", "Import Folder or Bundle…", ["File"], None, r#"{"path":str}"#, always, |s, p| {
+            let path = str_p(p, "path").ok_or_else(|| bad("file.importFolder", "need `path`"))?;
+            s.execute("file.import", json!({"paths": [path]}))
+        }),
         cmd!("file.import", "Import…", ["File"], Some("Cmd+I"), r#"{"paths":[str],"bin":binId?,"imageSequence":bool?,"replace":bool?}"#, always, |s, p| {
             let bin = u64_p(p, "bin").map(filmcraft_project::BinId);
             let paths: Vec<String> = match p.get("paths").and_then(Value::as_array) {
