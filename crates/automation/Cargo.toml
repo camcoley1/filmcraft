@@ -9,6 +9,11 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# AI jobs (`ai.*`) through the engine's `sidecar` feature; this crate needs it only for its tests.
+sidecar = ["filmcraft-engine/sidecar"]
+
 [dependencies]
 filmcraft-engine = { workspace = true }
 filmcraft-time = { workspace = true }
@@ -20,3 +25,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "syn
 base64 = "0.22"
 schemars = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[dev-dependencies]
+filmcraft-sidecar = { workspace = true, features = ["fake"] }

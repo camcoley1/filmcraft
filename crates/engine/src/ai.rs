@@ -39,8 +39,14 @@ use crate::{EngineError, Result, Session};
 /// Why the AI commands are disabled when no helper answers.
 pub(crate) const NOT_CONNECTED: &str = "AI helper not running (start craft-ai: craft-suite/sidecar/run.sh, then Clip ▸ AI ▸ Connect AI Helper)";
 
-/// Finished job folders younger than this are never pruned (a job of another window).
+/// Job folders changed (or heartbeat-touched) within this are never pruned: a job of another
+/// window or another FilmCraft.
 const PRUNE_MIN_AGE: Duration = Duration::from_secs(600);
+
+/// A file in a running job's folder, rewritten every [`HEARTBEAT_EVERY`] while the job runs and
+/// removed when it ends, so another instance's [`prune_cache`] leaves the folder alone.
+const HEARTBEAT: &str = ".running";
+const HEARTBEAT_EVERY: Duration = Duration::from_secs(60);
 
 /// The helper connection's state, kept by the session.
 pub struct AiState {
@@ -508,8 +514,8 @@ fn dir_size(dir: &Path, depth: u32, budget: &mut u32) -> u64 {
 }
 
 /// Keep the AI cache under `cap` bytes: delete the oldest job folders (`<ai root>/<project>/<job>/`)
-/// first, never one in `keep` (jobs still running or waiting to be applied) nor one changed within
-/// `min_age`. Returns how many were deleted.
+/// first, never one in `keep` (jobs still running or waiting to be applied) nor one changed, or
+/// whose [`HEARTBEAT`] was touched, within `min_age`. Returns how many were deleted.
 pub fn prune_cache(ai_root: &Path, cap: u64, keep: &[PathBuf], min_age: Duration) -> usize {
     let dirs = |p: &Path| -> Vec<PathBuf> {
         let Ok(rd) = std::fs::read_dir(p) else { return Vec::new() };
@@ -521,7 +527,8 @@ pub fn prune_cache(ai_root: &Path, cap: u64, keep: &[PathBuf], min_age: Duration
     for project in dirs(ai_root) {
         for job in dirs(&project) {
             let size = dir_size(&job, 4, &mut budget);
-            let modified = std::fs::metadata(&job).and_then(|m| m.modified()).ok();
+            let changed = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            let modified = changed(&job).max(changed(&job.join(HEARTBEAT)));
             total = total.saturating_add(size);
             jobs.push((modified, size, job));
         }
@@ -583,14 +590,23 @@ pub fn start_job(s: &mut Session, kind: &'static str, label: &str, clips: &[Clip
     let outcome: Arc<Mutex<Option<Ready>>> = Arc::default();
     let (prog, res, out, limits) = (job.progress.clone(), job.result.clone(), outcome.clone(), s.ai.limits);
     let run = move || {
+        let beat = PathBuf::from(&req.out_dir).join(HEARTBEAT);
+        let _ = std::fs::write(&beat, b"running\n");
         prune_cache(&ai_root, cap, &keep, PRUNE_MIN_AGE);
         let t0 = web_time::Instant::now();
+        let mut last_beat = t0;
         let cancelled = || prog.cancel.load(Ordering::Relaxed);
         let mut on_progress = |f: f64, st: &str| {
             prog.done.store((f * 1000.0) as u64, Ordering::Relaxed);
             *lock(&prog.status) = st.to_string();
+            if last_beat.elapsed() >= HEARTBEAT_EVERY {
+                last_beat = web_time::Instant::now();
+                let _ = std::fs::write(&beat, b"running\n");
+            }
         };
-        match filmcraft_sidecar::drive(&*client, &req, &limits, &cancelled, &mut on_progress) {
+        let r = filmcraft_sidecar::drive(&*client, &req, &limits, &cancelled, &mut on_progress);
+        let _ = std::fs::remove_file(&beat);
+        match r {
             // finished by `poll` once the result is applied (or dropped)
             Ok((result, files)) => {
                 *lock(&prog.status) = format!("{} result file(s) ready; applying", files.len());
@@ -632,6 +648,8 @@ pub fn start_job(s: &mut Session, kind: &'static str, label: &str, clips: &[Clip
     match lock(&res).clone() {
         Some(Err(e)) => Err(EngineError::Other(e)),
         Some(Ok(_)) => Ok(json!({"job": id, "outDir": out_dir.to_string_lossy(), "applied": true})),
+        // waited, but the result waits for a gesture to end: applied by a later poll
+        None if wait => Ok(json!({"job": id, "outDir": out_dir.to_string_lossy(), "applied": false, "pending": true})),
         None => Ok(out),
     }
 }

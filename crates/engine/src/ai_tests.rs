@@ -412,10 +412,13 @@ fn results_wait_for_gestures() {
     f.s.gesture_in_progress = true;
     super::poll(&mut f.s);
     assert_eq!(markers(&f.s), 0);
+    // a caller that waited is told the result is still pending
+    let r = f.s.execute("ai.echo", json!({"wait": true})).unwrap();
+    assert_eq!((&r["applied"], &r["pending"]), (&json!(false), &json!(true)), "{r}");
     assert!(job_error(&f.s, id).is_none() && !f.s.jobs.iter().find(|j| j.id == id).unwrap().progress.finished.load(Ordering::Relaxed));
     f.s.gesture_in_progress = false;
     super::poll(&mut f.s);
-    assert_eq!(markers(&f.s), 1);
+    assert_eq!(markers(&f.s), 2, "both results land once the gesture ends");
 }
 
 #[test]
@@ -552,4 +555,22 @@ fn the_cache_is_bounded() {
     assert!(!dirs[0].exists() && dirs[1].exists() && !dirs[2].exists() && dirs[3].exists());
     // young folders are never pruned
     assert_eq!(super::prune_cache(&root, 0, &[], Duration::from_secs(600)), 0);
+    // a running job of another instance keeps its folder through its heartbeat, even when the
+    // folder itself has not changed for a while
+    let other = proj.join("echo-other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join(super::HEARTBEAT), b"running").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::write(other.join(super::HEARTBEAT), b"running").unwrap();
+    assert_eq!(super::prune_cache(&root, 0, &[], Duration::from_millis(200)), 2, "the two stale folders go");
+    assert!(other.exists() && !dirs[1].exists() && !dirs[3].exists());
+}
+
+/// A finished job leaves no heartbeat behind.
+#[test]
+fn the_heartbeat_ends_with_the_job() {
+    let mut f = fixture("beat", Script::default());
+    let r = f.s.execute("ai.echo", json!({"wait": true})).unwrap();
+    let dir = PathBuf::from(r["outDir"].as_str().unwrap());
+    assert!(dir.join("echo.json").exists() && !dir.join(super::HEARTBEAT).exists());
 }

@@ -39,7 +39,11 @@ AI features run in **`craft-ai`**, a separate Python process installed by craft-
 5. **No helper I/O on the UI thread.** In the desktop app (`AiState::background`) every handshake
    runs on a worker thread and `wait: true` is ignored; jobs always run on their own thread. Agents
    that want to block get it from the automation layer, which runs `ai.*` with `wait` as a polled
-   job (`LONG_COMMANDS`), as it does exports. The CLI and tests may block.
+   job (`LONG_COMMANDS`), as it does exports; a headless host applies finished results each time
+   it takes the session (`Session::poll_persistence` before every command), as the app does every
+   frame. The CLI and tests may block. A waited job whose result is held by a gesture replies
+   `{"applied": false, "pending": true}`. A running job's folder carries a heartbeat file, so
+   another FilmCraft's cache pruning leaves it alone.
 6. **Bounded, cancellable jobs.** Every job runs as an engine `Job`: progress 0 to 1 in the Events
    panel and `jobs.list`, cancelled by `jobs.cancel` (the helper is told to stop). The client caps
    reply size, result file count and total result size, and a per-job wall-clock timeout; a helper

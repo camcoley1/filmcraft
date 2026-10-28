@@ -268,6 +268,10 @@ impl FilmcraftMcp {
                 tokio::task::spawn_blocking(move || {
                     // A command that panicked earlier poisoned the lock; the session is still usable.
                     let mut g = s.lock().unwrap_or_else(PoisonError::into_inner);
+                    // what the app does every frame: finished background jobs (AI results,
+                    // scene detection, proxies) are applied before the command sees the session,
+                    // so a polled `jobs.list` reports them finished
+                    g.poll_persistence();
                     g.execute(&id, params).map_err(AutomationError::from)
                 })
                 .await
@@ -899,6 +903,40 @@ mod tests {
             let r = c.ask(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})).await;
             assert!(r["result"].is_object() && r["result"].get("resultType").is_none() && r["result"].get("ttlMs").is_none(), "{method}: {r}");
         }
+    }
+
+    /// Headless MCP runs `ai.*` with `wait: true` as a polled job (`LONG_COMMANDS`); the headless
+    /// backend applies finished AI results when it next takes the session, so the call returns
+    /// with the result applied instead of polling forever.
+    #[cfg(feature = "sidecar")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn headless_ai_wait_completes_and_applies() {
+        use filmcraft_sidecar::fake::{FakeHelper, Script};
+        let helper = FakeHelper::start(Script { steps: 3, ..Default::default() }).unwrap();
+        let mut s = demo();
+        let cache = std::env::temp_dir().join(format!("filmcraft-mcp-ai-{}", std::process::id()));
+        s.ai.cache_root = Some(cache);
+        s.ai.limits.poll_interval = std::time::Duration::from_millis(5);
+        s.execute("ai.connect", json!({"port": helper.port()})).unwrap();
+        let clip = s.active_sequence().unwrap().video_tracks[0].items[0].id;
+        s.state.selection = vec![clip];
+        let markers = s.active_sequence().unwrap().markers.len();
+        let mut c = Client::start(s);
+        c.init().await;
+        let call = async {
+            let r = c.call(1, "command_run", json!({"id": "ai.echo", "params": {"wait": true}})).await;
+            let m = c.call(2, "command_run", json!({"id": "sequence.inspect", "params": {}})).await;
+            (r, m)
+        };
+        let (r, m) = tokio::time::timeout(std::time::Duration::from_secs(20), call).await.expect("ai.echo with wait never returned");
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        let text = r["result"]["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(text.contains("\"job\""), "{text}");
+        assert_eq!(helper.started().len(), 1);
+        let seq: Value = serde_json::from_str(m["result"]["content"][0]["text"].as_str().unwrap_or("null")).unwrap_or_default();
+        let names: Vec<&str> = seq["markers"].as_array().into_iter().flatten().filter_map(|m| m["name"].as_str()).collect();
+        assert_eq!(names.len(), markers + 1, "the result was applied: {names:?}");
+        assert!(names.contains(&"AI Echo"), "{names:?}");
     }
 
     /// docs/agents.md § Long exports: a blocking export reports `notifications/progress` for its
