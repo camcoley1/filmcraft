@@ -224,6 +224,83 @@ fn hevc_config(p: &ParamSets) -> Result<HevcConfig, String> {
     Ok(cfg)
 }
 
+/// Pictures a reordered stream may hold back at once (a presentation index at most this far after
+/// its decoding position; H.264 and HEVC allow at most 16 reorder and 16 buffered pictures).
+const MAX_LEAD: i64 = 32;
+
+/// The MP4 timeline of the compressed frames, in decoding order, and the checks that every picture
+/// comes out exactly once.
+///
+/// Frame `n` is decoded at `n × step` on the MP4 decode timeline and presented `bound` frames after
+/// its presentation index, so its composition offset is `(index + bound - n) × step`, never negative;
+/// the edit list starts at `bound`, where the first picture (presentation time 0) sits. `bound` is the
+/// stream's declared reorder depth (its SPS), known from the first frame; once every frame is in,
+/// [`Timeline::depth`] is the depth the stream really used and the muxer moves the presentation
+/// back by the difference (`Mp4Writer::rebase_composition`), so a player that ignores edit lists is
+/// late by the real reorder delay only. (VideoToolbox's own decode times are not used: on reordered
+/// streams it reports `n × step` from 0, which puts some pictures' presentation before their decoding.)
+#[derive(Debug, Default)]
+struct Timeline {
+    step: i64,
+    reorder: bool,
+    /// Declared reorder depth (frames): the composition offsets as written are relative to it.
+    bound: i64,
+    /// Compressed frames returned so far.
+    decoded: i64,
+    /// Every presentation index below this came out once.
+    next: i64,
+    /// Presentation indices at or above `next` that came out (ahead of a lower one still missing).
+    pending: std::collections::BTreeSet<i64>,
+    /// Deepest reorder seen: max over frames of (decoding position − presentation index).
+    depth: i64,
+}
+
+impl Timeline {
+    fn new(step: u32, reorder: bool) -> Self {
+        Timeline { step: i64::from(step).max(1), reorder, ..Default::default() }
+    }
+
+    /// The composition offset of the next frame (decoding order), or why the frame does not fit.
+    fn place(&mut self, pts: i64, dts: i64) -> Result<i32, String> {
+        let n = self.decoded;
+        let what = |why: &str| format!("VideoToolbox returned frame {n} (in decoding order) at time {pts} (decode time {dts}): {why}");
+        let index = if pts >= 0 && pts % self.step == 0 { pts / self.step } else { return Err(what("not on the frame grid")) };
+        if !self.reorder && (index != n || pts != dts) {
+            return Err(what("out of order"));
+        }
+        if index < self.next || self.pending.contains(&index) {
+            return Err(what("a picture that already came out"));
+        }
+        if n.saturating_sub(index) > self.bound {
+            return Err(what("reordered deeper than the stream allows"));
+        }
+        if index.saturating_sub(n) > MAX_LEAD || self.pending.len() as i64 >= MAX_LEAD {
+            return Err(what("too far ahead of a missing picture"));
+        }
+        let offset = index.checked_add(self.bound).and_then(|i| i.checked_sub(n)).and_then(|f| f.checked_mul(self.step)).and_then(|o| i32::try_from(o).ok());
+        let offset = offset.ok_or_else(|| what("composition offset out of range"))?;
+        self.pending.insert(index);
+        while self.pending.remove(&self.next) {
+            self.next += 1;
+        }
+        self.depth = self.depth.max(n - index);
+        self.decoded += 1;
+        Ok(offset)
+    }
+
+    /// After the last frame: every one of the `submitted` pictures came out exactly once.
+    fn finish(&self, submitted: u64) -> Result<(), String> {
+        let submitted = i64::try_from(submitted).unwrap_or(i64::MAX);
+        if self.decoded != submitted || self.next != submitted || !self.pending.is_empty() {
+            return Err(format!(
+                "VideoToolbox returned {} of {submitted} pictures ({} in presentation order before the first missing one)",
+                self.decoded, self.next
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// [`VtEncoder`] as a `VideoEncoder`: RGBA (or, for Main 10, HDR R'G'B') pictures in, MP4 samples out.
 pub struct HardwareEncoder {
     vt: VtEncoder,
@@ -236,45 +313,24 @@ pub struct HardwareEncoder {
     y16: Vec<u16>,
     u16: Vec<u16>,
     v16: Vec<u16>,
-    /// Compressed frames returned so far.
-    decoded: i64,
-    /// With B-frames: how far (timescale units) the decode timeline runs ahead of the presentation
-    /// timeline, the stream's reorder depth in frames (from its SPS) times the frame duration. 0 without.
-    delay: i64,
+    timeline: Timeline,
+    /// Every frame is out (`flush` ran): [`VideoEncoder::media_start`] answers the measured depth.
+    flushed: bool,
 }
 
 impl HardwareEncoder {
     fn new(vt: VtEncoder, signal: ColorSignal) -> Self {
-        HardwareEncoder { vt, signal, y: Vec::new(), u: Vec::new(), v: Vec::new(), y16: Vec::new(), u16: Vec::new(), v16: Vec::new(), decoded: 0, delay: 0 }
+        let timeline = Timeline::new(vt.config().frame_duration, vt.config().b_frames);
+        HardwareEncoder { vt, signal, y: Vec::new(), u: Vec::new(), v: Vec::new(), y16: Vec::new(), u16: Vec::new(), v16: Vec::new(), timeline, flushed: false }
     }
 
-    /// MP4 samples from compressed frames (decoding order). Frame `n` is decoded at `n × duration`
-    /// on the MP4 decode timeline and presented at its presentation time plus [`Self::delay`], so its
-    /// composition offset is never negative; [`VideoEncoder::media_start`] starts the edit list at
-    /// `delay`, where the first picture (presentation time 0) sits. Without B-frames the delay is 0
-    /// and every frame must come out at `n × duration`. (VideoToolbox's own decode times are not used
-    /// for the file: on reordered streams it reports `n × duration` from 0, which puts some pictures'
-    /// presentation before their decoding.) A dropped frame, a picture off the frame grid or one
-    /// reordered deeper than the stream says is an error, never a file with wrong times.
+    /// MP4 samples from compressed frames (decoding order), timed by [`Timeline`]. A dropped,
+    /// duplicated or misplaced picture is an error, never a file with wrong times.
     fn samples(&mut self, packets: Vec<VtPacket>) -> filmcraft_export::Result<Vec<EncodedPacket>> {
-        let c = self.vt.config();
-        let (duration, reorder) = (c.frame_duration, c.b_frames);
-        let step = i64::from(duration);
+        let duration = self.vt.config().frame_duration;
         let mut out = Vec::with_capacity(packets.len());
         for p in packets {
-            let n = self.decoded;
-            self.decoded += 1;
-            let dts = n.checked_mul(step);
-            let offset = dts.and_then(|d| p.pts.checked_add(self.delay)?.checked_sub(d)).and_then(|o| i32::try_from(o).ok());
-            let valid = if reorder { p.pts >= 0 && p.pts % step == 0 && offset.is_some_and(|o| o >= 0) } else { dts == Some(p.pts) && p.pts == p.dts };
-            let Some(offset) = offset.filter(|_| valid) else {
-                return Err(ExportError::Encode(format!(
-                    "VideoToolbox returned frame {n} (in decoding order) at time {} (decode time {}): {}",
-                    p.pts,
-                    p.dts,
-                    if reorder { "outside the stream's reorder depth" } else { "out of order" }
-                )));
-            };
+            let offset = self.timeline.place(p.pts, p.dts).map_err(ExportError::Encode)?;
             out.push(EncodedPacket { data: p.data, key: p.key, duration, composition_offset: offset });
         }
         Ok(out)
@@ -359,7 +415,7 @@ impl VideoEncoder for HardwareEncoder {
             }
             if self.vt.config().b_frames {
                 let depth = Self::reorder_depth(codec, &params).map_err(ExportError::Encode)?;
-                self.delay = i64::try_from(depth).unwrap_or(16).saturating_mul(i64::from(self.vt.config().frame_duration));
+                self.timeline.bound = i64::try_from(depth).unwrap_or(16);
             }
         }
         self.samples(packets)
@@ -367,11 +423,102 @@ impl VideoEncoder for HardwareEncoder {
 
     fn flush(&mut self) -> filmcraft_export::Result<Vec<EncodedPacket>> {
         let packets = self.vt.flush().map_err(ExportError::Encode)?;
-        self.samples(packets)
+        let out = self.samples(packets)?;
+        self.timeline.finish(self.vt.submitted()).map_err(ExportError::Encode)?;
+        self.flushed = true;
+        Ok(out)
     }
 
     fn media_start(&self) -> Option<i64> {
-        // with B-frames presentation runs `delay` behind decoding: the edit list starts it at the first picture
-        (self.delay > 0).then_some(self.delay)
+        // with B-frames presentation runs behind decoding: the edit list starts it at the first picture.
+        // Before the last frame that is the declared depth (what the offsets are written against); after
+        // it, the depth the stream used, which the export moves the presentation back to.
+        let frames = if self.flushed { self.timeline.depth } else { self.timeline.bound };
+        (frames > 0).then(|| frames.saturating_mul(self.timeline.step))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (presentation index, decoding position) of an HEVC-style group of pictures, as VideoToolbox
+    /// hands them over: decoding order, two deep.
+    const GOP: [i64; 10] = [0, 4, 2, 1, 3, 5, 9, 7, 6, 8];
+    const STEP: u32 = 1001;
+
+    fn run(timeline: &mut Timeline, indices: &[i64]) -> Result<Vec<i32>, String> {
+        indices.iter().enumerate().map(|(n, i)| timeline.place(i * i64::from(STEP), n as i64 * i64::from(STEP))).collect()
+    }
+
+    fn reordered(bound: i64) -> Timeline {
+        Timeline { bound, ..Timeline::new(STEP, true) }
+    }
+
+    #[test]
+    fn a_reordered_stream_gets_non_negative_offsets_and_its_measured_depth() {
+        let mut t = reordered(4);
+        let offsets = run(&mut t, &GOP).unwrap();
+        // offset = (index + bound - n) x step: never negative, presentation after decoding
+        assert_eq!(offsets[0], 4 * 1001);
+        assert!(offsets.iter().all(|o| *o >= 0));
+        assert_eq!(t.depth, 2, "picture 1 is decoded third");
+        t.finish(10).unwrap();
+        // without B-frames: in order, offset 0
+        let mut t = Timeline::new(STEP, false);
+        assert_eq!(run(&mut t, &[0, 1, 2, 3]).unwrap(), vec![0; 4]);
+        assert_eq!(t.depth, 0);
+        t.finish(4).unwrap();
+    }
+
+    #[test]
+    fn a_duplicated_picture_is_an_error() {
+        let mut t = reordered(2);
+        let e = run(&mut t, &[0, 2, 1, 2]).unwrap_err();
+        assert!(e.contains("already came out"), "{e}");
+        // also once the window has moved past it
+        let mut t = reordered(2);
+        assert!(run(&mut t, &[0, 2, 1, 3, 1]).unwrap_err().contains("already came out"));
+        let mut t = Timeline::new(STEP, false);
+        assert!(run(&mut t, &[0, 1, 1]).is_err());
+    }
+
+    #[test]
+    fn a_missing_picture_is_an_error() {
+        // a hole the stream never fills: found when the last frame is in
+        let mut t = reordered(2);
+        run(&mut t, &[0, 2, 1, 4, 3, 6, 7]).unwrap();
+        let e = t.finish(8).unwrap_err();
+        assert!(e.contains("7 of 8") && e.contains("5 in presentation order"), "{e}");
+        // fewer frames out than went in
+        let mut t = reordered(2);
+        run(&mut t, &[0, 2, 1]).unwrap();
+        assert!(t.finish(4).is_err());
+        // a hole that keeps the window from moving: found as soon as too much is pending
+        let mut t = reordered(2);
+        let far: Vec<i64> = std::iter::once(0).chain(2..3 + MAX_LEAD).collect();
+        assert!(run(&mut t, &far).unwrap_err().contains("too far ahead"));
+        // without B-frames a skipped frame is out of order at once
+        let mut t = Timeline::new(STEP, false);
+        assert!(run(&mut t, &[0, 2]).unwrap_err().contains("out of order"));
+    }
+
+    #[test]
+    fn a_picture_deeper_than_the_stream_declares_or_off_the_grid_is_an_error() {
+        // picture 1 decoded third is two deep: a stream that declares one is lying
+        let mut t = reordered(1);
+        assert!(run(&mut t, &[0, 4, 2, 1]).unwrap_err().contains("deeper"));
+        // a time that is not a whole number of frames, or before the start
+        let mut t = reordered(2);
+        assert!(t.place(500, 0).unwrap_err().contains("frame grid"));
+        assert!(t.place(-1001, 0).unwrap_err().contains("frame grid"));
+        // a picture far ahead of its decoding position
+        let mut t = reordered(2);
+        assert!(t.place((MAX_LEAD + 1) * 1001, 0).unwrap_err().contains("too far ahead"));
+        // hostile times never overflow
+        let mut t = reordered(16);
+        let _ = t.place(i64::MAX - i64::MAX % 1001, 0);
+        let mut t = Timeline { bound: i64::MAX, ..Timeline::new(STEP, true) };
+        assert!(t.place(0, 0).is_err(), "offset out of range");
     }
 }

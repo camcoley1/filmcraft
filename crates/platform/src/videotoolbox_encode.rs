@@ -174,6 +174,8 @@ enum Output {
 /// kept alive until the session is invalidated.
 struct Shared {
     codec: VtCodec,
+    /// Frame reordering is on: only IDR pictures are sync samples.
+    reorder: bool,
     timescale: i64,
     out: Mutex<Vec<Output>>,
     params: Mutex<Option<ParamSets>>,
@@ -230,8 +232,10 @@ fn ticks(t: CMTime, timescale: i64) -> Option<i64> {
 }
 
 /// Whether length-prefixed NAL units hold a random access point: an IDR slice (nal_unit_type 5) in
-/// H.264; a BLA, IDR or CRA slice (types 16 to 21) in HEVC.
-fn is_sync(data: &[u8], codec: VtCodec) -> Result<bool, String> {
+/// H.264; a BLA, IDR or CRA slice (types 16 to 21) in HEVC, or with `idr_only` (reordered streams,
+/// whose BLA / CRA pictures may have leading pictures that do not decode after a seek) an IDR slice
+/// (19, 20) only.
+fn is_sync(data: &[u8], codec: VtCodec, idr_only: bool) -> Result<bool, String> {
     let mut pos = 0usize;
     let mut key = false;
     while pos < data.len() {
@@ -242,6 +246,7 @@ fn is_sync(data: &[u8], codec: VtCodec) -> Result<bool, String> {
         let header = *data.get(pos).ok_or("empty NAL unit")?;
         key |= match codec {
             VtCodec::H264 => header & 0x1f == 5,
+            VtCodec::Hevc if idr_only => (19..=20).contains(&((header >> 1) & 0x3f)),
             VtCodec::Hevc => (16..=21).contains(&((header >> 1) & 0x3f)),
         };
         pos = end;
@@ -337,7 +342,7 @@ fn read_packet(sample: &CMSampleBuffer, shared: &Shared) -> Result<VtPacket, Str
     let (pts, dts) = unsafe { (sample.presentation_time_stamp(), sample.decode_time_stamp()) };
     let pts = ticks(pts, shared.timescale).ok_or("compressed frame without a presentation time")?;
     let dts = ticks(dts, shared.timescale).unwrap_or(pts);
-    let key = is_sync(&data, shared.codec)?;
+    let key = is_sync(&data, shared.codec, shared.reorder)?;
     {
         let mut params = shared.params.lock().unwrap_or_else(PoisonError::into_inner);
         if params.is_none() {
@@ -440,13 +445,13 @@ fn fill(pb: &CVImageBuffer, w: usize, h: usize, y: &[u8], u: &[u8], v: &[u8]) ->
 }
 
 /// Copy planar 10-bit Y / U / V codes (0..1023, the layout of [`fill`]) into an `x420` buffer: two
-/// bytes per sample in native (little-endian) order, the code in the top 10 bits.
+/// bytes per sample, little-endian as the format defines, the code in the top 10 bits.
 fn fill_10(pb: &CVImageBuffer, w: usize, h: usize, y: &[u16], u: &[u16], v: &[u16]) -> Result<(), String> {
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
     if y.len() < w * h || u.len() < cw * ch || v.len() < cw * ch {
         return Err("the Y'CbCr planes are smaller than the picture".into());
     }
-    let put = |dst: &mut [u8; 2], code: u16| *dst = (code.min(1023) << 6).to_ne_bytes();
+    let put = |dst: &mut [u8; 2], code: u16| *dst = (code.min(1023) << 6).to_le_bytes();
     // SAFETY: `pb` is a valid pixel buffer (the caller holds it retained).
     if unsafe { CVPixelBufferLockBaseAddress(pb, CVPixelBufferLockFlags(0)) } != 0 {
         return Err("cannot lock the input buffer".into());
@@ -546,7 +551,8 @@ impl VtEncoder {
             return Err("invalid frame rate".into());
         }
         let codec = config.profile.codec();
-        let shared = Box::new(Shared { codec, timescale: i64::from(config.timescale), out: Mutex::new(Vec::new()), params: Mutex::new(None) });
+        let shared =
+            Box::new(Shared { codec, reorder: config.b_frames, timescale: i64::from(config.timescale), out: Mutex::new(Vec::new()), params: Mutex::new(None) });
 
         // SAFETY: reading immutable framework constants.
         let require_key: &CFString = unsafe { kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder };
@@ -614,9 +620,13 @@ impl VtEncoder {
         // No B-frames unless asked for: on real 1080p footage the hardware encoder's quality is the
         // same with and without them (±0.3 dB at equal bitrate), the bitrate lands closer to the
         // target, and decode and presentation order coincide, so the muxer needs no composition
-        // offsets or edit list. With them, packets carry their decode times (see `VtPacket`).
+        // offsets or edit list. With them, the export builds the decode timeline itself
+        // (`hardware_encode`'s `Timeline`).
         require(set_bool(session, reorder, c.b_frames), "frame reordering")?;
-        // closed GOPs: every keyframe is an IDR picture, so every MP4 sync sample is a clean seek point
+        // closed GOPs: every keyframe is an IDR picture, so every MP4 sync sample is a clean seek
+        // point. Not every encoder takes the key (this machine's HEVC encoder refuses it), so with
+        // B-frames `is_sync` counts only IDR pictures as sync samples: a CRA picture of an open GOP
+        // may have leading pictures that cannot be decoded after a seek.
         let _ = set_bool(session, open_gop, false);
 
         let keyint = c.keyframe_interval.clamp(1, i32::MAX as u32) as i32;
@@ -715,6 +725,11 @@ impl VtEncoder {
     /// The configuration this encoder was created with.
     pub fn config(&self) -> &VtConfig {
         &self.config
+    }
+
+    /// Pictures submitted so far.
+    pub fn submitted(&self) -> u64 {
+        self.submitted
     }
 
     /// The stream's parameter sets, known once the first compressed frame came out.

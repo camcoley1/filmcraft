@@ -717,6 +717,10 @@ pub struct Report {
     /// Further files written besides `path` (MXF OP-Atom audio files).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub extra_files: Vec<String>,
+    /// What the export did differently from what was asked, for the user (an HDR H.265 export
+    /// this machine could only write as tone-mapped SDR).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// A packet produced by a video encoder.
@@ -1999,7 +2003,15 @@ pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, so
         progress.finished.store(true, Ordering::Relaxed);
         progress.set_status(format!("Done in {secs:.1}s"));
     }
-    Ok(Report { path: settings.path.clone(), frames: nframes, seconds: secs, bytes, render_fps: nframes as f64 / secs.max(1e-6), extra_files: Vec::new() })
+    Ok(Report {
+        path: settings.path.clone(),
+        frames: nframes,
+        seconds: secs,
+        bytes,
+        render_fps: nframes as f64 / secs.max(1e-6),
+        extra_files: Vec::new(),
+        warnings: Vec::new(),
+    })
 }
 
 #[cfg(test)]

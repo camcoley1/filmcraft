@@ -549,6 +549,22 @@ impl<W: Write + Seek> Mp4Writer<W> {
         Ok(())
     }
 
+    /// Move a track's presentation earlier by `shift` (media timescale) before the file is finished:
+    /// every composition offset written so far loses `shift` and the edit list starts at
+    /// `media_start` instead. For a B-frame stream whose offsets were written against a declared
+    /// reorder depth, once the depth it really used is known. An offset that would leave the `i32`
+    /// range is an error and changes nothing.
+    pub fn rebase_composition(&mut self, track: usize, shift: i64, media_start: Option<i64>) -> Result<()> {
+        let t = self.tracks.get_mut(track).ok_or(Error::NoSuchTrack(track))?;
+        let shifted: Option<Vec<(u32, i32)>> =
+            t.t.ctts.iter().map(|&(c, o)| i64::from(o).checked_sub(shift).and_then(|o| i32::try_from(o).ok()).map(|o| (c, o))).collect();
+        let ctts = shifted.ok_or_else(|| Error::Mux(format!("composition offsets shifted by {shift} leave the i32 range")))?;
+        t.t.ctts = ctts;
+        t.t.comp_end = i64::try_from(t.t.comp_end).unwrap_or(i64::MAX).saturating_sub(shift).max(0) as u64;
+        t.cfg.media_start = media_start;
+        Ok(())
+    }
+
     /// Add a QuickTime timecode track referenced by `video_track`. Its single sample (the start
     /// frame number) is written at finish, spanning the video track's duration.
     pub fn add_timecode_track(&mut self, video_track: usize, tc: TimecodeConfig, start_frame: u32) -> Result<usize> {
@@ -980,6 +996,45 @@ mod tests {
             assert_eq!(presented, (0..10).map(|i| i * dur).collect::<Vec<_>>(), "every picture once, the first at 0");
             assert_eq!(t.sync_sample_before(9), 5);
         }
+    }
+
+    #[test]
+    fn rebasing_moves_the_presentation_to_the_measured_reorder_depth() {
+        // written against a declared depth of 4 frames; the stream used 2
+        let (dur, declared, used) = (1001i64, 4 * 1001i64, 2 * 1001i64);
+        let mut w = Mp4Writer::new(Cursor::new(Vec::new()), WriterOptions { movie_timescale: 30000, ..WriterOptions::new(Brand::Mp4) }).unwrap();
+        let mut cfg = TrackConfig::new(avc_entry(), 30000);
+        cfg.media_start = Some(declared);
+        let v = w.add_track(cfg).unwrap();
+        for (n, &(pts, key)) in REORDERED.iter().enumerate() {
+            let offset = (pts * dur + declared - n as i64 * dur) as i32;
+            w.write_sample(v, WriteSample { data: &[n as u8; 20], duration: dur as u32, composition_offset: offset, is_sync: key }).unwrap();
+        }
+        assert!(w.rebase_composition(v, i64::from(i32::MAX) * 4, Some(0)).is_err(), "out of range: an error");
+        w.rebase_composition(v, declared - used, Some(used)).unwrap();
+        assert!(w.rebase_composition(9, 0, None).is_err());
+        let out = w.finish().unwrap().into_inner();
+        assert_eq!(box_version(&out, b"ctts"), Some(0));
+        let f = crate::open(out.as_slice()).unwrap();
+        let t = &f.tracks[0];
+        assert_eq!((t.edits.len(), t.edits[0].media_time, t.edits[0].segment_duration), (1, used, 10 * dur as u64));
+        for (n, (s, &(pts, _))) in t.samples.iter().zip(&REORDERED).enumerate() {
+            assert_eq!(s.pts - used, pts * dur, "sample {n}");
+            assert!(s.pts >= s.dts);
+        }
+        // a stream that never reordered: no offsets, no edit list
+        let mut w = Mp4Writer::new(Cursor::new(Vec::new()), WriterOptions::new(Brand::Mp4)).unwrap();
+        let mut cfg = TrackConfig::new(avc_entry(), 30000);
+        cfg.media_start = Some(declared);
+        let v = w.add_track(cfg).unwrap();
+        for n in 0..4u8 {
+            w.write_sample(v, WriteSample { data: &[n; 20], duration: dur as u32, composition_offset: declared as i32, is_sync: n == 0 }).unwrap();
+        }
+        w.rebase_composition(v, declared, None).unwrap();
+        let out = w.finish().unwrap().into_inner();
+        assert_eq!((box_version(&out, b"ctts"), box_version(&out, b"elst")), (None, None));
+        let f = crate::open(out.as_slice()).unwrap();
+        assert_eq!(f.tracks[0].duration, 4 * dur as u64);
     }
 
     #[test]

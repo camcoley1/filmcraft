@@ -12,7 +12,8 @@
 //!   the same 10-bit pictures as our decoder. SDR stays Main 8-bit BT.709.
 //!
 //! Its own test binary: the encoder registry and the counters are process-wide. Tests skip
-//! (SKIPPED) where VideoToolbox has no encoder for what they need, and the ffprobe / ffmpeg checks
+//! (SKIPPED) where VideoToolbox has no encoder for what they need, unless `FILMCRAFT_REQUIRE_VT=1`
+//! (a hardware runner) makes that a failure; the ffprobe / ffmpeg checks
 //! where those tools are missing.
 #![cfg(target_os = "macos")]
 
@@ -74,6 +75,13 @@ fn tmp(name: &str) -> String {
     d.join(name).to_string_lossy().to_string()
 }
 
+/// A test that cannot run here: SKIPPED, or a failure where `FILMCRAFT_REQUIRE_VT=1` says this
+/// machine has the hardware (so a runner without it cannot pass with nothing exercised).
+fn skip(why: &str) {
+    assert!(std::env::var("FILMCRAFT_REQUIRE_VT").as_deref() != Ok("1"), "FILMCRAFT_REQUIRE_VT=1 but {why}");
+    eprintln!("SKIPPED: {why}");
+}
+
 fn settings(format: Format, path: String, b_frames: bool) -> ExportSettings {
     ExportSettings {
         format,
@@ -95,7 +103,7 @@ fn hardware_takes(s: &ExportSettings) -> bool {
         Some(Ok(_)) => true,
         Some(Err(e)) => panic!("factory error: {e}"),
         None => {
-            eprintln!("SKIPPED: no VideoToolbox hardware {} encoder (b_frames {})", s.format.label(), s.hardware_b_frames);
+            skip(&format!("no VideoToolbox hardware {} encoder (b_frames {})", s.format.label(), s.hardware_b_frames));
             false
         }
     }
@@ -227,6 +235,10 @@ fn check_track_timing(name: &str, bytes: &[u8], b_frames: bool) -> i64 {
     let reordered = t.samples.iter().filter(|s| s.pts - s.dts != start).count();
     if b_frames {
         assert!(start > 0 && start % dur == 0, "{name}: edit list media time {start}");
+        // the pre-roll is the reorder the stream used (not the SPS bound), so a player that ignores
+        // the edit list is late by that much only
+        let used = t.samples.iter().enumerate().map(|(n, s)| n as i64 - (s.pts - start) / dur).max().unwrap_or(0);
+        assert_eq!(start, used * dur, "{name}: pre-roll {start} for a stream {used} frames deep");
         assert!(reordered > 0, "{name}: no picture was reordered");
         // a sync sample is presented at its decode position: nothing before it in decoding order is shown after it
         for (n, s) in t.samples.iter().enumerate().filter(|(_, s)| s.is_sync) {
@@ -310,7 +322,7 @@ fn hdr_sequences_export_as_main_10() {
     filmcraft_platform::register();
     assert_eq!(hdr_available(Format::Hevc), hevc_main10_available(), "HDR H.265 is available iff VideoToolbox can encode Main 10");
     if !hevc_main10_available() {
-        eprintln!("SKIPPED: no VideoToolbox HEVC Main 10 here (hevc: {})", hevc_available());
+        skip(&format!("no VideoToolbox HEVC Main 10 here (hevc: {})", hevc_available()));
         return;
     }
     let ffprobe = filmcraft_testkit::ffprobe_or_skip("vt main 10");
@@ -423,7 +435,7 @@ fn sdr_stays_main_8_bit() {
     let _one = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     filmcraft_platform::register();
     if !hevc_available() {
-        eprintln!("SKIPPED: no VideoToolbox HEVC here");
+        skip("no VideoToolbox HEVC here");
         return;
     }
     let ffprobe = filmcraft_testkit::ffprobe_or_skip("vt main 10");
@@ -478,7 +490,7 @@ fn main_10_rejects_mismatched_pictures_and_clamps_hostile_floats() {
     let _one = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     filmcraft_platform::register();
     if !hevc_main10_available() {
-        eprintln!("SKIPPED: no VideoToolbox HEVC Main 10 here");
+        skip("no VideoToolbox HEVC Main 10 here");
         return;
     }
     let rgba = vec![128u8; (W * H * 4) as usize];

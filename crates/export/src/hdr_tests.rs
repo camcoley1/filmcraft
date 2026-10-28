@@ -213,3 +213,48 @@ fn sdr_gets_a_colr_box_and_no_hdr_metadata() {
     let v = e.video.as_ref().unwrap();
     assert_eq!(v.color, Some(filmcraft_isobmff::ColorInfo::Nclx { primaries: 1, transfer: 1, matrix: 1, full_range: false }));
 }
+
+/// An HDR sequence exporting H.265 where the probe says the machine has a 10-bit encoder, but the
+/// 10-bit session cannot be created for this export (its size, a busy encoder...): the export is
+/// tone-mapped SDR, as before Main 10 existed, and the report says so, instead of failing.
+#[test]
+fn hdr_h265_falls_back_to_tone_mapped_sdr_when_the_10_bit_encoder_declines() {
+    use filmcraft_color::{ColorPipeline, Transfer, WorkingSpace};
+    fn ten_bit_here() -> bool {
+        true
+    }
+    /// Takes only this test's H.265 exports (by path); declines the HDR ones, as a 10-bit session
+    /// that cannot be created does; SDR goes to the built-in H.264 encoder standing in for the 8-bit one.
+    fn hevc(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Option<Result<Box<dyn VideoEncoder>>> {
+        if format != Format::Hevc || !s.path.contains("hevc-fallback") {
+            return None;
+        }
+        if s.signal.is_hdr() || s.path.contains("no-sdr") {
+            return None;
+        }
+        h264_factory(Format::H264, w, h, rate, &ExportSettings { format: Format::H264, ..s.clone() })
+    }
+    register_hdr_probe(Format::Hevc, ten_bit_here);
+    register_encoder(hevc);
+    let (p, seq, m) = crate::tests::project();
+    let mut p = (*p).clone();
+    p.sequence_mut(seq).unwrap().settings.color = ColorPipeline { working: WorkingSpace::Rec2100Pq, ..ColorPipeline::REC709 };
+    let p = Arc::new(p);
+    let path = crate::tests::tmp("hevc-fallback.mp4");
+    let s = ExportSettings { format: Format::Hevc, path: path.clone(), include_audio: false, ..Default::default() };
+    let report = export(&p, seq, &s, &m, &Progress::default()).expect("falls back instead of failing");
+    assert_eq!(report.frames, 24);
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(report.warnings[0].contains("tone-mapped SDR"), "{}", report.warnings[0]);
+    assert!(serde_json::to_string(&report).unwrap().contains("tone-mapped SDR"), "the report carries the warning");
+    let bytes: Arc<[u8]> = std::fs::read(&path).unwrap().into();
+    let src = filmcraft_codecs::open_bytes(&path, bytes).unwrap();
+    assert_eq!(src.info().video.clone().unwrap().color.transfer, Transfer::Bt709, "SDR, tone-mapped");
+    // when the 8-bit encoder declines too, the export still fails, with an error
+    let s = ExportSettings { path: crate::tests::tmp("hevc-fallback-no-sdr.mp4"), ..s };
+    let e = export(&p, seq, &s, &m, &Progress::default()).unwrap_err().to_string();
+    assert!(e.contains("HDR (Main 10) declined") && e.contains("tone-mapped SDR too"), "both reasons: {e}");
+    // an SDR export carries no warning
+    let sdr = ExportSettings { format: Format::H264, path: crate::tests::tmp("sdr.mp4"), include_audio: false, ..Default::default() };
+    assert!(export(&crate::tests::project().0, seq, &sdr, &m, &Progress::default()).unwrap().warnings.is_empty());
+}
