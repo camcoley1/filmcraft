@@ -1264,6 +1264,10 @@ pub struct Project {
     /// instructions for whoever opens it next, frame numbers and the like. Schema v15.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub notes: String,
+    /// A random UUID naming the project's AI cache folder (`<media cache>/AI/<id>/`, ADR 0002),
+    /// given on its first AI job; empty until then and in older files. Schema v17.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
 }
 
 /// How a sequence is shown in the Timeline panel: its zoom, scroll position and track heights.
@@ -1360,6 +1364,7 @@ impl Project {
             source_graphics: BTreeMap::new(),
             narrations: BTreeMap::new(),
             notes: String::new(),
+            id: String::new(),
         }
     }
 

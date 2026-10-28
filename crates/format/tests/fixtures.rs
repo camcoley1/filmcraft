@@ -261,7 +261,7 @@ fn v10_minimal_loads_with_m3_11_defaults() {
 }
 
 #[test]
-fn v15_caption_track_loads_and_resaves_as_v16_intact() {
+fn v15_caption_track_loads_and_resaves_intact() {
     // a project saved before caption word timings and animation existed (schema 15)
     let bytes = fixture("v15-captions.fcproj");
     let text = String::from_utf8(bytes.clone()).unwrap();
@@ -280,11 +280,12 @@ fn v15_caption_track_loads_and_resaves_as_v16_intact() {
     assert_eq!(track.style.size, 60.0);
     assert_eq!(track.style.color, [255, 255, 0, 255]);
     assert_eq!(track.style.animation, filmcraft_project::CaptionAnimation::None);
-    // saved again: schema 16, the caption unchanged, and still no new keys
+    // saved again: the current schema, the caption unchanged, and still no new keys
     let out = encode(p, false);
     let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(v["schema_version"], SCHEMA_VERSION);
-    assert_eq!(SCHEMA_VERSION, 16);
+    assert_eq!(SCHEMA_VERSION, 17);
+    assert!(p.id.is_empty(), "an old project has no id until its first AI job");
     let again = decode(&out).unwrap();
     assert!(!again.migrated());
     assert_eq!(&again.project, p);

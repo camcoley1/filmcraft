@@ -41,6 +41,8 @@
 //!   would drop them when saving.
 //! - **v16** (M4): caption word timings and caption animation. No-op step; older builds would drop
 //!   them when saving.
+//! - **v17** (M6.0): the project id (`Project::id`) naming the project's AI cache folder. No-op step
+//!   (older files have none and get one on their first AI job); older builds would drop it.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
@@ -63,7 +65,7 @@ pub type Migration = fn(Value) -> Result<Value, String>;
 /// edit a shipped one.
 pub const MIGRATIONS: &[Migration] = &[
     v1_to_v2, v2_to_v3, v3_to_v4, v4_to_v5, v5_to_v6, v6_to_v7, v7_to_v8, v8_to_v9, v9_to_v10, v10_to_v11, v11_to_v12, v12_to_v13, v13_to_v14, v14_to_v15,
-    v15_to_v16,
+    v15_to_v16, v16_to_v17,
 ];
 
 /// The schema version this build writes (and the newest it reads).
@@ -370,13 +372,18 @@ fn v15_to_v16(doc: Value) -> Result<Value, String> {
     Ok(doc)
 }
 
+/// v16 to v17: the project id. Older files have none (it stays empty until the first AI job).
+fn v16_to_v17(doc: Value) -> Result<Value, String> {
+    Ok(doc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn schema_version_matches_table() {
-        assert_eq!(SCHEMA_VERSION, 16);
+        assert_eq!(SCHEMA_VERSION, 17);
     }
 
     #[test]
@@ -502,6 +509,21 @@ mod tests {
         assert_eq!(v["format"], FORMAT_ID);
         assert!(v["project"]["items"].is_object());
         assert!(v["project"].get("version").is_none());
+    }
+
+    /// A v16 file (no project id) opens with an empty id; an id survives a save.
+    #[test]
+    fn project_id_is_optional_and_kept() {
+        let mut v: Value = serde_json::from_slice(&encode(&Project::new("old"), false)).unwrap();
+        assert!(v["project"].get("id").is_none(), "an empty id is not written");
+        v["schema_version"] = Value::from(16);
+        let l = decode(&serde_json::to_vec(&v).unwrap()).unwrap();
+        assert!(l.migrated() && l.project.id.is_empty());
+        let mut p = l.project;
+        p.id = "0b8e7d2c-5f1a-4c3e-9d6b-2a7f8e1c4b90".into();
+        let again = decode(&encode(&p, false)).unwrap();
+        assert_eq!(again.project.id, p.id);
+        assert!(!again.migrated());
     }
 
     #[test]
