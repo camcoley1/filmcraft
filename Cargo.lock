@@ -2256,6 +2256,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filmcraft-sidecar"
+version = "0.10.0"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "filmcraft-speech"
 version = "0.10.0"
 dependencies = [
