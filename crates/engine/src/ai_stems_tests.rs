@@ -133,14 +133,23 @@ fn placed_stems_line_up_with_the_clip() {
     assert_eq!(f.s.active_sequence().unwrap().audio_tracks.len(), before);
 }
 
+/// A failed apply changes nothing and rolls the files back: the stems the job moved to the media
+/// folder are back in the job folder in the cache, and the media folder is gone.
 #[test]
 fn a_stem_of_the_wrong_length_changes_nothing() {
     let mut f = helper("st-len", short_bass);
+    let media = f.cache.join("media");
+    f.s.ai.media_root = Some(media.clone());
     super::super::ensure_project_id(&mut f.s);
     let before = snapshot(&f.s);
     let e = f.s.execute("ai.stems", json!({"wait": true, "place": true})).unwrap_err().to_string();
     assert!(e.contains("bass stem is not as long as the decoded source"), "{e}");
     assert_eq!(snapshot(&f.s), before);
+    let out = std::path::PathBuf::from(&f.helper.started()[0].out_dir);
+    for stem in ["vocals", "drums", "bass", "other"] {
+        assert!(out.join(format!("{stem}.wav")).is_file(), "{stem} is back in the cache");
+    }
+    assert!(!media.join("AI Media").join(&f.s.project.id).exists(), "the media folder is removed");
 }
 
 #[test]
@@ -315,6 +324,53 @@ fn a_linked_pair_is_split_once_and_stems_outlive_the_cache() {
         let filmcraft_project::MediaRef::File { path } = &it.as_media().unwrap().media else { panic!("a file") };
         assert!(std::path::Path::new(path).exists(), "{path} survived pruning");
     }
+}
+
+/// Dual mono split to two tracks (channel 1 on one clip, channel 2 on another, same range): each
+/// clip gets its stems; a video clip linked to one of them adds no job.
+#[test]
+fn clips_playing_other_channels_of_the_same_range_each_get_stems() {
+    let mut f = helper("st-dual", stems);
+    f.s.ai.media_root = Some(f.cache.join("media"));
+    let seq = f.s.state.active_sequence.unwrap();
+    let (v, item) = (f.clip, f.item);
+    let (a1, a2) =
+        f.s.edit("Split", |pr, _| {
+            let rate = pr.sequence(seq).unwrap().settings.frame_rate;
+            let range = TimeRange::new(Tick::ZERO, Tick(254_016_000_000 * 2));
+            let mut left = pr.make_track_item(item, TrackKind::Audio, Tick::ZERO, range, rate).unwrap();
+            let mut right = pr.make_track_item(item, TrackKind::Audio, Tick(254_016_000_000 * 2), range, rate).unwrap();
+            (left.source_channels, right.source_channels) = (vec![0], vec![1]);
+            left.link = Some(7);
+            let q = pr.sequence_mut(seq).unwrap();
+            q.video_tracks[0].items[0].link = Some(7);
+            let ids = (left.id, right.id);
+            q.audio_tracks[0].items.push(left);
+            q.audio_tracks[0].items.push(right);
+            Ok(ids)
+        })
+        .unwrap();
+    f.s.state.selection = vec![v, a1, a2];
+    f.s.execute("ai.stems", json!({"wait": true})).unwrap();
+    assert_eq!(f.helper.started().len(), 2, "one job per channel, none for the linked video");
+    assert_eq!(f.s.project.items.values().filter(|i| i.name.ends_with(".wav")).count(), 8);
+    // each job decoded one channel
+    assert_eq!(*SOURCE.lock().unwrap(), Some((44_100, 1, 2 * 44_100 * 4)));
+}
+
+/// The job report points at the stems where they now live.
+#[test]
+fn the_job_report_points_at_the_media_folder() {
+    let mut f = helper("st-report", stems);
+    f.s.ai.media_root = Some(f.cache.join("media"));
+    let r = f.s.execute("ai.stems", json!({"wait": true})).unwrap();
+    let id = r["job"].as_u64().unwrap();
+    let job = f.s.jobs.iter().find(|j| j.id == id).unwrap();
+    let report = job.result.lock().unwrap().clone().unwrap().unwrap();
+    assert!(std::path::Path::new(&report.path).is_dir(), "{}", report.path);
+    assert!(report.path.contains("AI Media"), "{}", report.path);
+    assert_eq!(report.extra_files.len(), 4);
+    assert!(report.extra_files.iter().all(|p| std::path::Path::new(p).is_file() && p.starts_with(&report.path)), "{:?}", report.extra_files);
 }
 
 /// A saved project keeps its AI media next to it.

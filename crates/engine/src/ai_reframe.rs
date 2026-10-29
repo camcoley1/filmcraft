@@ -131,7 +131,8 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         let times: Vec<f64> = mts.iter().map(|t| *t as f64 / TICKS_PER_SECOND as f64).collect();
         let params = json!({"times": times, "aspect": [aspect.0, aspect.1], "smoothing": smoothing, "followSpeed": follow, "subjectIndex": subject, "detector": detector});
         let context = json!({"mt": mts, "source": [size.0, size.1], "aspect": [aspect.0, aspect.1]});
-        let spec = super::JobSpec { kind: "reframe", label: "Auto Reframe", clips: &[c], params, context, timeout: None, prepare: None, loose: false };
+        let spec =
+            super::JobSpec { kind: "reframe", label: "Auto Reframe", clips: &[c], params, context, timeout: None, prepare: None, loose: false, media: false };
         jobs.push(super::start_job(s, spec, wait)?);
     }
     if jobs.is_empty() {

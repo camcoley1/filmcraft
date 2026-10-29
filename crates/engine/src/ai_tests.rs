@@ -633,3 +633,42 @@ fn a_background_host_reprobes() {
     super::poll(&mut f.s);
     assert!(f.s.ai.probe.is_none(), "not again until REPROBE has passed");
 }
+
+/// Moving a result across volumes: a copy in pieces with progress; one that stops (or fails)
+/// removes what it wrote and keeps the source.
+#[test]
+fn a_cross_volume_copy_reports_progress_and_cleans_up() {
+    let d = cache_dir("copy");
+    std::fs::create_dir_all(&d).unwrap();
+    let (from, to) = (d.join("big.wav"), d.join("moved.wav"));
+    let data: Vec<u8> = (0..(9u32 << 20)).map(|i| i as u8).collect();
+    std::fs::write(&from, &data).unwrap();
+    let seen = std::cell::Cell::new(0u64);
+    let e = super::copy_and_remove(&from, &to, &|| seen.get() > 0, &mut |n| seen.set(n)).unwrap_err();
+    assert_eq!(e.to_string(), "stopped");
+    assert_eq!(seen.get(), 8 << 20, "stopped after the first piece");
+    assert!(!to.exists(), "the partial copy is removed");
+    assert_eq!(std::fs::read(&from).unwrap(), data, "the source is kept");
+    let mut last = 0;
+    super::copy_and_remove(&from, &to, &|| false, &mut |n| last = n).unwrap();
+    assert_eq!(last, data.len() as u64);
+    assert!(!from.exists());
+    assert_eq!(std::fs::read(&to).unwrap(), data);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Staging that fails part way moves the files already moved back and removes the media folder.
+#[test]
+fn a_failed_stage_rolls_back() {
+    let d = cache_dir("stage");
+    let (cache, media) = (d.join("cache"), d.join("AI Media").join("stems").join("job"));
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("a.wav"), b"a").unwrap();
+    let files = [cache.join("a.wav"), cache.join("missing.wav")];
+    assert!(super::stage(&files, &media, &|| false, &mut |_| {}).is_err());
+    assert_eq!(std::fs::read(cache.join("a.wav")).unwrap(), b"a");
+    assert!(!d.join("AI Media").join("stems").exists(), "the media folders are removed");
+    let moved = super::stage(&files[..1], &media, &|| false, &mut |_| {}).unwrap();
+    assert_eq!(moved, [media.join("a.wav")]);
+    let _ = std::fs::remove_dir_all(&d);
+}

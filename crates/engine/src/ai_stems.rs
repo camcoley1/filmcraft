@@ -63,6 +63,17 @@ struct Target {
     offset: i64,
     samples: i64,
     audio_track: bool,
+    link: Option<u64>,
+}
+
+impl Target {
+    /// Another clip that this one's stems would duplicate: the same media, stream, channels and
+    /// range, or (a video clip) its linked audio clip playing the same range.
+    fn covered_by(&self, o: &Target) -> bool {
+        let range = (&self.path, self.offset, self.samples) == (&o.path, o.offset, o.samples);
+        let input = range && (self.stream, &self.channels) == (o.stream, &o.channels);
+        input || (range && !self.audio_track && o.audio_track && self.link.is_some() && self.link == o.link)
+    }
 }
 
 /// Why a clip is not split: `Skip` (no audio here: other selected clips may still be split) or
@@ -112,7 +123,7 @@ fn target_or(s: &Session, c: ClipId) -> std::result::Result<Target, (bool, Strin
         return Err(skip(format!("{}: the clip plays no audio", it.name)));
     }
     let audio_track = q.track(t).is_some_and(|t| t.kind == TrackKind::Audio);
-    Ok(Target { clip: c, name: it.name.clone(), item: it.item, path: path.clone(), stream, channels, offset, samples, audio_track })
+    Ok(Target { clip: c, name: it.name.clone(), item: it.item, path: path.clone(), stream, channels, offset, samples, audio_track, link: it.link })
 }
 
 pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
@@ -124,14 +135,15 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let wait = bool_p(p, "wait").unwrap_or(false);
     // every clip is checked before any job starts; a linked video and audio pair (same media and
-    // range) is split once, from its audio clip
+    // range) is split once, from its audio clip; clips playing other channels or streams of the
+    // same range (dual mono split to two tracks) are split each
     let mut targets: Vec<Target> = Vec::new();
     let mut picked: Vec<ClipId> = clips_p(s, p);
     picked.sort_by_key(|c| target(s, *c).map_or(1, |t| u8::from(!t.audio_track)));
     for c in picked {
         match target(s, c) {
             Ok(t) => {
-                if !targets.iter().any(|o| (&o.path, o.offset, o.samples) == (&t.path, t.offset, t.samples)) {
+                if !targets.iter().any(|o| t.covered_by(o)) {
                     targets.push(t);
                 }
             }
@@ -163,6 +175,7 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
                 Ok(vec![path.to_string_lossy().to_string()])
             })),
             loose: !place,
+            media: true,
         };
         jobs.push(super::start_job(s, spec, wait)?);
     }
@@ -240,7 +253,7 @@ pub(crate) fn apply(s: &mut Session, pj: &super::PendingAi, files: &[std::path::
             .find(|f| f.file_name().is_some_and(|n| n.to_string_lossy() == format!("{stem}.wav")))
             .ok_or_else(|| EngineError::Other(format!("the helper wrote no {stem}.wav")))?;
         // checked again on open (a file swapped after the job's check is refused)
-        filmcraft_sidecar::open_result(f, &pj.out_dir, MAX_STEM_BYTES).map_err(|e| EngineError::Other(e.to_string()))?;
+        filmcraft_sidecar::open_result(f, pj.result_dir(), MAX_STEM_BYTES).map_err(|e| EngineError::Other(e.to_string()))?;
         stems.push(f.clone());
     }
     let name = pj.context.get("name").and_then(Value::as_str).unwrap_or("Clip").to_string();

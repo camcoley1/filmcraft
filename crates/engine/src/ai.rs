@@ -206,6 +206,17 @@ pub struct PendingAi {
     pub outcome: Arc<Mutex<Option<Ready>>>,
     /// What the feature's apply step needs besides the result (sample times…).
     pub context: Value,
+    /// Where the result files go when they become project media ([`JobSpec::media`]): decided
+    /// when the job starts; the job's thread moves them there before the result is applied.
+    pub media: Option<PathBuf>,
+}
+
+impl PendingAi {
+    /// The folder the result files are in when the job is ready: [`PendingAi::media`] or the job
+    /// folder.
+    pub fn result_dir(&self) -> &Path {
+        self.media.as_deref().unwrap_or(&self.out_dir)
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -625,13 +636,17 @@ pub struct JobSpec<'a> {
     pub prepare: Option<Prepare>,
     /// See [`Fingerprint::loose`].
     pub loose: bool,
+    /// The result files become project media: the job's thread moves them out of the cache into
+    /// [`media_dir`] (a copy, with progress, when that is on another volume) before the result is
+    /// applied, so applying only imports them.
+    pub media: bool,
 }
 
 /// See [`JobSpec::prepare`].
 pub type Prepare = Box<dyn FnOnce(&std::path::Path, &dyn Fn() -> bool, &mut dyn FnMut(f64)) -> std::result::Result<Vec<String>, String> + Send>;
 
 pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
-    let JobSpec { kind, label, clips, params, context, timeout, prepare, loose } = spec;
+    let JobSpec { kind, label, clips, params, context, timeout, prepare, loose, media } = spec;
     let client = s.sidecar.clone().ok_or_else(|| EngineError::Other(NOT_CONNECTED.into()))?;
     helper_ready(s, kind).map_err(EngineError::Other)?;
     let wait = wait && !s.ai.background;
@@ -649,7 +664,9 @@ pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
     }
     let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
     let ms = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-    let out_dir = project_cache_dir(s, &project)?.join(format!("{kind}-{ms}-{id}"));
+    let name = format!("{kind}-{ms}-{id}");
+    let out_dir = project_cache_dir(s, &project)?.join(&name);
+    let media = media.then(|| media_dir(s, kind, &name, &project));
     std::fs::create_dir_all(&out_dir).map_err(|e| EngineError::Other(format!("AI cache {}: {e}", out_dir.display())))?;
     let req = JobRequest { kind: kind.into(), inputs, params, out_dir: out_dir.to_string_lossy().into() };
     let settings = s.project.sequence(seq).map(|q| hash_json(&q.settings)).unwrap_or_default();
@@ -661,7 +678,7 @@ pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
     job.progress.total.store(1000, Ordering::Relaxed);
     let outcome: Arc<Mutex<Option<Ready>>> = Arc::default();
     let limits = Limits { timeout: timeout.unwrap_or(s.ai.limits.timeout).min(s.ai.limits.timeout), ..s.ai.limits };
-    let (prog, res, out) = (job.progress.clone(), job.result.clone(), outcome.clone());
+    let (prog, res, out, to) = (job.progress.clone(), job.result.clone(), outcome.clone(), media.clone());
     let run = move || {
         let beat = PathBuf::from(&req.out_dir).join(HEARTBEAT);
         let _ = std::fs::write(&beat, b"running\n");
@@ -708,14 +725,34 @@ pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
             let _ = std::fs::remove_file(f);
         }
         let _ = std::fs::remove_file(&beat);
+        // results that become media leave the cache here, off the UI thread
+        let r = match (r, &to) {
+            (Ok((result, files)), Some(dir)) => {
+                let total: u64 = files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
+                let mut copied = |n: u64| {
+                    *lock(&prog.status) = format!("Copying the result to {}: {} %", dir.display(), n.saturating_mul(100) / total.max(1));
+                };
+                match stage(&files, dir, &cancelled, &mut copied) {
+                    Ok(files) => Ok((result, files)),
+                    Err(_) if cancelled() => Err(SidecarError::Cancelled),
+                    Err(e) => Err(SidecarError::Local(format!("moving the result to {}: {e}", dir.display()))),
+                }
+            }
+            (r, _) => r,
+        };
         match r {
             // finished by `poll` once the result is applied (or dropped)
             Ok((result, files)) => {
                 *lock(&prog.status) = format!("{} result file(s) ready; applying", files.len());
                 let bytes = files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
-                let extra_files = files.iter().map(|f| f.to_string_lossy().to_string()).collect();
-                let report =
-                    filmcraft_export::Report { path: req.out_dir.clone(), frames: 0, seconds: t0.elapsed().as_secs_f64(), bytes, render_fps: 0.0, extra_files };
+                let report = filmcraft_export::Report {
+                    path: String::new(),
+                    frames: 0,
+                    seconds: t0.elapsed().as_secs_f64(),
+                    bytes,
+                    render_fps: 0.0,
+                    extra_files: Vec::new(),
+                };
                 *lock(&out) = Some(Ready { result, files, report });
                 return;
             }
@@ -733,7 +770,7 @@ pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
     let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
     let (prog, res) = (job.progress.clone(), job.result.clone());
     s.jobs.push(job);
-    s.ai.jobs.push(PendingAi { job: id, kind, label: label.to_string(), fingerprint, out_dir: out_dir.clone(), outcome, context });
+    s.ai.jobs.push(PendingAi { job: id, kind, label: label.to_string(), fingerprint, out_dir: out_dir.clone(), outcome, context, media });
     if wait || cfg!(target_arch = "wasm32") {
         run();
         poll(s);
@@ -789,8 +826,8 @@ pub fn poll(s: &mut Session) {
             i += 1;
             continue;
         }
-        let pj = s.ai.jobs.remove(i);
-        let Some(ready) = lock(&pj.outcome).take() else { continue };
+        let mut pj = s.ai.jobs.remove(i);
+        let Some(mut ready) = lock(&pj.outcome).take() else { continue };
         let kept = format!("the result was not applied (kept in {})", pj.out_dir.display());
         let r = if cancelled {
             let m = format!("stopped; {kept}");
@@ -803,11 +840,16 @@ pub fn poll(s: &mut Session) {
             s.events.push(crate::Event::Toast { message, error: false });
             Err(m)
         } else {
+            relocate(s, &mut pj, &mut ready.files);
             match apply(s, &pj, &ready.result, &ready.files) {
                 Ok(()) => {
-                    // applied: anything the project uses was moved out ([`persist_media`]); the
+                    // applied: the project's media were moved out of it ([`JobSpec::media`]); the
                     // job folder is no longer needed
                     let _ = std::fs::remove_dir_all(&pj.out_dir);
+                    if let Some(dir) = &pj.media {
+                        ready.report.path = dir.to_string_lossy().to_string();
+                        ready.report.extra_files = ready.files.iter().map(|f| f.to_string_lossy().to_string()).collect();
+                    }
                     Ok(ready.report)
                 }
                 Err(e) => {
@@ -817,6 +859,10 @@ pub fn poll(s: &mut Session) {
                 }
             }
         };
+        // not applied: media files go back to the job folder in the cache
+        if r.is_err() {
+            unstage(s, &pj, ready.files);
+        }
         *lock(&job.progress.status) = match &r {
             Ok(_) => "Applied".into(),
             Err(e) => e.clone(),
@@ -826,58 +872,168 @@ pub fn poll(s: &mut Session) {
     }
 }
 
-/// Where results that become project media live (never pruned): next to the saved project as
-/// `<project name> AI Media/<feature>/<job>/`, or for an unsaved project
-/// `<data dir>/AI Media/<project id>/<feature>/<job>/`. (Saving an unsaved project later does not
-/// move them; they stay where they are and the project points there.)
-pub fn media_dir(s: &Session, pj: &PendingAi) -> PathBuf {
-    let job = pj.out_dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| format!("job-{}", pj.job));
-    let saved = s.path.as_deref().map(std::path::Path::new).and_then(|p| p.parent()).filter(|_| !cfg!(target_arch = "wasm32"));
-    let base = match saved {
-        Some(dir) => {
+/// Where results that become project media live (never pruned), for job folder `job` of a `kind`
+/// job: in Project Settings ▸ Scratch Disks ▸ Captured when that is set (and trusted), else next to
+/// the saved project, as `<project name> AI Media/<kind>/<job>/`; for an unsaved project
+/// `<scratch disk, or the data dir>/AI Media/<project id>/<kind>/<job>/`. (Saving an unsaved
+/// project later does not move them; they stay where they are and the project points there.)
+pub fn media_dir(s: &Session, kind: &str, job: &str, project: &str) -> PathBuf {
+    let path = s.path.as_deref().filter(|_| !cfg!(target_arch = "wasm32"));
+    let saved = path.map(Path::new).and_then(Path::parent).filter(|d| !d.as_os_str().is_empty());
+    let scratch = crate::project_tools::trusted_scratch(s.project.settings.scratch.captured.as_deref(), path, &s.prefs.auto_save.scratch_folders);
+    let base = match (scratch, saved) {
+        (scratch, Some(dir)) => {
             let name: String = s.project.name.chars().map(|c| if matches!(c, '/' | '\\' | ':' | '\0') { '_' } else { c }).collect();
-            dir.join(format!("{} AI Media", name.trim()))
+            scratch.unwrap_or_else(|| dir.to_path_buf()).join(format!("{} AI Media", name.trim()))
         }
-        None => {
-            let root = s.ai.media_root.clone().or_else(crate::autosave::default_data_dir).unwrap_or_else(crate::temp_dir);
-            root.join("AI Media").join(&pj.fingerprint.project)
+        (scratch, None) => {
+            let root = scratch.or_else(|| s.ai.media_root.clone()).or_else(crate::autosave::default_data_dir).unwrap_or_else(crate::temp_dir);
+            root.join("AI Media").join(project)
         }
     };
-    base.join(pj.kind).join(job)
+    base.join(kind).join(job)
 }
 
-fn move_file(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(from, to).or_else(|_| {
-        std::fs::copy(from, to)?;
-        std::fs::remove_file(from)
-    })
-}
-
-/// Apply a result whose `files` become project media: they are moved out of the cache into
-/// [`media_dir`] first, `steps(moved paths)` run as one undo step ([`apply_atomic`]), and if that
-/// fails the files go back to the cache.
-pub fn apply_with_media(s: &mut Session, pj: &PendingAi, label: &str, files: &[PathBuf], steps: impl FnOnce(Vec<PathBuf>) -> Vec<Step>) -> Result<()> {
-    let dir = media_dir(s, pj);
-    std::fs::create_dir_all(&dir).map_err(|e| EngineError::Other(format!("{}: {e}", dir.display())))?;
-    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for f in files {
-        let to = dir.join(f.file_name().ok_or_else(|| EngineError::Other(format!("{}: no file name", f.display())))?);
-        if let Err(e) = move_file(f, &to) {
-            for (from, to) in moved.iter().rev() {
-                let _ = move_file(to, from);
-            }
-            return Err(EngineError::Other(format!("moving {} to {}: {e}", f.display(), dir.display())));
+/// Copy `from` to a new file `to` in 8 MB pieces, telling `progress` the bytes copied so far;
+/// stops (an error) when `stop` says so.
+fn copy_file(from: &Path, to: &Path, stop: &dyn Fn() -> bool, progress: &mut dyn FnMut(u64)) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    let mut src = std::fs::File::open(from)?;
+    let mut dst = std::fs::OpenOptions::new().write(true).create_new(true).open(to)?;
+    let mut buf = vec![0u8; 8 << 20];
+    let mut done = 0u64;
+    loop {
+        if stop() {
+            return Err(std::io::Error::other("stopped"));
         }
+        let n = src.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        dst.write_all(buf.get(..n).unwrap_or_default())?;
+        done = done.saturating_add(n as u64);
+        progress(done);
+    }
+    dst.sync_all()
+}
+
+/// Move a file: a rename, or (another volume) a copy and then removing `from`. A copy that fails
+/// or stops removes what it wrote.
+fn move_file(from: &Path, to: &Path, stop: &dyn Fn() -> bool, progress: &mut dyn FnMut(u64)) -> std::io::Result<()> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    copy_and_remove(from, to, stop, progress)
+}
+
+/// [`move_file`] across volumes.
+fn copy_and_remove(from: &Path, to: &Path, stop: &dyn Fn() -> bool, progress: &mut dyn FnMut(u64)) -> std::io::Result<()> {
+    if let Err(e) = copy_file(from, to, stop, progress) {
+        let _ = std::fs::remove_file(to);
+        return Err(e);
+    }
+    // a source that cannot be removed stays in the cache, which is pruned
+    let _ = std::fs::remove_file(from);
+    Ok(())
+}
+
+/// Move `files` into the new folder `dir` (on a job's thread); `progress` gets the bytes copied
+/// across volumes so far. On failure everything moved goes back and `dir` is removed.
+fn stage(files: &[PathBuf], dir: &Path, stop: &dyn Fn() -> bool, progress: &mut dyn FnMut(u64)) -> std::io::Result<Vec<PathBuf>> {
+    std::fs::create_dir_all(dir)?;
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut before = 0u64;
+    let mut r = Ok(());
+    for f in files {
+        let Some(name) = f.file_name() else {
+            r = Err(std::io::Error::other(format!("{}: no file name", f.display())));
+            break;
+        };
+        let to = dir.join(name);
+        let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+        if let Err(e) = move_file(f, &to, stop, &mut |n| progress(before.saturating_add(n))) {
+            r = Err(e);
+            break;
+        }
+        before = before.saturating_add(size);
         moved.push((f.clone(), to));
     }
-    let r = apply_atomic(s, label, steps(moved.iter().map(|(_, to)| to.clone()).collect()));
-    if r.is_err() {
-        for (from, to) in moved.iter().rev() {
-            let _ = move_file(to, from);
+    match r {
+        Ok(()) => Ok(moved.into_iter().map(|(_, to)| to).collect()),
+        Err(e) => {
+            for (from, to) in moved.iter().rev() {
+                let _ = move_file(to, from, &|| false, &mut |_| {});
+            }
+            remove_media_dir(dir);
+            Err(e)
         }
-        let _ = std::fs::remove_dir(&dir);
     }
-    r
+}
+
+/// Remove a job's media folder and its `<kind>` and base folder ([`media_dir`]) when they are empty.
+fn remove_media_dir(dir: &Path) {
+    for d in dir.ancestors().take(3) {
+        match std::fs::remove_dir(d) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => break,
+            _ => {}
+        }
+    }
+}
+
+/// The project was saved elsewhere since the job started: move its media folder to the new place
+/// when that is a rename (same volume); otherwise they stay where they are, which is logged.
+fn relocate(s: &mut Session, pj: &mut PendingAi, files: &mut [PathBuf]) {
+    let Some(dir) = pj.media.clone() else { return };
+    let job = pj.out_dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let now = media_dir(s, pj.kind, &job, &pj.fingerprint.project);
+    if now == dir {
+        return;
+    }
+    let moved = now.parent().is_some_and(|p| std::fs::create_dir_all(p).is_ok()) && std::fs::rename(&dir, &now).is_ok();
+    if !moved {
+        s.log.push(crate::panels::Level::Info, "ai", format!("{}: the result stays in {}", pj.label, dir.display()));
+        return;
+    }
+    remove_media_dir(&dir);
+    for f in files.iter_mut() {
+        if let Ok(rest) = f.strip_prefix(&dir) {
+            *f = now.join(rest);
+        }
+    }
+    pj.media = Some(now);
+}
+
+/// A media result that is not applied goes back to the job folder in the cache (pruned like any
+/// other result), on a worker thread in a host that must not block, and its media folder is
+/// removed.
+fn unstage(s: &Session, pj: &PendingAi, files: Vec<PathBuf>) {
+    let Some(dir) = pj.media.clone() else { return };
+    let cache = pj.out_dir.clone();
+    let back = move || {
+        for f in files.iter().filter(|f| f.starts_with(&dir)) {
+            if let Some(name) = f.file_name() {
+                let _ = move_file(f, &cache.join(name), &|| false, &mut |_| {});
+            }
+        }
+        remove_media_dir(&dir);
+    };
+    if s.ai.background && !cfg!(target_arch = "wasm32") {
+        // no worker: the files stay in the media folder
+        let _ = std::thread::Builder::new().name("filmcraft-ai-unstage".into()).spawn(back);
+    } else {
+        back();
+    }
+}
+
+/// Apply a result whose `files` become project media. The job's thread has moved them into
+/// [`PendingAi::media`] ([`JobSpec::media`]); `steps(paths)` run as one undo step
+/// ([`apply_atomic`]). If that fails, [`poll`] moves the files back to the cache.
+pub fn apply_with_media(s: &mut Session, pj: &PendingAi, label: &str, files: &[PathBuf], steps: impl FnOnce(Vec<PathBuf>) -> Vec<Step>) -> Result<()> {
+    let dir = pj.media.as_deref().ok_or_else(|| EngineError::Other(format!("{label}: the result was not moved to the project's AI media folder")))?;
+    if let Some(f) = files.iter().find(|f| !f.starts_with(dir)) {
+        return Err(EngineError::Other(format!("{} is not in {}", f.display(), dir.display())));
+    }
+    apply_atomic(s, label, steps(files.to_vec()))
 }
 
 /// One step of applying a result.
@@ -913,7 +1069,8 @@ fn echo(s: &mut Session, p: &Value) -> Result<Value> {
             params[k] = json!(n);
         }
     }
-    let spec = JobSpec { kind: "echo", label: "AI Echo", clips: &clips, params, context: Value::Null, timeout: None, prepare: None, loose: false };
+    let spec =
+        JobSpec { kind: "echo", label: "AI Echo", clips: &clips, params, context: Value::Null, timeout: None, prepare: None, loose: false, media: false };
     start_job(s, spec, bool_p(p, "wait").unwrap_or(false))
 }
 
