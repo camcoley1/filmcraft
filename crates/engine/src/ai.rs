@@ -6,9 +6,10 @@
 //! | `ai.connect {port=9877}` | Clip ▸ AI | connects to the helper on another port |
 //! | `ai.reframe` | Clip ▸ AI | M6a: [`reframe`] |
 //! | `ai.stems` | Clip ▸ AI | M6b: [`stems`] |
-//! | `ai.enhanceSpeech` `ai.upscale` `ai.interpolate` | Clip ▸ AI | M6c to M6f |
+//! | `ai.enhanceSpeech` | Clip ▸ AI | M6c: [`enhance`] |
+//! | `ai.upscale` `ai.interpolate` | Clip ▸ AI | M6f |
 //! | `ai.generativeExtend` | Clip ▸ AI | M8f, in [`crate::ai_extend`] |
-//! | `ai.beatGrid` `ai.musicFit` | Sequence ▸ AI | M6d |
+//! | `ai.beatGrid` `ai.musicFit` | Sequence ▸ AI | M6d: [`beats`] |
 //! | `ai.indexProject` `ai.search {query}` | Clip ▸ AI / (Project panel search) | M6e, in [`crate::ai_search`] |
 //! | `ai.echo` | (none) | the protocol test kind |
 //!
@@ -250,7 +251,6 @@ pub(crate) fn helper_ready(s: &Session, feature: &str) -> std::result::Result<()
 #[derive(Clone, Copy)]
 enum Needs {
     Clips,
-    Sequence,
 }
 
 fn feature_enabled(s: &Session, feature: &str, milestone: &str, needs: Needs) -> std::result::Result<(), String> {
@@ -262,7 +262,6 @@ fn feature_enabled(s: &Session, feature: &str, milestone: &str, needs: Needs) ->
                 return Err("select a clip in the timeline".into());
             }
         }
-        Needs::Sequence => has_seq(s)?,
     }
     Err(format!("not built yet (arrives in {milestone})"))
 }
@@ -305,15 +304,16 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             run: reframe::run,
             journal: true,
         },
-        feature!(
-            "ai.enhanceSpeech",
-            "Enhance Speech…",
-            ["Clip", "AI"],
-            "enhanceSpeech",
-            "M6c",
-            Needs::Clips,
-            r#"{"clips":[id]?,"strength":0..1=1,"wait":bool=false}"#
-        ),
+        CommandSpec {
+            id: "ai.enhanceSpeech",
+            label: "Enhance Speech…",
+            menu: &["Clip", "AI"],
+            shortcut: None,
+            params: enhance::PARAMS,
+            enabled: enhance::enabled,
+            run: enhance::run,
+            journal: true,
+        },
         CommandSpec {
             id: "ai.stems",
             label: "Extract Stems…",
@@ -334,16 +334,26 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             Needs::Clips,
             r#"{"clips":[id]?,"factor":2|4=2,"wait":bool=false}"#
         ),
-        feature!("ai.beatGrid", "Add Beat Markers", ["Sequence", "AI"], "beatGrid", "M6d", Needs::Clips, r#"{"clips":[id]?,"wait":bool=false}"#),
-        feature!(
-            "ai.musicFit",
-            "Fit Music to Length…",
-            ["Sequence", "AI"],
-            "musicFit",
-            "M6d",
-            Needs::Sequence,
-            r#"{"clip":id?,"seconds":f?,"duck":bool=true}"#
-        ),
+        CommandSpec {
+            id: "ai.beatGrid",
+            label: "Add Beat Markers",
+            menu: &["Sequence", "AI"],
+            shortcut: None,
+            params: beats::GRID_PARAMS,
+            enabled: beats::grid_enabled,
+            run: beats::run_grid,
+            journal: true,
+        },
+        CommandSpec {
+            id: "ai.musicFit",
+            label: "Fit Music to Length…",
+            menu: &["Sequence", "AI"],
+            shortcut: None,
+            params: beats::FIT_PARAMS,
+            enabled: beats::fit_enabled,
+            run: beats::run_fit,
+            journal: true,
+        },
         CommandSpec {
             id: "ai.echo",
             label: "AI Helper Echo Test",
@@ -1085,6 +1095,8 @@ fn apply(s: &mut Session, pj: &PendingAi, result: &JobResult, files: &[PathBuf])
         "reframe" => reframe::apply(s, pj, files),
         "stems" => stems::apply(s, pj, files),
         "generativeExtend" => crate::ai_extend::apply(s, pj, result, files),
+        "enhance" => enhance::apply(s, pj, files),
+        "beats" => beats::apply(s, pj, files),
         k => Err(EngineError::Other(format!("results of `{k}` jobs cannot be applied yet"))),
     }
 }
@@ -1149,6 +1161,12 @@ fn apply_echo(s: &mut Session, fp: &Fingerprint, result: &JobResult, files: &[Pa
     apply_atomic(s, "AI Echo", vec![mark, note])
 }
 
+#[path = "ai_audio.rs"]
+pub(crate) mod audio;
+#[path = "ai_beats.rs"]
+pub mod beats;
+#[path = "ai_enhance.rs"]
+pub mod enhance;
 #[path = "ai_reframe.rs"]
 pub mod reframe;
 #[path = "ai_stems.rs"]
