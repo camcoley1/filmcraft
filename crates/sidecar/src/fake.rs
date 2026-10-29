@@ -57,6 +57,8 @@ pub struct Script {
     pub die_at_poll: Option<u32>,
     /// Requests must carry this token (`None`: any or none).
     pub token: Option<String>,
+    /// The `hello` reply waits this long (a busy helper).
+    pub hello_delay: Duration,
 }
 
 impl Default for Script {
@@ -70,12 +72,14 @@ impl Default for Script {
             malformed: Malformed::None,
             die_at_poll: None,
             token: None,
+            hello_delay: Duration::ZERO,
         }
     }
 }
 
 #[derive(Default)]
 struct State {
+    hellos: u32,
     started: Vec<JobRequest>,
     polls: u32,
     cancelled: Vec<String>,
@@ -121,6 +125,11 @@ impl FakeHelper {
 
     pub fn started(&self) -> Vec<JobRequest> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner).started.clone()
+    }
+
+    /// How many `hello` requests arrived.
+    pub fn hellos(&self) -> u32 {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).hellos
     }
 
     pub fn cancelled(&self) -> Vec<String> {
@@ -175,8 +184,12 @@ fn serve(s: TcpStream, script: &Script, state: &Mutex<State>, stop: &AtomicBool)
 
 /// The reply line; None = drop the connection without one.
 fn reply(req: &Value, script: &Script, state: &Mutex<State>, stop: &AtomicBool) -> Option<String> {
-    let mut st = state.lock().unwrap_or_else(PoisonError::into_inner);
     let op = req["op"].as_str().unwrap_or("");
+    if op == "hello" {
+        state.lock().unwrap_or_else(PoisonError::into_inner).hellos += 1;
+        std::thread::sleep(script.hello_delay);
+    }
+    let mut st = state.lock().unwrap_or_else(PoisonError::into_inner);
     let v = match op {
         "hello" if script.malformed == Malformed::Hello => return Some("{not json".into()),
         "hello" => json!({"type": "hello", "protocol": script.protocol, "version": script.version, "features": script.features}),

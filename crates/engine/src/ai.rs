@@ -94,6 +94,13 @@ impl Default for AiState {
 pub struct Probe {
     result: Arc<Mutex<Option<std::result::Result<Hello, String>>>>,
     announce: bool,
+    /// The client being asked: when `ai.connect` has installed another one meanwhile, the answer
+    /// is stale and the new client is asked next (one probe in flight at a time).
+    client: Arc<dyn SidecarClient>,
+}
+
+fn same_client(a: &Arc<dyn SidecarClient>, b: &Arc<dyn SidecarClient>) -> bool {
+    std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b))
 }
 
 /// What a target clip was when its job started.
@@ -197,6 +204,7 @@ fn helper_ready(s: &Session, feature: &str) -> std::result::Result<(), String> {
         return Err(NOT_CONNECTED.into());
     }
     match &s.ai.hello {
+        None if s.ai.probe.is_some() => Err("contacting the AI helper…".into()),
         None => Err(NOT_CONNECTED.into()),
         Some(Err(why)) => Err(why.clone()),
         Some(Ok(h)) if !h.has(feature) => Err(format!("the AI helper (version {}) does not provide `{feature}` yet", h.version)),
@@ -348,18 +356,21 @@ pub fn refresh(s: &mut Session, announce: bool) {
         s.ai.hello = Some(handshake(&*client));
         return;
     }
+    // one probe at a time: a probe of an older client is left to finish, its answer is dropped
+    // and this client is asked then ([`poll_probe`])
     if let Some(p) = s.ai.probe.as_mut() {
         p.announce |= announce;
         return;
     }
     let result: Arc<Mutex<Option<std::result::Result<Hello, String>>>> = Arc::default();
     let out = result.clone();
+    let probed = client.clone();
     let run = move || {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handshake(&*client)));
         *lock(&out) = Some(r.unwrap_or_else(|_| Err("internal error while contacting the AI helper (see the crash log)".into())));
     };
     match std::thread::Builder::new().name("filmcraft-ai-probe".into()).spawn(run) {
-        Ok(_) => s.ai.probe = Some(Probe { result, announce }),
+        Ok(_) => s.ai.probe = Some(Probe { result, announce, client: probed }),
         Err(e) => s.ai.hello = Some(Err(format!("cannot contact the AI helper: {e}"))),
     }
 }
@@ -377,7 +388,13 @@ fn poll_probe(s: &mut Session) {
     let Some(p) = &s.ai.probe else { return };
     let Some(r) = lock(&p.result).take() else { return };
     let announce = p.announce;
+    let current = s.sidecar.as_ref().is_some_and(|c| same_client(c, &p.client));
     s.ai.probe = None;
+    if !current {
+        // answered for a client `ai.connect` has replaced: ask the current one instead
+        refresh(s, announce);
+        return;
+    }
     if announce {
         match &r {
             Ok(h) => s.toast(format!("AI helper connected (version {})", h.version)),
@@ -426,8 +443,10 @@ fn connect(s: &mut Session, p: &Value) -> Result<Value> {
         let port = port.as_u64().and_then(|n| u16::try_from(n).ok()).filter(|n| *n > 0);
         s.ai.port = port.ok_or_else(|| bad("ai.connect", "`port` must be 1..65535"))?;
     }
+    // a new client and no capabilities until it answers; a probe still in flight is for the old
+    // client, so its answer will be dropped ([`poll_probe`])
     s.sidecar = None;
-    s.ai.probe = None;
+    s.ai.hello = None;
     refresh(s, true);
     match &s.ai.hello {
         Some(Err(e)) if s.ai.probe.is_none() => Err(EngineError::Other(e.clone())),

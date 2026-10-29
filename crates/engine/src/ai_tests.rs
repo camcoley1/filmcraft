@@ -574,3 +574,38 @@ fn the_heartbeat_ends_with_the_job() {
     let dir = PathBuf::from(r["outDir"].as_str().unwrap());
     assert!(dir.join("echo.json").exists() && !dir.join(super::HEARTBEAT).exists());
 }
+
+/// Reconnecting while a probe is in flight: one probe at a time, the old client's answer is
+/// dropped, and no old capabilities show for the new connection.
+#[test]
+fn repeated_connects_keep_one_probe_and_no_stale_capabilities() {
+    let mut f = fixture("reconnect", Script::default());
+    f.s.ai.background = true;
+    let slow =
+        FakeHelper::start(Script { features: vec!["echo".into(), "reframe".into()], hello_delay: Duration::from_millis(400), ..Default::default() }).unwrap();
+    let fast = FakeHelper::start(Script { features: vec!["echo".into()], ..Default::default() }).unwrap();
+    f.s.execute("ai.connect", json!({"port": slow.port()})).unwrap();
+    assert!(f.s.ai.hello.is_none(), "the old capabilities are dropped at once");
+    assert_eq!(reason(&f.s, "ai.echo"), "contacting the AI helper…");
+    for _ in 0..3 {
+        f.s.execute("ai.connect", json!({"port": fast.port()})).unwrap();
+        assert!(f.s.ai.hello.is_none());
+    }
+    let t0 = std::time::Instant::now();
+    while f.s.ai.probe.is_some() || f.s.ai.hello.is_none() {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the probes never settled");
+        std::thread::sleep(Duration::from_millis(10));
+        super::poll(&mut f.s);
+    }
+    let st = f.s.execute("ai.status", json!({})).unwrap();
+    // `ai.status` in background mode probes again; settle that one too
+    while f.s.ai.probe.is_some() {
+        std::thread::sleep(Duration::from_millis(10));
+        super::poll(&mut f.s);
+    }
+    assert_eq!(f.s.ai.port, fast.port());
+    assert_eq!(f.s.ai.hello.as_ref().unwrap().as_ref().unwrap().features, ["echo"], "{st}");
+    assert!(reason(&f.s, "ai.reframe").contains("does not provide `reframe`"), "the slow helper's reframe never shows");
+    assert_eq!(slow.hellos(), 1);
+    assert_eq!(fast.hellos(), 2, "one probe after the slow one, one for ai.status: never one per connect");
+}
