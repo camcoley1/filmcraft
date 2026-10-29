@@ -284,11 +284,46 @@ fn v15_caption_track_loads_and_resaves_intact() {
     let out = encode(p, false);
     let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(v["schema_version"], schema_for(p));
-    assert_eq!(SCHEMA_VERSION, 17);
+    assert_eq!(SCHEMA_VERSION, 18);
     assert!(p.id.is_empty(), "an old project has no id until its first AI job");
     let again = decode(&out).unwrap();
     assert!(!again.migrated());
     assert_eq!(&again.project, p);
     let resaved = String::from_utf8(out).unwrap();
     assert!(!resaved.contains("\"words\"") && !resaved.contains("\"animation\""));
+}
+
+/// Lumetri node graphs (schema v18): a project whose Lumetri has no graph (every older project)
+/// is still written as v16 and reads as a single node; one with a graph is written as v18 and
+/// keeps every node and version.
+#[test]
+fn lumetri_graphs_are_v18_and_older_lumetri_stays_one_node() {
+    use filmcraft_project::{ParamValue, color_graph, find_effect};
+    let mut p = decode(&fixture("v8-subclip.fcproj")).unwrap().project;
+    let mut lumetri = find_effect("lumetri").unwrap().instance();
+    lumetri.param_mut("exposure").unwrap().value = ParamValue::Float(0.6);
+    p.sequence_mut(ItemId(21)).unwrap().video_tracks[0].items[0].effects.push(lumetri);
+    // no graph: v16, a single node of the effect's own parameters
+    let old = encode(&p, false);
+    let v: serde_json::Value = serde_json::from_slice(&old).unwrap();
+    assert_eq!(v["schema_version"], 16);
+    let effect = &v["project"]["items"]["21"]["kind"]["Sequence"]["video_tracks"][0]["items"][0]["effects"];
+    assert!(effect.as_array().is_some_and(|a| a.iter().any(|e| e["effect"] == "lumetri" && e.get("color").is_none())), "no graph written: {effect}");
+    let back = decode(&old).unwrap().project;
+    let e = back.sequence(ItemId(21)).unwrap().video_tracks[0].items[0].effects.iter().find(|e| e.effect == "lumetri").unwrap();
+    assert!(e.color.is_none() && color_graph::is_single(e));
+    let nodes = color_graph::active_nodes(e);
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].params.get("exposure").and_then(|x| x.value.as_f64()), Some(0.6));
+    // a graph: v18, lossless
+    let clip = &mut p.sequence_mut(ItemId(21)).unwrap().video_tracks[0].items[0];
+    let e = clip.effects.iter_mut().find(|e| e.effect == "lumetri").unwrap();
+    color_graph::add_node(e, None, "warm").unwrap();
+    color_graph::set_mix(e, 1, 0.4).unwrap();
+    color_graph::add_version(e, None, true).unwrap();
+    assert!(p.has_color_graphs());
+    assert_eq!(schema_for(&p), 18);
+    let again = decode(&encode(&p, true)).unwrap();
+    assert_eq!(again.schema_version, 18);
+    assert_eq!(again.project, p);
 }

@@ -39,6 +39,7 @@ impl LumetriPreset {
                 post_fader: false,
                 essential: false,
                 layer: None,
+                color: None,
             },
         };
         for (k, v) in &self.params {

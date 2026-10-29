@@ -45,6 +45,9 @@
 //!   (older files have none and get one on their first AI job); older builds would drop it. A
 //!   project without an id is still written as v16 ([`schema_for`]), so builds without AI features
 //!   write exactly what they wrote before and older builds keep opening those files.
+//! - **v18** (M8d): Lumetri node graphs and grade versions (`EffectInstance::color`). No-op step
+//!   (older files have none: one node, as before). Like v17, only a project that has a graph is
+//!   written as v18 ([`schema_for`]); older builds would drop the other nodes and versions.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
@@ -67,7 +70,7 @@ pub type Migration = fn(Value) -> Result<Value, String>;
 /// edit a shipped one.
 pub const MIGRATIONS: &[Migration] = &[
     v1_to_v2, v2_to_v3, v3_to_v4, v4_to_v5, v5_to_v6, v6_to_v7, v7_to_v8, v8_to_v9, v9_to_v10, v10_to_v11, v11_to_v12, v12_to_v13, v13_to_v14, v14_to_v15,
-    v15_to_v16, v16_to_v17,
+    v15_to_v16, v16_to_v17, v17_to_v18,
 ];
 
 /// The schema version this build writes (and the newest it reads).
@@ -76,10 +79,23 @@ pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32 + 1;
 /// The schema that introduced `Project::id`.
 pub const PROJECT_ID_SCHEMA: u32 = 17;
 
-/// The schema `project` is written in: the current one, except that a project without an id (no
-/// AI job yet) is written as v16 while v17 (the id) is the newest schema: nothing in it needs v17.
+/// The schema that introduced Lumetri node graphs (`EffectInstance::color`).
+pub const COLOR_GRAPH_SCHEMA: u32 = 18;
+
+/// The schema `project` is written in: the oldest that holds everything in it, so builds without
+/// the newer features keep opening files that do not use them. v18 for a project with a Lumetri
+/// node graph, v17 for one with an id (an AI job ran), v16 otherwise.
 pub fn schema_for(project: &Project) -> u32 {
-    if SCHEMA_VERSION == PROJECT_ID_SCHEMA && project.id.is_empty() { PROJECT_ID_SCHEMA - 1 } else { SCHEMA_VERSION }
+    if SCHEMA_VERSION != COLOR_GRAPH_SCHEMA {
+        return SCHEMA_VERSION;
+    }
+    if project.has_color_graphs() {
+        COLOR_GRAPH_SCHEMA
+    } else if !project.id.is_empty() {
+        PROJECT_ID_SCHEMA
+    } else {
+        PROJECT_ID_SCHEMA - 1
+    }
 }
 
 /// Oldest schema this build can still upgrade.
@@ -389,13 +405,17 @@ fn v16_to_v17(doc: Value) -> Result<Value, String> {
     Ok(doc)
 }
 
+fn v17_to_v18(doc: Value) -> Result<Value, String> {
+    Ok(doc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn schema_version_matches_table() {
-        assert_eq!(SCHEMA_VERSION, 17);
+        assert_eq!(SCHEMA_VERSION, 18);
     }
 
     #[test]

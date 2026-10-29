@@ -10,6 +10,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
 pub mod caption;
+pub mod color_graph;
 pub mod effect;
 pub mod essential;
 pub mod find;
@@ -1449,6 +1450,13 @@ impl Project {
     }
     pub fn sequences(&self) -> impl Iterator<Item = &ProjectItem> {
         self.items.values().filter(|i| matches!(i.kind, ItemKind::Sequence(_)))
+    }
+
+    /// Whether any clip's Lumetri holds a node graph (schema v18).
+    pub fn has_color_graphs(&self) -> bool {
+        self.sequences()
+            .filter_map(ProjectItem::as_sequence)
+            .any(|s| s.video_tracks.iter().chain(&s.audio_tracks).flat_map(|t| &t.items).any(|it| it.effects.iter().any(|e| e.color.is_some())))
     }
 
     /// The part of a nested-sequence clip's timeline range that lies past the end of the nested

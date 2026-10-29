@@ -97,6 +97,7 @@ impl EffectDef {
             post_fader: false,
             essential: false,
             layer: None,
+            color: None,
         }
     }
 }
@@ -118,6 +119,10 @@ pub struct EffectInstance {
     /// ([`crate::graphic_design::LayerExtra`]). Schema v12.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layer: Option<Box<crate::graphic_design::LayerExtra>>,
+    /// Lumetri Color only: its node graph and grade versions ([`crate::color_graph`]; the
+    /// instance's own `params` are the selected node's). Schema v18.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<Box<crate::color_graph::ColorGraph>>,
 }
 
 impl EffectInstance {
