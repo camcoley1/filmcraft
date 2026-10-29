@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use filmcraft_project::{ItemId, ItemKind, Transcript};
 use filmcraft_speech::SAMPLE_RATE;
-use filmcraft_speech::diarize::{Params, diarize};
+use filmcraft_speech::diarize::{Params, diarize_with};
 use serde_json::{Value, json};
 
 use crate::commands::{CommandSpec, bad, bool_p, f64_p, u64_p};
@@ -53,25 +53,50 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The transcript to label: `item`, else the media of the selected clips, else the only transcript.
+/// The media items whose transcripts a nested or multi-camera clip plays, first the one that gives
+/// the most words.
+fn nested_media(s: &Session, nested: ItemId) -> Vec<ItemId> {
+    let Some(seq) = s.project.sequence(nested) else { return Vec::new() };
+    let mut count: Vec<(ItemId, usize)> = Vec::new();
+    for w in filmcraft_edit::transcript::sequence_words_nested(seq, &s.project.transcripts, &|id| s.project.sequence(id)) {
+        match count.iter_mut().find(|c| c.0 == w.item) {
+            Some(c) => c.1 += 1,
+            None => count.push((w.item, 1)),
+        }
+    }
+    count.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    count.into_iter().map(|c| c.0).collect()
+}
+
+/// The transcript to label: `item`, else the transcribed audio of a selected multi-camera or
+/// nested clip, else the media of the selection, else the only transcript.
 fn target(s: &Session, p: &Value) -> Result<ItemId> {
     let cmd = "transcript.diarize";
     let media = |i: ItemId| s.project.resolve_media(i).map(|(root, _, _)| root);
+    let has = |m: &ItemId| s.project.transcripts.get(m).is_some_and(|t| !t.words.is_empty());
     if let Some(i) = u64_p(p, "item") {
         let m = media(ItemId(i)).ok_or_else(|| bad(cmd, "no such media item"))?;
-        return if s.project.transcripts.get(&m).is_some_and(|t| !t.words.is_empty()) { Ok(m) } else { Err(bad(cmd, "that item has no transcript")) };
+        return if has(&m) { Ok(m) } else { Err(bad(cmd, "that item has no transcript")) };
     }
-    let q = s.active_sequence();
-    let selected = q.into_iter().flat_map(|q| s.state.selection.iter().filter_map(move |c| q.find_item(*c).map(|x| x.1.item)));
-    let candidates: Vec<ItemId> = s.state.project_selection.iter().copied().chain(selected).filter_map(media).collect();
-    if let Some(m) = candidates.into_iter().find(|m| s.project.transcripts.get(m).is_some_and(|t| !t.words.is_empty())) {
+    let clip_items: Vec<ItemId> =
+        s.active_sequence().into_iter().flat_map(|q| s.state.selection.iter().filter_map(move |c| q.find_item(*c).map(|x| x.1.item))).collect();
+    // a selected multi-camera or nested clip: the audio it plays
+    for item in &clip_items {
+        if s.project.sequence(*item).is_some()
+            && let Some(m) = nested_media(s, *item).into_iter().find(has)
+        {
+            return Ok(m);
+        }
+    }
+    let candidates: Vec<ItemId> = s.state.project_selection.iter().copied().chain(clip_items).filter_map(media).collect();
+    if let Some(m) = candidates.into_iter().find(has) {
         return Ok(m);
     }
     let all: Vec<ItemId> = s.project.transcripts.iter().filter(|(_, t)| !t.words.is_empty()).map(|(i, _)| *i).collect();
     match all.as_slice() {
         [one] => Ok(*one),
         [] => Err(bad(cmd, "there is no transcript to label (Transcribe first)")),
-        _ => Err(bad(cmd, "several items have transcripts: pass `item`")),
+        _ => Err(bad(cmd, "several items have transcripts: select the clip or media whose speakers to label, or pass `item`")),
     }
 }
 
@@ -101,8 +126,7 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
         }
         params.threshold = t.clamp(0.05, 2.0) as f32;
     }
-    let chunk = CHUNK_SECONDS * SAMPLE_RATE as i64;
-    let steps = (len + chunk - 1) / chunk.max(1) + 1;
+    let steps = (len + CHUNK - 1) / CHUNK + 1;
     let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
     let name = s.project.item(item).map(|i| i.name.clone()).unwrap_or_default();
     let job = crate::Job { id, label: format!("Label Speakers ({name})"), progress: Default::default(), result: Default::default() };
@@ -112,47 +136,19 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let work = move || {
         use std::sync::atomic::Ordering;
         let t0 = web_time::Instant::now();
-        let mut audio: Vec<f32> = Vec::with_capacity(len.max(0) as usize);
-        let mut err = None;
-        let mut start = 0i64;
-        while start < len && err.is_none() {
-            if prog.cancel.load(Ordering::Relaxed) {
-                err = Some("stopped".to_string());
-                break;
-            }
-            let frames = chunk.min(len - start) as usize;
-            match src.audio(start, frames, SAMPLE_RATE) {
-                Ok(buf) => {
-                    let mut mono = filmcraft_speech::downmix(&buf.channels);
-                    mono.resize(frames, 0.0);
-                    audio.extend(mono);
-                }
-                Err(e) => err = Some(format!("can't decode audio at {} s: {e}", start / SAMPLE_RATE as i64)),
-            }
-            start += chunk;
-            prog.done.store((start / chunk).max(0) as u64, Ordering::Relaxed);
-            *lock(&prog.status) = format!("Decoding audio: {} of {} s", (start.min(len)) / SAMPLE_RATE as i64, len / SAMPLE_RATE as i64);
-        }
-        let mut speakers = 0;
-        if err.is_none() && prog.cancel.load(Ordering::Relaxed) {
-            err = Some("stopped".to_string());
-        }
-        if err.is_none() {
-            *lock(&prog.status) = "Clustering voices".into();
-            let mut t = (*base_run).clone();
-            speakers = diarize(&audio, &mut t, &params);
-            *lock(&out) = Some(t);
-            prog.done.store(prog.total.load(Ordering::Relaxed), Ordering::Relaxed);
-        }
+        let r = label(&*src, len, &base_run, &params, &prog);
         let secs = t0.elapsed().as_secs_f64();
-        *lock(&prog.status) = match &err {
-            Some(e) if e == "stopped" => "Stopped: nothing was changed".into(),
-            Some(e) => e.clone(),
-            None => format!("Found {speakers} speaker(s) ({secs:.1}s)"),
+        *lock(&prog.status) = match &r {
+            Ok((_, n)) => format!("Found {n} speaker(s) ({secs:.1}s)"),
+            Err(e) if e == "stopped" => "Stopped: nothing was changed".into(),
+            Err(e) => e.clone(),
         };
-        let r = match err {
-            Some(e) => Err(e),
-            None => Ok(filmcraft_export::Report { path: String::new(), frames: 0, seconds: secs, bytes: 0, render_fps: 0.0, extra_files: Vec::new() }),
+        let r = match r {
+            Ok((t, _)) => {
+                *lock(&out) = Some(t);
+                Ok(filmcraft_export::Report { path: String::new(), frames: 0, seconds: secs, bytes: 0, render_fps: 0.0, extra_files: Vec::new() })
+            }
+            Err(e) => Err(e),
         };
         *lock(&res) = Some(r);
         prog.finished.store(true, Ordering::Relaxed);
@@ -170,10 +166,75 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             return Err(EngineError::Other(e));
         }
         out["speakers"] = json!(speakers);
-    } else {
-        std::thread::Builder::new().name("filmcraft-diarize".into()).spawn(work).map_err(|e| EngineError::Other(e.to_string()))?;
+    } else if let Err(e) = spawn_worker(work) {
+        // no thread: the job never ran, so it must not stay registered as pending
+        s.diarize_jobs.retain(|j| j.job != id);
+        s.jobs.retain(|j| j.id != id);
+        return Err(EngineError::Other(format!("can't start the Label Speakers job: {e}")));
     }
     Ok(out)
+}
+
+/// Start `work` on a thread of its own.
+fn spawn_worker(work: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+    SPAWN.with(|hook| match hook.get() {
+        Some(fail) if fail => Err(std::io::Error::other("test: thread limit")),
+        _ => std::thread::Builder::new().name("filmcraft-diarize".into()).spawn(work).map(|_| ()),
+    })
+}
+
+thread_local! {
+    /// Test hook: make [`spawn_worker`] fail on this thread.
+    static SPAWN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Make [`spawn_worker`] fail on this thread (tests of the thread-limit path).
+#[cfg(test)]
+pub(crate) fn fail_spawns(on: bool) {
+    SPAWN.with(|c| c.set(Some(on)));
+}
+
+/// Samples of 16 kHz audio decoded per step (progress and cancel points).
+const CHUNK: i64 = CHUNK_SECONDS * SAMPLE_RATE as i64;
+
+/// `len` samples of `src` as mono 16 kHz, read in chunks (progress and cancel between them).
+pub(crate) fn decode_chunked(src: &dyn filmcraft_media::MediaSource, len: i64, prog: &filmcraft_export::Progress) -> std::result::Result<Vec<f32>, String> {
+    use std::sync::atomic::Ordering;
+    let mut audio: Vec<f32> = Vec::with_capacity(len.max(0) as usize);
+    let mut start = 0i64;
+    while start < len {
+        if prog.cancel.load(Ordering::Relaxed) {
+            return Err("stopped".into());
+        }
+        let frames = CHUNK.min(len - start) as usize;
+        let buf = src.audio(start, frames, SAMPLE_RATE).map_err(|e| format!("can't decode audio at {} s: {e}", start / SAMPLE_RATE as i64))?;
+        let mut mono = filmcraft_speech::downmix(&buf.channels);
+        mono.resize(frames, 0.0);
+        audio.extend(mono);
+        start += CHUNK;
+        prog.done.store((start / CHUNK).max(0) as u64, Ordering::Relaxed);
+        *lock(&prog.status) = format!("Decoding audio: {} of {} s", start.min(len) / SAMPLE_RATE as i64, len / SAMPLE_RATE as i64);
+    }
+    Ok(audio)
+}
+
+/// Decode `len` samples of `src` and label the speakers of a copy of `base`. `Err("stopped")`
+/// when the job was cancelled; other errors are messages.
+pub(crate) fn label(
+    src: &dyn filmcraft_media::MediaSource,
+    len: i64,
+    base: &Transcript,
+    params: &Params,
+    prog: &filmcraft_export::Progress,
+) -> std::result::Result<(Transcript, usize), String> {
+    use std::sync::atomic::Ordering;
+    let cancelled = || prog.cancel.load(Ordering::Relaxed);
+    let audio = decode_chunked(src, len, prog)?;
+    *lock(&prog.status) = "Clustering voices".into();
+    let mut t = base.clone();
+    let n = diarize_with(&audio, &mut t, params, &cancelled).ok_or_else(|| "stopped".to_string())?;
+    prog.done.store(prog.total.load(Ordering::Relaxed), Ordering::Relaxed);
+    Ok((t, n))
 }
 
 /// Apply finished jobs (one undo step each) and drop finished / cancelled ones. Called once per UI

@@ -108,7 +108,7 @@ fn targets(s: &Session, p: &Value) -> Vec<ItemId> {
 }
 
 /// Mono 16 kHz audio of a media item (None: no audio).
-fn item_audio(s: &Session, item: ItemId) -> Option<Vec<f32>> {
+pub(crate) fn item_audio(s: &Session, item: ItemId) -> Option<Vec<f32>> {
     let dur = match &s.project.item(item)?.kind {
         ItemKind::Media(m) => m.duration(),
         _ => return None,
