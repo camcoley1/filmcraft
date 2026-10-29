@@ -15,6 +15,8 @@ pub mod aaf_omf;
 pub mod ai;
 #[cfg(feature = "sidecar")]
 pub mod ai_extend;
+#[cfg(feature = "sidecar")]
+pub mod ai_search;
 pub mod autosave;
 pub mod captions;
 pub mod clip_ops;
@@ -51,6 +53,7 @@ pub mod relink;
 pub mod remix;
 pub mod scene_detect;
 pub mod scopes;
+pub mod search_results;
 pub mod sequence_extras;
 pub mod sequence_tools;
 pub mod settings;
@@ -502,6 +505,11 @@ pub struct Session {
     /// The AI helper handshake and the AI jobs in flight.
     #[cfg(feature = "sidecar")]
     pub ai: ai::AiState,
+    /// AI search jobs in flight.
+    #[cfg(feature = "sidecar")]
+    pub ai_search: ai_search::State,
+    /// The last `ai.search` (the Project panel shows it).
+    pub search_results: search_results::SearchResults,
 }
 
 /// An export advanced a batch at a time on the host's thread ([`Session::pump_jobs`]).
@@ -601,6 +609,9 @@ impl Session {
             sidecar: None,
             #[cfg(feature = "sidecar")]
             ai: Default::default(),
+            #[cfg(feature = "sidecar")]
+            ai_search: Default::default(),
+            search_results: Default::default(),
         }
     }
 

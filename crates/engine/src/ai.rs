@@ -9,7 +9,7 @@
 //! | `ai.enhanceSpeech` `ai.upscale` `ai.interpolate` | Clip ▸ AI | M6c to M6f |
 //! | `ai.generativeExtend` | Clip ▸ AI | M8f, in [`crate::ai_extend`] |
 //! | `ai.beatGrid` `ai.musicFit` | Sequence ▸ AI | M6d |
-//! | `ai.search {query}` | (Project panel search) | M6e |
+//! | `ai.indexProject` `ai.search {query}` | Clip ▸ AI / (Project panel search) | M6e, in [`crate::ai_search`] |
 //! | `ai.echo` | (none) | the protocol test kind |
 //!
 //! Every `ai.*` feature is disabled with a reason while no compatible helper is connected
@@ -44,12 +44,12 @@ pub(crate) const NOT_CONNECTED: &str = "AI helper not running (start craft-ai: c
 
 /// Job folders changed (or heartbeat-touched) within this are never pruned: a job of another
 /// window or another FilmCraft.
-const PRUNE_MIN_AGE: Duration = Duration::from_secs(600);
+pub(crate) const PRUNE_MIN_AGE: Duration = Duration::from_secs(600);
 
 /// A file in a running job's folder, rewritten every [`HEARTBEAT_EVERY`] while the job runs and
 /// removed when it ends, so another instance's [`prune_cache`] leaves the folder alone.
-const HEARTBEAT: &str = ".running";
-const HEARTBEAT_EVERY: Duration = Duration::from_secs(60);
+pub(crate) const HEARTBEAT: &str = ".running";
+pub(crate) const HEARTBEAT_EVERY: Duration = Duration::from_secs(60);
 
 /// The helper connection's state, kept by the session.
 pub struct AiState {
@@ -224,7 +224,7 @@ impl PendingAi {
     }
 }
 
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -251,7 +251,6 @@ pub(crate) fn helper_ready(s: &Session, feature: &str) -> std::result::Result<()
 enum Needs {
     Clips,
     Sequence,
-    Project,
 }
 
 fn feature_enabled(s: &Session, feature: &str, milestone: &str, needs: Needs) -> std::result::Result<(), String> {
@@ -264,7 +263,6 @@ fn feature_enabled(s: &Session, feature: &str, milestone: &str, needs: Needs) ->
             }
         }
         Needs::Sequence => has_seq(s)?,
-        Needs::Project => {}
     }
     Err(format!("not built yet (arrives in {milestone})"))
 }
@@ -346,7 +344,6 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             Needs::Sequence,
             r#"{"clip":id?,"seconds":f?,"duck":bool=true}"#
         ),
-        feature!("ai.search", "Search Media by Content", [], "search", "M6e", Needs::Project, r#"{"query":str}"#),
         CommandSpec {
             id: "ai.echo",
             label: "AI Helper Echo Test",
@@ -541,7 +538,7 @@ pub(crate) fn restamp(s: &mut Session) {
     }
 }
 
-fn cache_root(s: &Session) -> PathBuf {
+pub(crate) fn cache_root(s: &Session) -> PathBuf {
     let root = s.ai.cache_root.clone().or_else(|| s.media_cache_dir()).or_else(|| crate::autosave::default_data_dir().map(|d| d.join("Media Cache")));
     root.unwrap_or_else(|| crate::temp_dir().join("FilmCraft Media Cache"))
 }
@@ -829,6 +826,7 @@ fn remove_partial_inputs(dir: &Path) {
 /// dynamic trim is in progress. Jobs of a project that was replaced are cancelled. Called once
 /// per UI frame from [`Session::poll_persistence`] and after `wait` runs.
 pub fn poll(s: &mut Session) {
+    crate::ai_search::poll(s);
     poll_probe(s);
     if s.ai.background && s.ai.probe.is_none() && s.ai.last_probe.is_some_and(|t| t.elapsed() >= REPROBE) {
         refresh(s, false);

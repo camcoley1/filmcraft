@@ -3481,6 +3481,8 @@ fn build() -> Vec<CommandSpec> {
     v.extend(crate::ai::commands());
     #[cfg(feature = "sidecar")]
     v.extend(crate::ai_extend::commands());
+    #[cfg(feature = "sidecar")]
+    v.extend(crate::ai_search::commands());
     // Edit ▸ Label ▸ <colour>, Paste Attributes, subclips, Video / Audio Options, Replace With Clip…
     // and their menu order
     crate::clip_ops::apply_layout(&mut v);

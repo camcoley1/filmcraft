@@ -28,6 +28,9 @@ pub enum ResultMode {
     Outside,
     /// The job fails with this message.
     Fail(String),
+    /// These files (name, bytes) in `out_dir`, and this `meta` in the result (hits of a search,
+    /// the items of an index).
+    Files { files: Vec<(String, Vec<u8>)>, meta: serde_json::Value },
     /// These files, made from the request (a feature's result format).
     Custom(Writer),
     /// A copy of the file `from`, named `name` in `out_dir` (a result that is a real media file).
@@ -244,6 +247,12 @@ fn finish(job: &JobRequest, id: &Value, mode: &ResultMode) -> Value {
     let _ = std::fs::create_dir_all(dir);
     let file = match mode {
         ResultMode::Fail(m) => return json!({"type": "error", "job": id, "message": m}),
+        ResultMode::Files { files, meta } => {
+            for (name, bytes) in files {
+                let _ = std::fs::write(dir.join(name), bytes);
+            }
+            return json!({"type": "result", "job": id, "files": files.iter().map(|f| f.0.clone()).collect::<Vec<_>>(), "meta": meta});
+        }
         ResultMode::Custom(write) => {
             let names: Vec<String> = write(job)
                 .into_iter()
