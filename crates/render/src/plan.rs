@@ -7,8 +7,8 @@
 //! them as a [`LayerFx`]: their parameters evaluated at the frame's time, run by the GPU on the
 //! clip's working image before Motion places it, in the CPU's order (effects → Motion → Opacity /
 //! blend); effect masks travel with their effect ([`crate::gpufx::FxOp::Masked`]). Anything the
-//! shaders don't cover yet — other standard effects, opacity masks, adjustment
-//! layers, nested sequences, transitions other than dissolves, dips and Push — is rendered on the CPU
+//! shaders don't cover yet (other standard effects, opacity masks, adjustment
+//! layers, nested sequences, transitions other than dissolves, dips and Push) is rendered on the CPU
 //! for that layer (or the whole frame) and handed over as a pre-composited image, so the GPU path
 //! is always exact with respect to the CPU reference.
 //!
