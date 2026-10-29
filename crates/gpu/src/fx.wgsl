@@ -4,7 +4,7 @@
 // operation; parameters arrive evaluated (keyframes, defaults and clamps applied on the CPU).
 
 struct U {
-    i0: vec4<u32>,  // op, width, height, unused
+    i0: vec4<u32>,  // op, width, height, first row of this dispatch's band (`fx::BAND_PIXELS`)
     i1: vec4<u32>,  // integer parameters (box radius, repeat, steps, channel, rect…)
     p0: vec4<f32>,
     p1: vec4<f32>,
@@ -56,6 +56,7 @@ const OP_LUMETRI_ADVANCED: u32 = 32u;
 const OP_HSL_KEY: u32 = 33u;
 const OP_HSL_MEDIAN: u32 = 34u;
 const OP_HSL_APPLY: u32 = 35u;
+const OP_MASK_MIX: u32 = 36u;
 
 // Samples per Lumetri curve table (`effects::CURVE_SAMPLES`); the advanced pass's tables hold nine
 // of them, then the look LUT.
@@ -801,6 +802,35 @@ fn hsl_apply(p: vec2<i32>) -> vec4<f32> {
     return vec4(dec(out) * a, a);
 }
 
+// A masked effect's polygon points (`fx::mask_data`): after the count and 12 floats per mask.
+fn mask_pt(i: u32) -> vec2<f32> {
+    let k = 4u + u32(data[0]) * 12u + i * 2u;
+    return vec2(data[k], data[k + 1u]);
+}
+
+// Combined coverage of a masked effect's masks at pixel centre `p` (`mask::coverage`). A pixel
+// farther than the band from a mask's bounding box is outside it with the band's distance, as the
+// full test would find, so only pixels near a mask test its edges.
+fn mask_coverage(p: vec2<f32>) -> f32 {
+    let count = u32(data[0]);
+    var acc = mode_start(u32(data[6]));
+    for (var i = 0u; i < count; i++) {
+        let b = 4u + i * 12u;
+        let m = MaskInfo(u32(data[b]), u32(data[b + 1u]), u32(data[b + 2u]), u32(data[b + 3u]), data[b + 4u], data[b + 5u], data[b + 6u], 0.0);
+        let band = mask_band(m);
+        let lo = vec2(data[b + 8u], data[b + 9u]) - vec2(band);
+        let hi = vec2(data[b + 10u], data[b + 11u]) + vec2(band);
+        var v: f32;
+        if m.len >= 3u && (p.x < lo.x || p.y < lo.y || p.x > hi.x || p.y > hi.y) {
+            v = mask_level(m, -band);
+        } else {
+            v = mask_value(m, p);
+        }
+        acc = clamp(combine(m.mode, acc, v), 0.0, 1.0);
+    }
+    return acc;
+}
+
 fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
     let s = size();
     let pc = vec2<f32>(p) + 0.5;
@@ -1006,6 +1036,11 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
         case OP_HSL_APPLY: {
             return hsl_apply(p);
         }
+        case OP_MASK_MIX: {
+            // src: the effect's result, aux: the image before it
+            let o = textureLoad(aux, p, 0);
+            return o + (ld(p) - o) * mask_coverage(pc);
+        }
         default: {
             let o = ld(p);
             let a = o.a;
@@ -1019,10 +1054,11 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
 
 @compute @workgroup_size(16, 16)
 fn fx_px(@builtin(global_invocation_id) id: vec3<u32>) {
-    if id.x >= u.i0.y || id.y >= u.i0.z {
+    let y = id.y + u.i0.w;
+    if id.x >= u.i0.y || y >= u.i0.z {
         return;
     }
-    let p = vec2<i32>(id.xy);
+    let p = vec2<i32>(i32(id.x), i32(y));
     textureStore(dst, p, pixel(u.i0.x, p));
 }
 

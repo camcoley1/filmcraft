@@ -206,7 +206,17 @@ pub enum FxOp {
         /// The GPU stage covers this grade: SDR, and LUTs / a Denoise radius within its limits.
         gpu_capable: bool,
     },
+    /// An effect limited to its masks (`mask::apply_effect`): the effect, then a mix with the image
+    /// before it by the masks' coverage. `masks` are the active ones, flattened in working pixels.
+    Masked {
+        op: Box<FxOp>,
+        masks: Vec<crate::mask::FlatMask>,
+    },
 }
+
+/// Most mask polygon points (all masks of one effect) the GPU stage takes: its coverage pass tests
+/// every edge for the pixels near a mask, so the work per pass stays bounded.
+pub const GPU_MASK_MAX_POINTS: usize = 1024;
 
 /// Largest 3D LUT cube (entries per side) the GPU stage takes; larger cubes render on the CPU.
 pub const GPU_LUT_MAX_CUBE: usize = 65;
@@ -595,6 +605,13 @@ impl FxOp {
         })
     }
 
+    /// [`eval`](Self::eval), limited to the effect's active masks ([`FxOp::Masked`]) when it has any.
+    pub fn eval_masked(e: &EffectInstance, cx: &FxCtx, w: usize, h: usize) -> Option<FxOp> {
+        let op = Self::eval(e, cx, w, h)?;
+        let masks = crate::mask::prepare(&e.masks, cx.t, cx.px_scale);
+        Some(if masks.is_empty() { op } else { FxOp::Masked { op: Box::new(op), masks } })
+    }
+
     fn crop_rect(w: usize, h: usize, l: f32, t: f32, r: f32, b: f32, feather: f32) -> FxOp {
         let (w, h) = (w as f32, h as f32);
         FxOp::Crop { x0: l * w, x1: w * (1.0 - r), y0: t * h, y1: h * (1.0 - b), feather: feather.max(0.0) }
@@ -677,6 +694,11 @@ impl FxOp {
                     && advanced_ok
                     && hsl_ok
                     && sharpen.as_ref().is_none_or(|s| s.2.is_finite())
+            }
+            FxOp::Masked { op, masks } => {
+                op.gpu_ok()
+                    && masks.iter().map(|m| m.pts.len()).sum::<usize>() <= GPU_MASK_MAX_POINTS
+                    && masks.iter().all(|m| m.pts.iter().all(|p| fin(p)) && fin(&[m.feather, m.expansion, m.opacity]))
             }
         }
     }
@@ -1072,6 +1094,14 @@ impl FxOp {
                     crate::effects::unsharp_boxes(img, rx, ry, *amount, 0.0);
                 }
             }
+            FxOp::Masked { op, masks } => match crate::mask::coverage(masks, img.w, img.h) {
+                Some(cov) => {
+                    let original = img.clone();
+                    op.apply(img);
+                    crate::mask::mix(img, &original, &cov);
+                }
+                None => op.apply(img),
+            },
         }
     }
 }

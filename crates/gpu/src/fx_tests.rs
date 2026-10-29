@@ -956,18 +956,137 @@ fn lumetri_heavy_grade_timings() {
                 let frame = VideoFrame::rgba_f32(w, h, px.clone());
                 let fx = LayerFx { size: (w, h), decimation: 1, ops: vec![op.clone()] };
                 let _ = comp.effect_image(&frame, &fx);
-                let runs: Vec<f64> = (0..5)
-                    .map(|_| {
-                        let t0 = std::time::Instant::now();
-                        let _ = comp.effect_image(&frame, &fx);
-                        t0.elapsed().as_secs_f64() * 1000.0
-                    })
-                    .collect();
-                format!("{:.1} ms", median(runs))
+                let time = |fx: &LayerFx, comp: &mut GpuCompositor| {
+                    median(
+                        (0..5)
+                            .map(|_| {
+                                let t0 = std::time::Instant::now();
+                                let _ = comp.effect_image(&frame, fx);
+                                t0.elapsed().as_secs_f64() * 1000.0
+                            })
+                            .collect(),
+                    )
+                };
+                let total = time(&fx, &mut comp);
+                // the same upload and read-back with a pass that changes nothing (Black & White's cost is
+                // negligible): what the compositor does not pay, since it never reads the frame back
+                let transfer = time(&LayerFx { size: (w, h), decimation: 1, ops: vec![FxOp::BlackWhite] }, &mut comp);
+                format!("{total:.1} ms incl. upload + read-back ({transfer:.1} ms of it for a one-pass chain): grade passes ~{:.1} ms", total - transfer)
             }
             (None, _) => "no GPU adapter".into(),
             (_, false) => "not GPU-capable (rendered on the CPU)".into(),
         };
         eprintln!("heavy grade {w}x{h}: CPU {:.1} ms, GPU {gpu_ms}", median(cpu));
     }
+}
+
+/// Masks for the masked-effect tests on a `w`×`h` working image: a feathered ellipse (Add), an
+/// expanded rectangle subtracted from it, and an inverted, half-opaque Difference ellipse.
+fn effect_masks(w: f64, h: f64) -> Vec<filmcraft_project::Mask> {
+    use filmcraft_project::{Mask, MaskMode, MaskPath};
+    let mut a = Mask::new("a", MaskPath::ellipse(Vec2::new(w * 0.45, h * 0.5), Vec2::new(w * 0.3, h * 0.35)));
+    a.feather.value = ParamValue::Float(12.0);
+    let mut b = Mask::new("b", MaskPath::rect(w * 0.4, h * 0.1, w * 0.55, h * 0.45));
+    b.mode = MaskMode::Subtract;
+    b.expansion.value = ParamValue::Float(4.0);
+    let mut c = Mask::new("c", MaskPath::ellipse(Vec2::new(w * 0.75, h * 0.7), Vec2::new(w * 0.15, h * 0.2)));
+    c.mode = MaskMode::Difference;
+    c.inverted = true;
+    c.opacity.value = ParamValue::Float(50.0);
+    c.feather.value = ParamValue::Float(3.0);
+    vec![a, b, c]
+}
+
+/// Masked effects (`FxOp::Masked`) on the GPU against the CPU (`mask::coverage` + mix, as
+/// `mask::apply_effect`): Lumetri's heavy grade (whose HSL Secondary and Sharpen save the image
+/// inside the mask's own save), Unsharp Mask, and a single feathered mask.
+#[test]
+fn masked_effects_match_cpu() {
+    let Some((dev, q)) = gpu_or_skip("masked_effects_match_cpu") else { return };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let (w, h) = (320u32, 180u32);
+    let px = demo_picture(w, h);
+    let frame = VideoFrame::rgba_f32(w, h, px.clone());
+    let all = effect_masks(f64::from(w), f64::from(h));
+    let mut failures = Vec::new();
+    for (name, mut e, masks) in [
+        ("heavy grade, three masks", heavy_grade(), all.clone()),
+        ("unsharp mask, three masks", effect("unsharp_mask", &[("amount", fl(150.0)), ("radius", fl(6.0))]), all.clone()),
+        ("tint, one feathered ellipse", effect("tint", &[("amount", fl(100.0))]), vec![all[0].clone()]),
+        ("HSL show mask, inverted ellipse", effect("lumetri", &[("hsl_on", ParamValue::Bool(true)), ("hsl_show_mask", ch(3))]), vec![all[2].clone()]),
+    ] {
+        e.masks = masks;
+        let op = FxOp::eval_masked(&e, &cx(Tick::ZERO, 1.0), w as usize, h as usize).expect("an op");
+        assert!(matches!(op, FxOp::Masked { .. }), "{name}: not masked");
+        assert!(op.gpu_ok(), "{name}: not GPU-capable");
+        let mut cpu = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.clone() };
+        op.apply(&mut cpu);
+        // the CPU render's own path (`mask::apply_effect`) gives the same picture
+        let mut reference = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.clone() };
+        filmcraft_render::mask::apply_effect(&mut reference, &e, &cx(Tick::ZERO, 1.0));
+        assert_eq!(reference.px, cpu.px, "{name}: FxOp::Masked is mask::apply_effect");
+        let (_, _, gpu) = c.effect_image(&frame, &LayerFx { size: (w, h), decimation: 1, ops: vec![op] }).expect("effect image");
+        let (fl_diff, b8) = diff_float_and_8bit(&cpu.px, &gpu);
+        eprintln!("{name}: max float diff {fl_diff:.2e}, max 8-bit diff {b8}");
+        if fl_diff > 1.0 / 255.0 || b8 > 1 {
+            failures.push(format!("{name}: float {fl_diff:.2e}, 8-bit {b8}"));
+        }
+    }
+    assert!(failures.is_empty(), "GPU masked effects differ from the CPU:\n{}", failures.join("\n"));
+}
+
+/// Masks the GPU stage leaves to the CPU (too many polygon points, non-finite numbers), and masks
+/// switched off (mode None), which leave the effect unmasked.
+#[test]
+fn masked_effects_gpu_boundary() {
+    use filmcraft_project::{Mask, MaskMode, MaskPath};
+    let (w, h) = (320usize, 180usize);
+    let c1 = cx(Tick::ZERO, 1.0);
+    let mut e = effect("tint", &[("amount", fl(100.0))]);
+    let mut off = Mask::new("off", MaskPath::rect(10.0, 10.0, 50.0, 50.0));
+    off.mode = MaskMode::None;
+    e.masks = vec![off];
+    assert!(matches!(FxOp::eval_masked(&e, &c1, w, h), Some(FxOp::Tint { .. })), "a mask set to None does not mask");
+    // a polygon with more points than the stage takes
+    let n = filmcraft_render::gpufx::GPU_MASK_MAX_POINTS + 1;
+    let pts: Vec<[f32; 2]> = (0..n)
+        .map(|i| {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            [160.0 + 60.0 * a.cos(), 90.0 + 60.0 * a.sin()]
+        })
+        .collect();
+    let flat = |pts: Vec<[f32; 2]>, feather: f32| filmcraft_render::mask::FlatMask {
+        pts,
+        feather,
+        expansion: 0.0,
+        opacity: 1.0,
+        inverted: false,
+        mode: MaskMode::Add,
+    };
+    let masked = |m| FxOp::Masked { op: Box::new(FxOp::BlackWhite), masks: vec![m] };
+    assert!(!masked(flat(pts.clone(), 1.0)).gpu_ok());
+    assert!(masked(flat(pts[..100].to_vec(), 1.0)).gpu_ok());
+    assert!(!masked(flat(pts[..100].to_vec(), f32::NAN)).gpu_ok());
+    // an inner op the GPU does not take keeps the whole masked effect on the CPU
+    assert!(!FxOp::Masked { op: Box::new(FxOp::Gamma { g: f32::NAN }), masks: vec![flat(pts[..10].to_vec(), 1.0)] }.gpu_ok());
+}
+
+/// A working image larger than one band (`fx::BAND_PIXELS`) runs each per-pixel pass as several
+/// dispatches: every row is written once, and passes that read neighbours (Denoise, Blur, Sharpen)
+/// read across the band edges, so the picture is the CPU's.
+#[test]
+fn banded_passes_cover_every_row() {
+    let Some((dev, q)) = gpu_or_skip("banded_passes_cover_every_row") else { return };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let (w, h) = (2048u32, 1100u32);
+    assert!(w * h > fx::BAND_PIXELS && (fx::BAND_PIXELS / w) < h, "two bands at least");
+    let px = picture(w, h);
+    let frame = VideoFrame::rgba_f32(w, h, px.clone());
+    let op = FxOp::eval(&heavy_grade(), &cx(Tick::ZERO, 1.0), w as usize, h as usize).expect("an op");
+    let mut cpu = filmcraft_render::Image { w: w as usize, h: h as usize, px };
+    op.apply(&mut cpu);
+    let (_, _, gpu) = c.effect_image(&frame, &LayerFx { size: (w, h), decimation: 1, ops: vec![op] }).expect("effect image");
+    let (fl_diff, b8) = diff_float_and_8bit(&cpu.px, &gpu);
+    eprintln!("banded heavy grade {w}x{h}: max float diff {fl_diff:.2e}, max 8-bit diff {b8}");
+    assert!(fl_diff <= 1.0 / 255.0 && b8 <= 1, "{fl_diff} / {b8}");
 }

@@ -22,6 +22,11 @@ pub(crate) const FX_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Flo
 /// Box radii up to this many pixels are summed per output pixel; larger ones as a running sum.
 pub const BOX_PER_PIXEL_MAX: u32 = 32;
 
+/// Most pixels one dispatch of a per-pixel pass covers: larger images run a pass as several
+/// dispatches over bands of rows, so no single dispatch keeps the GPU busy for long (integrated
+/// GPUs, whose watchdog ends a dispatch that runs too long, run 4K grades as four bands).
+pub const BAND_PIXELS: u32 = 1 << 21;
+
 const OP_BRIGHTNESS_CONTRAST: u32 = 1;
 const OP_PROC_AMP: u32 = 2;
 const OP_TINT: u32 = 3;
@@ -56,6 +61,34 @@ const OP_LUMETRI_ADVANCED: u32 = 32;
 const OP_HSL_KEY: u32 = 33;
 const OP_HSL_MEDIAN: u32 = 34;
 const OP_HSL_APPLY: u32 = 35;
+const OP_MASK_MIX: u32 = 36;
+
+/// An effect's active masks as `fx.wgsl`'s `mask_coverage` reads them: the count, then per mask its
+/// [`MaskInfo`](mask_common.wgsl) fields (start, length, mode, inverted, feather, expansion, opacity,
+/// 0) and bounding box (min x, min y, max x, max y), then every polygon point (x, y).
+fn mask_data(masks: &[filmcraft_render::mask::FlatMask]) -> Vec<f32> {
+    let active: Vec<_> = masks.iter().filter(|m| m.mode.index() != 0).collect();
+    let mut head = vec![active.len() as f32, 0.0, 0.0, 0.0];
+    let mut pts: Vec<f32> = Vec::new();
+    for m in &active {
+        let start = pts.len() / 2;
+        let (mut lo, mut hi) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+        for p in &m.pts {
+            for k in 0..2 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        if m.pts.is_empty() {
+            (lo, hi) = ([0.0; 2], [0.0; 2]);
+        }
+        head.extend([start as f32, m.pts.len() as f32, m.mode.index() as f32, f32::from(u8::from(m.inverted)), m.feather, m.expansion, m.opacity, 0.0]);
+        head.extend([lo[0], lo[1], hi[0], hi[1]]);
+        pts.extend(m.pts.iter().flatten());
+    }
+    head.extend(pts);
+    head
+}
 
 /// Where the advanced pass's look LUT starts in its tables (after nine curves; `fx.wgsl`'s
 /// `LOOK_LUT_BASE`).
@@ -124,8 +157,9 @@ struct Step {
     code: u32,
     i1: [u32; 4],
     p: [f32; 24],
-    /// Save the image this pass reads (before running it).
-    save: bool,
+    /// Save the image this pass reads (before running it), this many times (nested groups that
+    /// start on the same pass each save it).
+    saves: u32,
     /// Read the most recently saved image as `aux`, then drop it.
     restore: bool,
     /// Tables the pass reads (`data` in the shader: curve LUTs, 3D LUTs...); empty for most.
@@ -137,14 +171,14 @@ fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
     for (d, s) in q.iter_mut().zip(p) {
         *d = *s;
     }
-    Step { run: false, code, i1, p: q, save: false, restore: false, data: Vec::new() }
+    Step { run: false, code, i1, p: q, saves: 0, restore: false, data: Vec::new() }
 }
 
 /// Mark `group` (the passes of one op, in order) as working on a saved copy of its input: the
 /// first pass saves the image it reads, the last restores it.
 fn saving(mut group: Vec<Step>) -> Vec<Step> {
     if let Some(first) = group.first_mut() {
-        first.save = true;
+        first.saves += 1;
     }
     if let Some(last) = group.last_mut() {
         last.restore = true;
@@ -244,6 +278,16 @@ fn steps(op: &FxOp) -> Vec<Step> {
             }
         }
         FxOp::Unsharp { rx, ry, amount, threshold } => out.extend(unsharp(rx, ry, *amount, *threshold)),
+        FxOp::Masked { op, masks } => {
+            // the effect on a saved copy of the image, then the mix with it by the masks' coverage
+            let mut g = steps(op);
+            if !g.is_empty() {
+                let mut mix = step(OP_MASK_MIX, [0; 4], &[]);
+                mix.data = mask_data(masks);
+                g.push(mix);
+                out.extend(saving(g));
+            }
+        }
         FxOp::Crop { x0, x1, y0, y1, feather } => out.push(step(OP_CROP, [0; 4], &[*x0, *x1, *y0, *y1, *feather])),
         FxOp::Resample(r) => {
             let op = if (r.opacity - 1.0).abs() < 1e-6 { 1.0 } else { r.opacity };
@@ -373,7 +417,7 @@ impl FxStage {
     pub(crate) fn new(device: &wgpu::Device, composite: &wgpu::ShaderModule, layer_bgl: &wgpu::BindGroupLayout) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("filmcraft-fx"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("fx.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(concat!(include_str!("fx.wgsl"), include_str!("mask_common.wgsl")).into()),
         });
         let tex = |binding| wgpu::BindGroupLayoutEntry {
             binding,
@@ -515,7 +559,7 @@ impl FxStage {
         let mut depth = 0usize;
         let mut deepest = 0usize;
         for s in &all {
-            depth += usize::from(s.save);
+            depth += s.saves as usize;
             deepest = deepest.max(depth);
             depth = depth.saturating_sub(usize::from(s.restore));
         }
@@ -533,25 +577,11 @@ impl FxStage {
         let mut cur = 0usize;
         let mut saved: Vec<usize> = Vec::new();
         for s in &all {
-            if s.save {
+            for _ in 0..s.saves {
                 saved.push(cur);
             }
             let dst = (0..n).find(|k| *k != cur && !saved.contains(k))?;
             let aux = if s.restore { views.get(*saved.last()?)? } else { dummy };
-            let mut bytes = Vec::with_capacity(128);
-            for v in [s.code, w, h, 0].iter().chain(&s.i1) {
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
-            for v in &s.p {
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
-            let buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fx-u"),
-                size: bytes.len() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            queue.write_buffer(&buf, 0, &bytes);
             let data = if s.data.is_empty() {
                 empty.clone()
             } else {
@@ -569,24 +599,46 @@ impl FxStage {
                 queue.write_buffer(&d, 0, &raw);
                 d
             };
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("fx"),
-                layout: &self.bgl,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(views.get(cur)?) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(views.get(dst)?) },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(aux) },
-                    wgpu::BindGroupEntry { binding: 4, resource: data.as_entire_binding() },
-                ],
-            });
-            let groups = if s.run {
-                let lines = if s.i1[2] != 0 { w } else { h };
-                (lines.div_ceil(64), 1)
-            } else {
-                (w.div_ceil(16), h.div_ceil(16))
-            };
-            dispatches.push(Dispatch { run: s.run, bg, groups });
+            // per-pixel passes over bands of rows (`BAND_PIXELS`); a running-sum pass is one
+            // invocation per line already
+            let band = if s.run { h } else { (BAND_PIXELS / w).max(16).next_multiple_of(16).min(h) };
+            let mut y0 = 0;
+            while y0 < h {
+                let rows = band.min(h - y0);
+                let mut bytes = Vec::with_capacity(128);
+                for v in [s.code, w, h, y0].iter().chain(&s.i1) {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                for v in &s.p {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("fx-u"),
+                    size: bytes.len() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                queue.write_buffer(&buf, 0, &bytes);
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("fx"),
+                    layout: &self.bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(views.get(cur)?) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(views.get(dst)?) },
+                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(aux) },
+                        wgpu::BindGroupEntry { binding: 4, resource: data.as_entire_binding() },
+                    ],
+                });
+                let groups = if s.run {
+                    let lines = if s.i1[2] != 0 { w } else { h };
+                    (lines.div_ceil(64), 1)
+                } else {
+                    (w.div_ceil(16), rows.div_ceil(16))
+                };
+                dispatches.push(Dispatch { run: s.run, bg, groups });
+                y0 += rows;
+            }
             cur = dst;
             if s.restore {
                 saved.pop();
