@@ -198,7 +198,7 @@ pub fn item_interactions(
 ) {
     if resp.clicked() {
         let mods = click_modifiers(ui);
-        let order = if mods.shift { items_in_view(app, v, &app.ui.project_search.to_ascii_lowercase()) } else { Vec::new() };
+        let order = if mods.shift { items_in_view(app, v, &crate::panels::project_ai_search::name_filter(&app.ui.project_search)) } else { Vec::new() };
         let anchor = app.ui.project_panel.anchor.map(ItemId);
         let sel = click_selection(&app.session.state.project_selection, &order, anchor, id, mods.shift, mods.command);
         // a Shift-click keeps the anchor; a plain or Ctrl/Cmd click sets it

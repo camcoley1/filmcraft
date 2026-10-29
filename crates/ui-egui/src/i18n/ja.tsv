@@ -3655,3 +3655,11 @@
 	Before the clip	クリップの前
 	Prompt (optional)	プロンプト（任意）
 	Don't ask again for this project	このプロジェクトでは今後確認しない
+	Search by content needs the AI helper build.	内容検索にはAIヘルパー対応版が必要です。
+	Press Enter to search by content	Enterキーで内容を検索
+	Searching…	検索中…
+	No matches	一致なし
+	Words	音声
+	Picture	映像
+	changed since indexed	インデックス後に変更
+	Search by content (AI)	内容で検索 (AI)

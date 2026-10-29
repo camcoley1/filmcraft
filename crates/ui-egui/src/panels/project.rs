@@ -164,6 +164,10 @@ pub fn shown_inst(app: &FilmcraftApp) -> Inst {
 }
 
 /// Text size of the panel (Font Size).
+fn fs_of(app: &FilmcraftApp) -> f32 {
+    font(app)
+}
+
 pub fn font(app: &FilmcraftApp) -> f32 {
     app.session.prefs.project_panel.view.font_size.points()
 }
@@ -253,7 +257,7 @@ pub fn close_tab(app: &mut FilmcraftApp, k: usize) {
 /// Items of a panel instance in display order (keyboard navigation, Select All).
 pub fn visible_items(app: &FilmcraftApp, inst: Inst) -> Vec<ItemId> {
     let v = view_of(app, inst);
-    crate::panels::project_views::items_in_view(app, &v, &app.ui.project_search.to_ascii_lowercase())
+    crate::panels::project_views::items_in_view(app, &v, &crate::panels::project_ai_search::name_filter(&app.ui.project_search))
 }
 
 /// The command Select All (Cmd+A) runs with the Project panel focused: the items of the shown
@@ -262,7 +266,7 @@ pub fn visible_items(app: &FilmcraftApp, inst: Inst) -> Vec<ItemId> {
 /// search filters the panel, exactly the rows it shows (`project.select {items}`).
 pub fn select_all_command(app: &FilmcraftApp) -> (String, Value) {
     let inst = shown_inst(app);
-    if !app.ui.project_search.is_empty() {
+    if !app.ui.project_search.is_empty() && !crate::panels::project_ai_search::is_ai(&app.ui.project_search) {
         let items: Vec<u64> = visible_items(app, inst).into_iter().map(|i| i.0).collect();
         return ("project.select".into(), json!({"items": items}));
     }
@@ -425,10 +429,26 @@ fn body(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &View, actions
     let search_rect = Rect::from_min_size(row.min, vec2(sw, 22.0));
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(search_rect).id_salt((&pre, "search")));
     let mut q = app.ui.project_search.clone();
-    crate::widgets::search_field(&mut child, &mut q, tl!("Search"), search_rect.width(), &t);
+    let field = crate::widgets::search_field(&mut child, &mut q, tl!("Search"), search_rect.width(), &t);
+    // a query that starts with `?` is a search by content (Enter runs it)
+    if crate::panels::project_ai_search::is_ai(&q) && field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+        crate::panels::project_ai_search::run(&q, actions);
+    }
     app.ui.project_search = q;
     app.auto.add(&format!("{pre}.search"), search_rect, "Search");
-    let find = Rect::from_min_size(pos2(search_rect.max.x + 8.0, row.min.y), vec2(24.0, 22.0));
+    let ai = Rect::from_min_size(pos2(search_rect.max.x + 8.0, row.min.y), vec2(24.0, 22.0));
+    let ai_on = crate::panels::project_ai_search::is_ai(&app.ui.project_search);
+    let air = ui.interact(ai, egui::Id::new((&pre, "aiSearch")), Sense::click()).on_hover_text(tl!("Search by content (AI)"));
+    app.auto.add(&format!("{pre}.aiSearch"), ai, "Search by content (AI)");
+    if ai_on || air.hovered() {
+        ui.painter().rect_filled(ai, 3.0, if ai_on { t.field_border } else { t.hover });
+    }
+    ui.painter().text(ai.center(), Align2::CENTER_CENTER, "AI", Tokens::ui(fs_of(app) - 1.0), t.icon);
+    if air.clicked() {
+        let q = app.ui.project_search.clone();
+        app.ui.project_search = if ai_on { crate::panels::project_ai_search::question(&q).to_string() } else { format!("?{q}") };
+    }
+    let find = Rect::from_min_size(pos2(ai.max.x + 8.0, row.min.y), vec2(24.0, 22.0));
     let fr = ui.interact(find, egui::Id::new((&pre, "find")), Sense::click()).on_hover_text(tl!("Find…"));
     app.auto.add(&format!("{pre}.find"), find, "Find…");
     if fr.hovered() {
@@ -438,7 +458,7 @@ fn body(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &View, actions
     if fr.clicked() {
         actions.push(("edit.find".into(), json!({})));
     }
-    let filter = app.ui.project_search.to_ascii_lowercase();
+    let filter = crate::panels::project_ai_search::name_filter(&app.ui.project_search);
     let total = count_items(app, v.bin);
     let sel = app.session.state.project_selection.len();
     let count = if sel > 0 { tlf!("{sel} of {total} items selected", sel, total) } else { tlf!("{total} items", total) };
@@ -455,6 +475,10 @@ fn body(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &View, actions
     ui.painter().rect_filled(content, 4.0, t.panel_bg.gamma_multiply(0.92));
     let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(content).id_salt((&pre, "content")));
     cui.set_clip_rect(content.intersect(ui.clip_rect()));
+    if crate::panels::project_ai_search::is_ai(&app.ui.project_search) {
+        crate::panels::project_ai_search::results(app, &mut cui, content, &pre, fs, actions);
+        return;
+    }
     match v.mode {
         ViewMode::List => crate::panels::project_views::list_view(app, &mut cui, content, v, &filter, actions),
         ViewMode::Icon => crate::panels::project_views::icon_view(app, &mut cui, content, v, &filter, actions),
