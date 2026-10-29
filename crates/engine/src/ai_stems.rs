@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use crate::commands::{bool_p, clips_p, has_seq};
 use crate::{EngineError, Result, Session};
 
-pub(crate) const PARAMS: &str = r#"{"clips":[id]?,"place":bool=false (also put the stems on new audio tracks under the clip),"wait":bool=false}"#;
+pub(crate) const PARAMS: &str = r#"{"clips":[id]?,"place":bool=false (also put the stems on new audio tracks under the clip),"bandwidth":"16k"|"11k"="16k" (how high the model separates; above it the stems are silent),"wait":bool=false}"#;
 
 /// The stems, in track order.
 pub const STEMS: [&str; 4] = ["vocals", "drums", "bass", "other"];
@@ -50,6 +50,11 @@ fn media_of(s: &Session, c: ClipId) -> std::result::Result<(String, f64), String
 
 pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let place = bool_p(p, "place").unwrap_or(false);
+    let bandwidth = match p.get("bandwidth").and_then(Value::as_str) {
+        None => "16k",
+        Some(b @ ("16k" | "11k")) => b,
+        Some(b) => return Err(crate::commands::bad("ai.stems", format!("`bandwidth` is \"16k\" or \"11k\", not `{b}`"))),
+    };
     let wait = bool_p(p, "wait").unwrap_or(false);
     let mut jobs = Vec::new();
     for c in clips_p(s, p) {
@@ -70,7 +75,7 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
             kind: "stems",
             label: "Extract Stems",
             clips: &[c],
-            params: json!({"stems": STEMS, "maxSeconds": MAX_SECONDS}),
+            params: json!({"stems": STEMS, "maxSeconds": MAX_SECONDS, "bandwidth": bandwidth}),
             context: json!({"name": name, "place": place, "seconds": seconds}),
             timeout: Some(timeout),
             prepare: Some(Box::new(move |dir: &std::path::Path, cancelled: &dyn Fn() -> bool| {

@@ -75,6 +75,8 @@ fn stems_land_in_a_bin_in_one_undo_step() {
     assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 44_100);
     assert_eq!(wav.len(), 44 + 2 * 44_100 * 2 * 4);
     assert_eq!(req.params["stems"], json!(["vocals", "drums", "bass", "other"]));
+    assert_eq!(req.params["bandwidth"], "16k", "16 kHz separation by default");
+    assert!(f.s.execute("ai.stems", json!({"bandwidth": "22k"})).is_err());
     assert_eq!(bin_items(&f, "Stems: interview"), ["vocals.wav", "drums.wav", "bass.wav", "other.wav"]);
     assert_eq!(f.s.history.undo.len(), undo + 1);
     assert_eq!(f.s.history.undo.last().unwrap().0, "Extract Stems");
