@@ -2,7 +2,7 @@
 //! end to end, cancel, malformed replies, version mismatch, bad result files, a helper that dies,
 //! stale results and the atomic apply.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -12,7 +12,7 @@ use filmcraft_project::{ClipId, ItemId, ItemKind, Label, MediaClip, MediaRef, Se
 use filmcraft_sidecar::Limits;
 use filmcraft_sidecar::fake::{FakeHelper, Malformed, ResultMode, Script};
 use filmcraft_time::{FrameRate, Tick, TimeRange};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::NOT_CONNECTED;
 use crate::{Event, Session};
@@ -671,4 +671,63 @@ fn a_failed_stage_rolls_back() {
     let moved = super::stage(&files[..1], &media, &|| false, &mut |_| {}).unwrap();
     assert_eq!(moved, [media.join("a.wav")]);
     let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A preparation stopped part way (after writing at least one chunk) leaves no partial input.
+#[test]
+fn a_stopped_preparation_removes_its_partial_input() {
+    let mut f = fixture("prep-stop", Script::default());
+    let clips = [f.clip];
+    let prepare: super::Prepare = Box::new(|dir: &Path, stop: &dyn Fn() -> bool, _: &mut dyn FnMut(f64)| {
+        use std::io::Write;
+        let mut w = std::fs::File::create(dir.join("source.wav")).map_err(|e| e.to_string())?;
+        while !stop() {
+            w.write_all(&[0u8; 4096]).map_err(|e| e.to_string())?;
+            w.flush().map_err(|e| e.to_string())?;
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        Err("stopped".into())
+    });
+    let spec = super::JobSpec {
+        kind: "echo",
+        label: "AI Echo",
+        clips: &clips,
+        params: json!({}),
+        context: Value::Null,
+        timeout: None,
+        prepare: Some(prepare),
+        loose: false,
+        media: false,
+    };
+    let r = super::start_job(&mut f.s, spec, false).unwrap();
+    let id = r["job"].as_u64().unwrap();
+    let input = PathBuf::from(r["outDir"].as_str().unwrap()).join("source.wav");
+    let t0 = std::time::Instant::now();
+    while std::fs::metadata(&input).map_or(0, |m| m.len()) == 0 {
+        assert!(t0.elapsed() < Duration::from_secs(5), "the preparation wrote nothing");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    f.s.execute("jobs.cancel", json!({"job": id})).unwrap();
+    finish(&mut f.s, id);
+    assert_eq!(job_error(&f.s, id).as_deref(), Some("stopped"));
+    assert!(!input.exists(), "the partial input is removed");
+    assert!(f.helper.started().is_empty(), "the helper was never asked");
+}
+
+/// The helper's feature states: an unavailable feature is disabled with the helper's reason; one
+/// whose model needs a download is offered, and ai.status says which.
+#[test]
+fn feature_states_reach_status_and_reasons() {
+    let states = json!({
+        "stems": {"state": "unavailable", "reason": "spleeter_4stems.onnx is not installed; run tools/convert_spleeter.sh"},
+        "reframe": {"state": "needs download"},
+        "echo": {"state": "ready"},
+    });
+    let f = fixture("states", Script { features: vec!["echo".into(), "reframe".into()], states, ..Default::default() });
+    let st = super::status_json(&f.s);
+    assert_eq!(st["featureStates"]["reframe"]["state"], "needs download", "{st}");
+    assert_eq!(st["featureStates"]["stems"]["state"], "unavailable");
+    let why = reason(&f.s, "ai.stems");
+    assert!(why.contains("stems is unavailable in the AI helper") && why.contains("convert_spleeter"), "{why}");
+    assert!(super::helper_ready(&f.s, "reframe").is_ok(), "offered: the job downloads the model");
 }

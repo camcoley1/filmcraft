@@ -232,7 +232,11 @@ fn helper_ready(s: &Session, feature: &str) -> std::result::Result<(), String> {
         None if s.ai.probe.is_some() => Err("contacting the AI helper…".into()),
         None => Err(NOT_CONNECTED.into()),
         Some(Err(why)) => Err(why.clone()),
-        Some(Ok(h)) if !h.has(feature) => Err(format!("the AI helper (version {}) does not provide `{feature}` yet", h.version)),
+        Some(Ok(h)) if !h.has(feature) => Err(match h.states.get(feature) {
+            Some(st) if st.state == "checking" => format!("the AI helper is checking the {feature} model…"),
+            Some(st) => format!("{feature} is unavailable in the AI helper: {}", st.reason.as_deref().unwrap_or(&st.state)),
+            None => format!("the AI helper (version {}) does not provide `{feature}` yet", h.version),
+        }),
         Some(Ok(_)) => Ok(()),
     }
 }
@@ -454,6 +458,9 @@ fn status_json(s: &Session) -> Value {
         "protocol": h.map(|h| h.protocol),
         "needProtocol": filmcraft_sidecar::PROTOCOL_VERSION,
         "features": h.map(|h| h.features.clone()).unwrap_or_default(),
+        // ready / needs download (offered: the first job downloads the model) / checking /
+        // unavailable, with the reason
+        "featureStates": h.map(|h| json!(h.states)).unwrap_or_else(|| json!({})),
         "reason": reason,
         "jobs": s.ai.jobs.len(),
     })
@@ -676,6 +683,11 @@ pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
 
     let job = crate::Job { id, label: label.to_string(), progress: Default::default(), result: Default::default() };
     job.progress.total.store(1000, Ordering::Relaxed);
+    if matches!(&s.ai.hello, Some(Ok(h)) if h.states.get(kind).is_some_and(|st| st.state == "needs download")) {
+        let m = format!("{label}: the AI helper downloads the {kind} model first (once)");
+        *lock(&job.progress.status) = m.clone();
+        s.log.push(crate::panels::Level::Info, "ai", m);
+    }
     let outcome: Arc<Mutex<Option<Ready>>> = Arc::default();
     let limits = Limits { timeout: timeout.unwrap_or(s.ai.limits.timeout).min(s.ai.limits.timeout), ..s.ai.limits };
     let (prog, res, out, to) = (job.progress.clone(), job.result.clone(), outcome.clone(), media.clone());
@@ -703,7 +715,13 @@ pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
             Some(prepare) => {
                 *lock(&prog.status) = "Preparing the input".into();
                 let mut step = |f: f64| prog.done.store((f.clamp(0.0, 1.0) * 50.0) as u64, Ordering::Relaxed);
-                prepare(std::path::Path::new(&req.out_dir), &stop, &mut step).map(|inputs| {
+                let r = prepare(std::path::Path::new(&req.out_dir), &stop, &mut step);
+                if r.is_err() {
+                    // a decode that failed or stopped part way leaves a partial input: the job
+                    // folder holds nothing else yet
+                    remove_partial_inputs(Path::new(&req.out_dir));
+                }
+                r.map(|inputs| {
                     scratch = inputs.clone();
                     req.inputs = inputs;
                 })
@@ -790,6 +808,18 @@ pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
         // waited, but the result waits for a gesture to end: applied by a later poll
         None if wait => Ok(json!({"job": id, "outDir": out_dir.to_string_lossy(), "applied": false, "pending": true})),
         None => Ok(out),
+    }
+}
+
+/// Remove the files a failed [`JobSpec::prepare`] wrote into job folder `dir` (everything but the
+/// [`HEARTBEAT`]; bounded).
+fn remove_partial_inputs(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten().take(1000) {
+        let p = e.path();
+        if p.file_name().is_some_and(|n| n != HEARTBEAT) && std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file()) {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 

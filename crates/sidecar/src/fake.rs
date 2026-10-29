@@ -59,6 +59,8 @@ pub struct Script {
     pub token: Option<String>,
     /// The `hello` reply waits this long (a busy helper).
     pub hello_delay: Duration,
+    /// `featureStates` in the `hello` reply (`Null`: none, as from an older helper).
+    pub states: Value,
 }
 
 impl Default for Script {
@@ -73,6 +75,7 @@ impl Default for Script {
             die_at_poll: None,
             token: None,
             hello_delay: Duration::ZERO,
+            states: Value::Null,
         }
     }
 }
@@ -192,7 +195,13 @@ fn reply(req: &Value, script: &Script, state: &Mutex<State>, stop: &AtomicBool) 
     let mut st = state.lock().unwrap_or_else(PoisonError::into_inner);
     let v = match op {
         "hello" if script.malformed == Malformed::Hello => return Some("{not json".into()),
-        "hello" => json!({"type": "hello", "protocol": script.protocol, "version": script.version, "features": script.features}),
+        "hello" => {
+            let mut h = json!({"type": "hello", "protocol": script.protocol, "version": script.version, "features": script.features});
+            if !script.states.is_null() {
+                h["featureStates"] = script.states.clone();
+            }
+            h
+        }
         "job.start" => match serde_json::from_value::<JobRequest>(req.clone()) {
             Ok(j) => {
                 st.started.push(j);

@@ -83,6 +83,19 @@ pub struct Hello {
     /// Job kinds the helper can run (`echo`, `reframe`, `stems`…).
     #[serde(default)]
     pub features: Vec<String>,
+    /// Each feature's state as the helper sees it ([`FeatureState`]); empty from older helpers.
+    #[serde(default, rename = "featureStates")]
+    pub states: std::collections::BTreeMap<String, FeatureState>,
+}
+
+/// A feature's state in [`Hello::states`]: `state` is `ready` (its model is installed and passed
+/// its hash and contract checks), `needs download` (offered: the first job downloads the model,
+/// with progress), `checking` or `unavailable` (not offered; `reason` says why).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FeatureState {
+    pub state: String,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 impl Hello {

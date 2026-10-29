@@ -41,6 +41,9 @@ const TICKS_PER_SAMPLE: i64 = TICKS_PER_SECOND / RATE as i64;
 const MAX_STEM_BYTES: u64 = 2 << 30;
 /// A stem may differ from the decoded length by this much.
 const LENGTH_SLACK_S: f64 = 0.05;
+/// An audio stream may end this much before the media does (camera audio a few ms short): reads
+/// past its last decodable sample there are silence. Earlier failures are errors.
+const END_SLACK_S: f64 = 0.5;
 
 pub(crate) fn enabled(s: &Session) -> std::result::Result<(), String> {
     super::helper_ready(s, "stems")?;
@@ -62,6 +65,8 @@ struct Target {
     /// First decoded sample (at [`RATE`]) and how many.
     offset: i64,
     samples: i64,
+    /// The media's end, in samples at [`RATE`].
+    end: i64,
     audio_track: bool,
     link: Option<u64>,
 }
@@ -102,12 +107,18 @@ fn target_or(s: &Session, c: ClipId) -> std::result::Result<Target, (bool, Strin
         [] => (0..have.min(2)).collect(),
         chosen => chosen.iter().take(2).map(|c| usize::from(*c).min(have - 1)).collect(),
     };
-    // the media the clip plays, padded, on the 44.1 kHz sample grid
+    // the media the clip plays, padded, on the 44.1 kHz sample grid (positions come from the
+    // project file: checked arithmetic, never a wrap)
     let pad = (PAD_S * TICKS_PER_SECOND as f64) as i64;
-    let a = (it.source_in.0.min(it.source_out().0) - pad).max(0);
-    let b = (it.source_in.0.max(it.source_out().0) + pad).min(m.info.duration.0.max(0)).max(a);
+    let out_of_range = || (true, format!("{}: the clip's source position is out of range; reset its In and Out points", it.name));
+    let (lo, hi) = (it.source_in.0.min(it.source_out().0), it.source_in.0.max(it.source_out().0));
+    let duration = m.info.duration.0.max(0);
+    let a = lo.checked_sub(pad).ok_or_else(out_of_range)?.max(0);
+    let b = hi.checked_add(pad).ok_or_else(out_of_range)?.min(duration).max(a);
     let offset = a / TICKS_PER_SAMPLE;
-    let samples = (b - offset * TICKS_PER_SAMPLE + TICKS_PER_SAMPLE - 1) / TICKS_PER_SAMPLE;
+    let samples =
+        b.checked_sub(offset * TICKS_PER_SAMPLE).and_then(|n| n.checked_add(TICKS_PER_SAMPLE - 1)).map(|n| n / TICKS_PER_SAMPLE).ok_or_else(out_of_range)?;
+    let end = duration / TICKS_PER_SAMPLE + i64::from(duration % TICKS_PER_SAMPLE != 0);
     if samples as f64 > MAX_SECONDS * RATE as f64 {
         return Err((
             true,
@@ -123,7 +134,7 @@ fn target_or(s: &Session, c: ClipId) -> std::result::Result<Target, (bool, Strin
         return Err(skip(format!("{}: the clip plays no audio", it.name)));
     }
     let audio_track = q.track(t).is_some_and(|t| t.kind == TrackKind::Audio);
-    Ok(Target { clip: c, name: it.name.clone(), item: it.item, path: path.clone(), stream, channels, offset, samples, audio_track, link: it.link })
+    Ok(Target { clip: c, name: it.name.clone(), item: it.item, path: path.clone(), stream, channels, offset, samples, end, audio_track, link: it.link })
 }
 
 pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
@@ -161,7 +172,7 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         // CPU separation runs at a few times real time: allow 6x the range plus 10 minutes
         let timeout = Duration::from_secs_f64(seconds * 6.0 + 600.0);
         let src = s.source(t.item).ok_or_else(|| EngineError::Other(format!("{}: the media cannot be read", t.name)))?;
-        let (stream, channels, offset, samples) = (t.stream, t.channels.clone(), t.offset, t.samples);
+        let (stream, channels, offset, samples, end) = (t.stream, t.channels.clone(), t.offset, t.samples, t.end);
         let spec = super::JobSpec {
             kind: "stems",
             label: "Extract Stems",
@@ -171,7 +182,7 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
             timeout: Some(timeout),
             prepare: Some(Box::new(move |dir: &std::path::Path, stop: &dyn Fn() -> bool, progress: &mut dyn FnMut(f64)| {
                 let path = dir.join("source.wav");
-                decode_to_wav(&*src, stream, &channels, offset, samples, &path, stop, progress)?;
+                decode_to_wav(&*src, stream, &channels, (offset, samples, end), &path, stop, progress)?;
                 Ok(vec![path.to_string_lossy().to_string()])
             })),
             loose: !place,
@@ -184,14 +195,14 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// Write `samples` samples of `src`'s audio stream `stream` from sample `offset` (at [`RATE`],
 /// resampled), channels `channels`, as a 32-bit float WAV, ten seconds at a time; stops when
-/// `stop` says so. Samples past the end of the stream are silence.
-#[allow(clippy::too_many_arguments)]
+/// `stop` says so. `end` is the media's end (samples): a stream that stops decoding within
+/// [`END_SLACK_S`] of it is padded with silence ([`read_chunk`]); any other decode failure is an
+/// error naming the stream and the range.
 fn decode_to_wav(
     src: &dyn filmcraft_media::MediaSource,
     stream: usize,
     channels: &[usize],
-    offset: i64,
-    samples: i64,
+    (offset, samples, end): (i64, i64, i64),
     path: &std::path::Path,
     stop: &dyn Fn() -> bool,
     progress: &mut dyn FnMut(f64),
@@ -229,8 +240,7 @@ fn decode_to_wav(
             return Err("stopped".into());
         }
         let n = step.min(total - done) as usize;
-        // a stream that ends early (camera audio a few ms short) reads as silence
-        let buf = src.audio_stream(stream, offset + done as i64, n, RATE).unwrap_or_else(|_| filmcraft_frame::AudioBuffer::silence(RATE, ch, n));
+        let buf = read_chunk(src, stream, offset.saturating_add(done as i64), n, end)?;
         let mut out = Vec::with_capacity(n * ch * 4);
         for i in 0..n {
             for c in channels.iter().take(ch) {
@@ -243,6 +253,50 @@ fn decode_to_wav(
         progress(done as f64 / total.max(1) as f64);
     }
     w.flush().map_err(|e| e.to_string())
+}
+
+/// `n` samples of audio stream `stream` from sample `pos`. When the decoder fails, the longest
+/// decodable prefix is found (by halving); if it ends within [`END_SLACK_S`] of the media's `end`
+/// the stream has ended there and the rest is silence, else the failure is returned with the
+/// stream and the range.
+fn read_chunk(
+    src: &dyn filmcraft_media::MediaSource,
+    stream: usize,
+    pos: i64,
+    n: usize,
+    end: i64,
+) -> std::result::Result<filmcraft_frame::AudioBuffer, String> {
+    let e = match src.audio_stream(stream, pos, n, RATE) {
+        Ok(b) => return Ok(b),
+        Err(filmcraft_media::MediaError::Cancelled) => return Err("stopped".into()),
+        Err(e) => e,
+    };
+    let (mut good, mut bad) = (0usize, n);
+    let mut prefix = None;
+    while bad - good > 1 {
+        let mid = good + (bad - good) / 2;
+        match src.audio_stream(stream, pos, mid, RATE) {
+            Ok(b) => {
+                good = mid;
+                prefix = Some(b);
+            }
+            Err(_) => bad = mid,
+        }
+    }
+    let stopped = pos.saturating_add(good as i64);
+    let slack = (END_SLACK_S * f64::from(RATE)) as i64;
+    if stopped < end.saturating_sub(slack) {
+        let t = |x: i64| x as f64 / f64::from(RATE);
+        return Err(format!(
+            "decoding audio stream {stream} failed at {:.3} s (reading {:.3} to {:.3} s; the media lasts {:.3} s): {e}",
+            t(stopped),
+            t(pos),
+            t(pos.saturating_add(n as i64)),
+            t(end)
+        ));
+    }
+    // the stream ended: what decoded, then silence
+    Ok(prefix.unwrap_or_else(|| filmcraft_frame::AudioBuffer::silence(RATE, 1, 0)))
 }
 
 pub(crate) fn apply(s: &mut Session, pj: &super::PendingAi, files: &[std::path::PathBuf]) -> Result<()> {

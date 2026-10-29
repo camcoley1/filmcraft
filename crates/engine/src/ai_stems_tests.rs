@@ -445,3 +445,71 @@ fn unplaced_stems_survive_a_move_and_placing_needs_the_sequence() {
         g.s.drain_events().into_iter().filter_map(|e| if let crate::Event::Toast { message, .. } = e { Some(message) } else { None }).collect();
     assert!(toasts.iter().any(|m| m.contains("open the clip's sequence to place them")), "{toasts:?}");
 }
+
+/// An audio source that decodes up to sample `decodes_to` (44.1 kHz) and fails after it.
+struct Broken {
+    info: filmcraft_media::MediaInfo,
+    decodes_to: i64,
+}
+
+impl filmcraft_media::MediaSource for Broken {
+    fn info(&self) -> &filmcraft_media::MediaInfo {
+        &self.info
+    }
+    fn video_frame(&self, _: filmcraft_media::FrameRequest) -> filmcraft_media::Result<std::sync::Arc<filmcraft_frame::VideoFrame>> {
+        Err(filmcraft_media::MediaError::NoStream("video"))
+    }
+    fn audio(&self, start: i64, frames: usize, rate: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
+        if start + frames as i64 > self.decodes_to {
+            return Err(filmcraft_media::MediaError::Decode("corrupt packet".into()));
+        }
+        Ok(filmcraft_frame::AudioBuffer { sample_rate: rate, channels: vec![vec![0.5; frames]; 2] })
+    }
+}
+
+fn broken(decodes_to: i64) -> Broken {
+    use filmcraft_media::MediaSource;
+    let rate = filmcraft_time::FrameRate::FPS_24;
+    let info =
+        filmcraft_media::generators::GeneratorSource::new(filmcraft_media::Generator::Demo(filmcraft_media::DemoScene::Plasma), 8, 8, rate, rate.tick_of(240))
+            .info()
+            .clone();
+    Broken { info, decodes_to }
+}
+
+/// A decoder that fails inside the media is an error naming the stream and the range (no silent
+/// stems); a stream that only ends a little before the media is padded with silence.
+#[test]
+fn decode_failures_are_errors_and_only_a_stream_end_is_silence() {
+    let dir = std::env::temp_dir().join(format!("filmcraft-ai-broken-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("source.wav");
+    let end = 10 * 44_100;
+    let e = super::decode_to_wav(&broken(4 * 44_100), 0, &[0, 1], (0, end, end), &path, &|| false, &mut |_| {}).unwrap_err();
+    assert!(e.contains("decoding audio stream 0 failed at 4.000 s") && e.contains("corrupt packet"), "{e}");
+    // 0.1 s short of the media: the rest is silence
+    let short = end - 4_410;
+    super::decode_to_wav(&broken(short), 0, &[0, 1], (0, end, end), &path, &|| false, &mut |_| {}).unwrap();
+    let b = std::fs::read(&path).unwrap();
+    let sample = |i: i64| f32::from_le_bytes(b[44 + i as usize * 8..48 + i as usize * 8].try_into().unwrap());
+    assert_eq!((sample(0), sample(short - 1), sample(short), sample(end - 1)), (0.5, 0.5, 0.0, 0.0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Source positions at the ends of the tick range are refused with a reason, never wrapped.
+#[test]
+fn extreme_source_positions_are_refused() {
+    for at in [i64::MIN, i64::MIN + 1, i64::MAX - 1, i64::MAX] {
+        let mut f = helper("st-extreme", stems);
+        let seq = f.s.state.active_sequence.unwrap();
+        let clip = f.clip;
+        f.s.edit("Hostile", |pr, _| {
+            pr.sequence_mut(seq).unwrap().find_item_mut(clip).unwrap().1.source_in = Tick(at);
+            Ok(())
+        })
+        .unwrap();
+        let e = f.s.execute("ai.stems", json!({"wait": true})).unwrap_err().to_string();
+        assert!(e.contains("out of range"), "{at}: {e}");
+        assert!(f.helper.started().is_empty());
+    }
+}
