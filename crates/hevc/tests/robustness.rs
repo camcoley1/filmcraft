@@ -57,7 +57,7 @@ fn hvcc_input_matches_reference() {
         }
         pics.extend(dec.flush());
         let reference = std::fs::read(yuv).unwrap();
-        common::compare(&pics, &reference, f.width as usize, f.height as usize, f.bit_depth).unwrap();
+        common::compare(&pics, &reference, f.width as usize, f.height as usize, f.bit_depth, f.chroma).unwrap();
         let mut pts: Vec<i64> = pics.iter().map(|p| p.pts).collect();
         pts.sort();
         assert_eq!(pts, (0..samples.len() as i64).map(|i| i * 1000).collect::<Vec<_>>());
@@ -78,7 +78,7 @@ fn xorshift(seed: &mut u64) -> u64 {
 /// Damaged streams must never panic or hang; errors are fine.
 #[test]
 fn corrupted_streams_do_not_panic() {
-    for name in ["medium", "bframes", "intra_main10", "rect_amp", "weightp"] {
+    for name in ["medium", "bframes", "intra_main10", "rect_amp", "weightp", "medium_422_10", "intra_422_12", "medium_422_8"] {
         let f = common::fixture(name);
         let Some((hevc, _)) = common::ensure(f) else { return };
         let data = std::fs::read(hevc).unwrap();
@@ -100,6 +100,43 @@ fn corrupted_streams_do_not_panic() {
                 let _ = dec.flush();
                 let _ = dec.take_error();
             }
+        }
+    }
+}
+
+/// Damaged parameter sets (bit flips in the VPS / SPS / PPS NAL units only, so that hostile values
+/// such as chroma formats, bit depths and sizes reach the decoder) of 4:2:2 streams: errors are
+/// fine, panics are not.
+#[test]
+fn damaged_parameter_sets_do_not_panic() {
+    for name in ["medium_422_10", "intra_422_12", "medium_main12"] {
+        let f = common::fixture(name);
+        let Some((hevc, _)) = common::ensure(f) else { return };
+        let data = std::fs::read(hevc).unwrap();
+        // byte ranges of the parameter set NAL units
+        let mut ranges = Vec::new();
+        for nal in annexb_nals(&data) {
+            let t = (nal[0] >> 1) & 0x3f;
+            if (32..=34).contains(&t) {
+                let start = nal.as_ptr() as usize - data.as_ptr() as usize;
+                ranges.push(start + 2..start + nal.len());
+            }
+        }
+        assert!(!ranges.is_empty(), "{name}: no parameter sets");
+        let mut seed = 0x0bad_5eed_u64 ^ name.len() as u64;
+        for round in 0..60 {
+            let mut d = data.clone();
+            for _ in 0..1 + round % 3 {
+                let r = &ranges[xorshift(&mut seed) as usize % ranges.len()];
+                let pos = r.start + xorshift(&mut seed) as usize % (r.end - r.start).max(1);
+                d[pos] ^= 1 << (xorshift(&mut seed) % 8);
+            }
+            let mut dec = Decoder::with_threads(1 + round % 2);
+            for au in common::split_access_units(&d) {
+                let _ = dec.decode(au, 0);
+            }
+            let _ = dec.flush();
+            let _ = dec.take_error();
         }
     }
 }

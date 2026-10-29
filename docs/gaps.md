@@ -67,7 +67,8 @@ platforms** G4, G9, G17; **performance** G16; **ecosystem** G11; **measurement**
 ## G3. 10-bit and 4:2:2 camera media needs hardware
 
 - **Missing:** our H.264 decoder is 8-bit 4:2:0 only (`crates/h264/README.md`: no High 10, High
-  4:2:2, 4:4:4, lossless, interlaced field / MBAFF); HEVC has no 4:2:2 / RExt. Most mirrorless and
+  4:2:2, 4:4:4, lossless, interlaced field / MBAFF). HEVC decodes Main 4:2:2 10 / 12 and Main 12 in
+  software since M8e.1 (other range-extension tools, 4:4:4 and tiles with WPP are refused). Most mirrorless and
   cinema cameras record exactly these (Sony XAVC S-I / XAVC HS 4:2:2 10-bit, Panasonic, Canon
   XF-AVC, Fujifilm).
 - **Evidence:** #626 (Panasonic Lumix 4K 10-bit 4:2:2 MOV). On macOS VideoToolbox decodes 10-bit
@@ -76,7 +77,7 @@ platforms** G4, G9, G17; **performance** G16; **ecosystem** G11; **measurement**
   hardware on Apple silicon, Intel and NVIDIA Blackwell).
 - **Impact:** camera originals from most current cameras do not open on Windows or Linux.
 - **Estimate:** H.264 High 10 + High 4:2:2 (chroma geometry, deblocking, transforms) 15–25 h;
-  HEVC Main 4:2:2 10 (RExt subset) 15–25 h. Doc: [codec-parity.md](codec-parity.md).
+  HEVC Main 4:2:2 10: done (M8e.1). Doc: [codec-parity.md](codec-parity.md).
 
 ## G4. Crashes at start-up, and no test CI on pull requests
 
@@ -321,3 +322,4 @@ platforms** G4, G9, G17; **performance** G16; **ecosystem** G11; **measurement**
 | 2026-10-10 | major | Created from ROADMAP.md's "Where we are lacking" (2026-10-05); re-ranked against Premiere 26.5.2 and the 188 open issues; added `.prproj`, 10-bit / 4:2:2 camera decode, launch crashes and missing PR CI, localization, delivery formats |
 | 2026-10-12 | minor | G10: MP1 (`A_MPEG/L1`) in Matroska imports (#1402) |
 | 2026-10-12 | minor | G10: OpenEXR PXR24 import |
+| 2026-10-29 | minor | G3: HEVC Main 4:2:2 10 / 12 and Main 12 software decode (M8e.1) |

@@ -208,7 +208,12 @@ impl<A: Accel> Front<A> {
         )
         .map_err(decode_err)?;
         sps.check_supported().map_err(decode_err)?;
-        pps.check_supported().map_err(decode_err)?;
+        pps.check_supported(&sps).map_err(decode_err)?;
+        // range-extension tools (e.g. CU chroma QP offsets) are not passed to VA-API's Main / Main 10
+        // profiles: the software decoder handles those streams
+        if sps.rext != Default::default() || pps.rext != Default::default() {
+            return Err(unsupported("HEVC range-extension tools"));
+        }
         if first {
             self.start_picture(&sh, &sps, &pps, pts, frames)?;
         }

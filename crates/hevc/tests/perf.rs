@@ -38,6 +38,12 @@ fn perf_1080p() {
 
 #[test]
 #[ignore]
+fn perf_1080p_422_10() {
+    run("bench_1080p_422_10", "1080p Main 4:2:2 10 CRF22 medium");
+}
+
+#[test]
+#[ignore]
 fn perf_4k() {
     run("bench_4k", "2160p Main10 CRF26 fast");
 }

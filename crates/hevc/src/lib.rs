@@ -1,10 +1,16 @@
 //! Clean-room pure-Rust H.265 / HEVC decoder, implemented from ITU-T Rec. H.265 (ISO/IEC 23008-2).
 //!
-//! Supported: Main and Main 10 profiles (4:2:0, 8/10-bit; up to 12-bit 4:2:0 without range-extension
-//! tools), all coding tools of those profiles: CABAC, coding / transform quadtrees, AMP, PCM,
+//! Supported: Main and Main 10 profiles (4:2:0, 8/10-bit), and 4:2:0 / 4:2:2 range-extension
+//! streams of 8 to 12 bits (Main 12, Main 4:2:2 10 / 12 and their Intra profiles): all coding tools
+//! of Main / Main 10: CABAC, coding / transform quadtrees, AMP, PCM,
 //! transform skip, scaling lists, sign data hiding, 35 intra modes with strong intra smoothing,
 //! merge / AMVP / TMVP, weighted prediction, deblocking, SAO, tiles, wavefront parallel processing
-//! (parsing), dependent slice segments, short- and long-term reference picture sets.
+//! (parsing), dependent slice segments, short- and long-term reference picture sets, plus CU chroma
+//! QP offsets (range extension). Rejected with [`Error::Unsupported`] rather than risk a wrong
+//! picture: 4:0:0 and 4:4:4, more than 12 bits, tiles together with WPP, and the other
+//! range-extension coding tools (transform skip rotation / context / above 4x4, RDPCM, persistent
+//! Rice adaptation, intra smoothing disabled, high-precision weighted prediction offsets, SAO offset
+//! scaling, extended precision, CABAC bypass alignment, cross-component prediction).
 //!
 //! ```no_run
 //! let mut dec = filmcraft_hevc::Decoder::new();
@@ -100,7 +106,7 @@ impl Plane {
     }
 }
 
-/// A decoded, cropped picture in planar 4:2:0.
+/// A decoded, cropped picture in planar 4:2:0 or 4:2:2.
 #[derive(Clone, Debug)]
 pub struct Picture {
     /// Cropped luma width.
@@ -109,6 +115,8 @@ pub struct Picture {
     pub height: u32,
     pub chroma_width: u32,
     pub chroma_height: u32,
+    /// 1 (4:2:0) or 2 (4:2:2).
+    pub chroma_format_idc: u32,
     /// Luma bit depth (chroma uses the same storage type).
     pub bit_depth: u32,
     pub y: Plane,

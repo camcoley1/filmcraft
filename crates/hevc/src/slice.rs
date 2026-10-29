@@ -126,6 +126,7 @@ pub struct SliceHeader {
     pub qp_delta: i32,
     pub cb_qp_offset: i32,
     pub cr_qp_offset: i32,
+    pub cu_chroma_qp_offset_enabled: bool,
     pub deblocking_disabled: bool,
     pub beta_offset_div2: i32,
     pub tc_offset_div2: i32,
@@ -211,6 +212,7 @@ impl SliceHeader {
                 qp_delta: 0,
                 cb_qp_offset: 0,
                 cr_qp_offset: 0,
+                cu_chroma_qp_offset_enabled: false,
                 deblocking_disabled: pps.deblocking_disabled,
                 beta_offset_div2: pps.beta_offset_div2,
                 tc_offset_div2: pps.tc_offset_div2,
@@ -346,6 +348,9 @@ impl SliceHeader {
                 sh.cb_qp_offset = r.read_se()?;
                 sh.cr_qp_offset = r.read_se()?;
                 ensure!((-12..=12).contains(&sh.cb_qp_offset) && (-12..=12).contains(&sh.cr_qp_offset), "slice chroma QP offset out of range");
+            }
+            if pps.rext.chroma_qp_offset_list {
+                sh.cu_chroma_qp_offset_enabled = r.read_flag()?;
             }
             let override_flag = if pps.deblocking_override_enabled { r.read_flag()? } else { false };
             if override_flag {

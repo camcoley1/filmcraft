@@ -10,8 +10,10 @@ scaling lists, `intraPredAngle` / `invAngle`, the chroma QP table, the deblockin
 the luma / chroma interpolation filter taps and the 32x32 DCT matrix) were extracted from the
 specification text by [`tools/extract_tables.py`](tools/extract_tables.py) (it only reads the text
 of the ITU-T PDF, see the script header); the output is `src/spec_tables.rs`. Scan orders are
-derived by the algorithms of 6.5.3-6.5.5. No code was taken or ported from FFmpeg, libde265, x265 or
-the HM reference software; ffmpeg / libx265 / VideoToolbox are only used as external test oracles
+derived by the algorithms of 6.5.3-6.5.5. The 4:2:2 chroma intra mode mapping (Table 8-3, in the
+corrected form of later editions of the specification) is entered by hand in `src/tables.rs` and
+verified by the JCT-VC `ADJUST_IPRED_ANGLE_A_RExt_Mitsubishi` conformance stream. No code was taken
+or ported from FFmpeg, libde265, x265 or the HM reference software; ffmpeg / libx265 / VideoToolbox are only used as external test oracles
 and fixture generators.
 
 ## Status
@@ -31,7 +33,10 @@ and fixture generators.
 | Frame-level multithreading (CTB-row granularity dependencies) | done |
 | Draft mode (non-reference pictures skip deblocking / SAO; reduced-resolution playback only) | done |
 | Tiles / WPP | parsed and decoded sequentially within a picture (parallelism is across pictures) |
-| 4:2:2 / 4:4:4 / monochrome, range-extension tools (RExt), 12-bit+ with extended precision | not yet (`Error::Unsupported`) |
+| 4:2:2 (Main 4:2:2 10 / 12 and Intra), 12-bit 4:2:0 (Main 12): geometry, 4:2:2 intra mode mapping, two chroma blocks (and cbfs) per TU, QpC = Min(qPi, 51), taller chroma MC, chroma deblocking grid and SAO; CU chroma QP offsets (`chroma_qp_offset_list`) | done (bit-exact on the x265 4:2:2 fixtures and the JCT-VC Main_422_10_A/B, GENERAL_*b_420/422, IPCM_A and ADJUST_IPRED_ANGLE streams) |
+| Other range-extension tools: transform skip rotation / context / above 4x4, implicit / explicit RDPCM, persistent Rice adaptation, intra smoothing disabled, high-precision weighted prediction offsets, SAO offset scaling, extended precision, CABAC bypass alignment, cross-component prediction | not yet (`Error::Unsupported`: parsed, then refused because no 4:2:0 / 4:2:2 reference stream exercises them) |
+| Tiles together with WPP (allowed outside Main / Main 10) | not yet (`Error::Unsupported`: the one reference stream, `WPP_AND_TILE_10Bit422Test_HIGH_TP_444_10BIT_RExt_Apple_2`, decodes differently after the first substream) |
+| 4:4:4 / monochrome, more than 12 bits | not yet (`Error::Unsupported`) |
 | SCC, multilayer (SHVC / MV-HEVC), 3D extensions | not supported (layers > 0 are ignored) |
 
 ## API
@@ -42,7 +47,7 @@ use filmcraft_hevc::{Decoder, Plane};
 let mut dec = Decoder::new(); // or Decoder::with_threads(n), Decoder::from_hvcc(&hvcc)?
 for (pts, access_unit) in access_units {
     for pic in dec.decode(access_unit, pts)? {
-        // pic.width / pic.height (cropped), pic.bit_depth,
+        // pic.width / pic.height (cropped), pic.bit_depth, pic.chroma_format_idc (1 = 4:2:0, 2 = 4:2:2),
         // pic.y / pic.u / pic.v: Plane::U8(Vec<u8>) for 8-bit, Plane::U16(Vec<u16>) above,
         // pic.y_stride / pic.uv_stride, pic.pts, pic.poc, pic.key (IRAP), pic.color (VUI), pic.sar
     }
@@ -95,9 +100,14 @@ with ffmpeg; tests print a message and skip when ffmpeg is absent).
   output is known exactly where filters leave PCM samples alone; every stream is also compared with
   ffmpeg.
 - Robustness: hvcC input with pts round trip; randomly corrupted, truncated and garbage input never
-  panics or deadlocks (single- and multi-threaded).
+  panics or deadlocks (single- and multi-threaded), including 4:2:2 / 12-bit streams and bit flips
+  confined to the parameter sets (hostile chroma formats, bit depths, sizes).
+- Range-extension conformance (`rext_conformance_streams`): with `FILMCRAFT_HEVC_REXT_DIR` pointing
+  at the JCT-VC RExt bitstreams (not in the repository), the 4:2:0 / 4:2:2 ones decode bit-exactly
+  against ffmpeg and the ones using unsupported tools (4:4:4, RDPCM, persistent Rice, tiles + WPP)
+  are refused with `Error::Unsupported`. Skipped without the variable.
 - Conformance (`tests/conformance.rs`): every fixture is decoded with 1 thread, 3 threads and every
-  core and compared sample-exactly with `ffmpeg -f rawvideo -pix_fmt yuv420p / yuv420p10le`; on mismatch
+  core and compared sample-exactly with `ffmpeg -f rawvideo -pix_fmt yuv420p / yuv422p / ...10le / ...12le`; on mismatch
   the first differing frame, plane, sample, CTB and 8x8 block are reported. Output pts/POC order is
   checked too, and that no picture is flagged draft without draft mode. `compare_detects_mismatch`
   guards the harness itself. Draft mode (`draft_mode_changes_only_flagged_non_reference_pictures`):
@@ -134,6 +144,13 @@ libx265 unless noted (x265 enables WPP by default, so most streams carry entry p
 | uhd_4k_main10 | 3840x2160 | Main 10 ultrafast |
 | vt_main / vt_main10 | 640x360 | Apple VideoToolbox (hevc_videotoolbox), macOS only |
 | synthetic (7 streams) | 96x64 | tiles, PCM, slices, dependent segments, LTR, list modification |
+| intra_422_10 / intra_422_12 / intra_422_nofilt | 352x288 | Main 4:2:2 10 / 12 intra (no SAO / deblocking) |
+| medium_422_8 / medium_422_10 / medium_422_12 | 352x288 | 4:2:2 8 / 10 / 12-bit, preset medium |
+| bframes_422_10 / slices4_422_10 / rect_amp_422_10 | 352x288 | 4:2:2: B-pyramid, 4 slices, rect + AMP |
+| weightp_422_10 / tskip_422_10 / chroma_qp_422_10 | 352x288 | 4:2:2: weighted prediction, transform skip, cb / cr QP offsets |
+| scaling_list_422_10 / lossless_422_10 / crf0_422_10 | 352x288, 176x144 | 4:2:2: scaling lists, lossless, CRF 0 |
+| odd_422_10 | 1918x1078 | 4:2:2 conformance-window cropping |
+| medium_main12 | 352x288 | Main 12 (4:2:0) |
 
 `cargo test -p filmcraft-hevc --test conformance coverage_report -- --ignored --nocapture` prints the
 decoder statistics per fixture.
@@ -148,6 +165,14 @@ average 50-100), so these are lower bounds:
 |---|---|---|
 | 1080p Main, x265 medium CRF 24, 60 frames | ~75 fps | ~225 fps |
 | 2160p Main 10, x265 fast CRF 26, 20 frames | ~20 fps | ~95 fps |
+
+Main 4:2:2 10 (M8e.1, `perf_1080p_422_10`), measured on the same machine at load average ~58
+(8 threads), with the 4:2:0 Main stream re-measured alongside for scale:
+
+| stream | 1 thread | 8 threads |
+|---|---|---|
+| 1080p Main 4:2:2 10, x265 medium CRF 22, 30 frames | 16.9 fps | 68.5 fps |
+| 1080p Main, x265 medium CRF 24, 60 frames (same run) | 26.8 fps | 89.0 fps |
 
 No intrinsics: the hot loops are written to auto-vectorise. M4.8
 profiling (`cargo xtask bench`, macOS `sample`) found the inverse transform at over half of the

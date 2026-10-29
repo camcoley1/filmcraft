@@ -130,6 +130,9 @@ pub struct Frame {
     pub log2_ctb: u32,
     pub bit_depth: u32,
     pub bit_depth_c: u32,
+    /// log2(SubWidthC), log2(SubHeightC): (1, 1) for 4:2:0, (1, 0) for 4:2:2.
+    pub sx: u32,
+    pub sy: u32,
     rows: Rows,
 }
 
@@ -147,13 +150,26 @@ fn wait<T>(cell: &OnceLock<T>) -> Option<&T> {
 }
 
 impl Frame {
-    pub fn new(id: u32, poc: i32, width: usize, height: usize, log2_ctb: u32, bit_depth: u32, bit_depth_c: u32) -> Self {
+    /// A frame of `chroma_format_idc` 1 (4:2:0) or 2 (4:2:2; any other value is treated as 4:2:0).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(id: u32, poc: i32, width: usize, height: usize, log2_ctb: u32, bit_depth: u32, bit_depth_c: u32, chroma_format_idc: u32) -> Self {
         let n = height.div_ceil(1 << log2_ctb);
         fn cells<S: Sample>(n: usize) -> Rows {
             S::wrap_rows((0..n).map(|_| OnceLock::new()).collect())
         }
         let rows = if stores_u8(bit_depth, bit_depth_c) { cells::<u8>(n) } else { cells::<u16>(n) };
-        Frame { id, poc, width, height, cwidth: width / 2, cheight: height / 2, log2_ctb, bit_depth, bit_depth_c, rows }
+        let (sx, sy) = if chroma_format_idc == 2 { (1, 0) } else { (1, 1) };
+        Frame { id, poc, width, height, cwidth: width >> sx, cheight: height >> sy, log2_ctb, bit_depth, bit_depth_c, sx, sy, rows }
+    }
+
+    /// chroma_format_idc of the frame (1 or 2).
+    pub fn chroma_format_idc(&self) -> u32 {
+        if self.sy == 0 { 2 } else { 1 }
+    }
+
+    /// Chroma lines of `lines` luma lines.
+    fn chroma_lines(&self, lines: usize) -> usize {
+        lines.div_ceil(1 << self.sy)
     }
 
     pub fn num_rows(&self) -> usize {
@@ -238,7 +254,7 @@ impl Frame {
     /// Copy a w x h window of chroma component `c` (0 = Cb, 1 = Cr) with edge replication.
     pub fn chroma_window<S: Sample>(&self, c: usize, x0: i32, y0: i32, w: usize, h: usize, out: &mut [i16], os: usize) {
         let (cw, ch) = (self.cwidth as i32, self.cheight as i32);
-        let sh = self.log2_ctb - 1;
+        let sh = self.log2_ctb - self.sy;
         let mask = (1i32 << sh) - 1;
         for r in 0..h {
             let yy = (y0 + r as i32).clamp(0, ch - 1);
@@ -254,7 +270,7 @@ impl Frame {
     /// (8-228, 8-229): the reference window of a prediction block without copying it. False (and
     /// `rows` partly filled) when the runs are not inside the picture horizontally.
     pub fn window_rows<'f, S: Sample>(&'f self, c: usize, x0: i32, y0: i32, w: usize, rows: &mut [&'f [S]]) -> bool {
-        let (pw, ph, sh) = if c == 0 { (self.width, self.height, self.log2_ctb) } else { (self.cwidth, self.cheight, self.log2_ctb - 1) };
+        let (pw, ph, sh) = if c == 0 { (self.width, self.height, self.log2_ctb) } else { (self.cwidth, self.cheight, self.log2_ctb - self.sy) };
         let Some(x) = usize::try_from(x0).ok().filter(|&x| x.saturating_add(w) <= pw) else { return false };
         let mask = (1usize << sh) - 1;
         let max_y = ph as i32 - 1;
@@ -285,7 +301,7 @@ impl Frame {
     /// (stride `ds`), samples outside the picture replicated from its edges (8-228, 8-229).
     #[allow(clippy::too_many_arguments)]
     pub fn copy_block<S: Sample>(&self, c: usize, x0: i32, y0: i32, w: usize, h: usize, dst: &mut [S], ds: usize) {
-        let (pw, ph, sh) = if c == 0 { (self.width, self.height, self.log2_ctb) } else { (self.cwidth, self.cheight, self.log2_ctb - 1) };
+        let (pw, ph, sh) = if c == 0 { (self.width, self.height, self.log2_ctb) } else { (self.cwidth, self.cheight, self.log2_ctb - self.sy) };
         let inside = usize::try_from(x0).ok().filter(|&x| x.saturating_add(w) <= pw);
         for (r, d) in dst.chunks_mut(ds).take(h).enumerate() {
             let yy = y0.saturating_add(r as i32).min(ph as i32 - 1).max(0) as usize;
@@ -342,8 +358,8 @@ impl Frame {
             let Some(row) = self.row::<S>(r / ctb) else { break };
             put(&mut y, &row.y, (r % ctb) * self.width + cx, cw);
         }
-        let (ccx, ccy, ccw, cch) = (cx / 2, cy / 2, cw.div_ceil(2), ch.div_ceil(2));
-        let cctb = ctb / 2;
+        let (ccx, ccy, ccw, cch) = (cx >> self.sx, cy >> self.sy, cw.div_ceil(1 << self.sx), ch.div_ceil(1 << self.sy));
+        let cctb = ctb >> self.sy;
         u.reserve_exact(ccw.saturating_mul(cch));
         v.reserve_exact(ccw.saturating_mul(cch));
         for r in ccy..ccy.saturating_add(cch) {
@@ -366,7 +382,7 @@ impl Frame {
                     continue;
                 }
                 let lines = f.row_lines(r);
-                let clines = lines.div_ceil(2);
+                let clines = f.chroma_lines(lines);
                 f.publish(
                     r,
                     FrameRow::<S> {
@@ -386,7 +402,7 @@ impl Frame {
 
     /// A mid-grey frame with the geometry of `like`.
     pub fn gray(id: u32, poc: i32, like: &Frame) -> Frame {
-        let f = Frame::new(id, poc, like.width, like.height, like.log2_ctb, like.bit_depth, like.bit_depth_c);
+        let f = Frame::new(id, poc, like.width, like.height, like.log2_ctb, like.bit_depth, like.bit_depth_c, like.chroma_format_idc());
         f.publish_gray();
         f
     }
@@ -401,8 +417,9 @@ impl Frame {
             for r in 0..f.num_rows() {
                 let lines = f.row_lines(r);
                 let (y0, y1) = (r * ctb * f.width, (r * ctb + lines) * f.width);
-                let clines = lines.div_ceil(2);
-                let (c0, c1) = (r * ctb / 2 * f.cwidth, (r * ctb / 2 + clines) * f.cwidth);
+                let clines = f.chroma_lines(lines);
+                let cctb = ctb >> f.sy;
+                let (c0, c1) = (r * cctb * f.cwidth, (r * cctb + clines) * f.cwidth);
                 f.publish(
                     r,
                     FrameRow::<S> {
@@ -414,7 +431,7 @@ impl Frame {
                 );
             }
         }
-        let f = Frame::new(id, poc, like.width, like.height, like.log2_ctb, like.bit_depth, like.bit_depth_c);
+        let f = Frame::new(id, poc, like.width, like.height, like.log2_ctb, like.bit_depth, like.bit_depth_c, like.chroma_format_idc());
         match &f.rows {
             Rows::U8(_) => fill::<u8>(&f, y, cb, cr),
             Rows::U16(_) => fill::<u16>(&f, y, cb, cr),
@@ -540,7 +557,7 @@ mod tests {
         let crop = (2usize, 4usize, 33usize, 27usize);
         for bd in [8u32, 10] {
             let (y, cb, cr) = planes(w, h, bd, 0x9e37_79b9_7f4a_7c15 + bd as u64);
-            let like = Frame::new(0, 0, w, h, 4, bd, bd);
+            let like = Frame::new(0, 0, w, h, 4, bd, bd, 1);
             let f = Frame::from_planes(1, 0, &like, &y, &cb, &cr);
             assert_eq!(matches!(f.rows, Rows::U8(_)), bd == 8);
             assert!(f.is_complete());
@@ -555,6 +572,41 @@ mod tests {
             assert_eq!(got(&pv), want_c(&cr), "cr bd {bd}");
             assert_eq!(py.as_u8().is_some(), bd == 8);
         }
+    }
+
+    /// 4:2:2 frames keep full-height chroma: rows publish, crop and replicate at the chroma edges
+    /// with the vertical chroma shift 0.
+    #[test]
+    fn chroma_422_geometry_crops_exactly() {
+        let (w, h) = (40usize, 36usize);
+        let crop = (2usize, 3usize, 33usize, 27usize);
+        let mut x = 0x2545_f491u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % 1024) as u16
+        };
+        let y: Vec<u16> = (0..w * h).map(|_| next()).collect();
+        let cb: Vec<u16> = (0..w / 2 * h).map(|_| next()).collect();
+        let cr: Vec<u16> = (0..w / 2 * h).map(|_| next()).collect();
+        let like = Frame::new(0, 0, w, h, 4, 10, 10, 2);
+        assert_eq!((like.cwidth, like.cheight, like.chroma_format_idc()), (20, 36, 2));
+        let f = Frame::from_planes(1, 0, &like, &y, &cb, &cr);
+        assert!(f.is_complete());
+        let (_, pu, pv) = f.cropped_planes(crop, false);
+        let (cx, cy, cw, ch) = crop;
+        let ccw = cw.div_ceil(2);
+        let want = |p: &[u16]| -> Vec<u16> { (cy..cy + ch).flat_map(|r| p[r * w / 2 + cx / 2..r * w / 2 + cx / 2 + ccw].to_vec()).collect() };
+        let got = |p: &Plane| -> Vec<u16> { (0..p.len()).map(|i| p.get(i)).collect() };
+        assert_eq!(got(&pu), want(&cb));
+        assert_eq!(got(&pv), want(&cr));
+        // a block below the last chroma line repeats it (8-229)
+        let mut dst = [0u16; 4];
+        f.copy_block::<u16>(1, 3, h as i32 + 5, 2, 2, &mut dst, 2);
+        assert_eq!(dst, [cb[(h - 1) * w / 2 + 3], cb[(h - 1) * w / 2 + 4], cb[(h - 1) * w / 2 + 3], cb[(h - 1) * w / 2 + 4]]);
+        let g = Frame::gray(2, 0, &like);
+        assert_eq!(g.row::<u16>(2).map(|r| r.cb.len()), Some(20 * 4));
     }
 
     /// Window lines crossing the left and / or right picture edge repeat the edge samples, as the
@@ -579,7 +631,7 @@ mod tests {
     /// nothing instead of a panic, and a grey frame of either type is complete.
     #[test]
     fn wrong_sample_type_is_harmless() {
-        let f = Frame::new(0, 0, 32, 32, 4, 8, 8);
+        let f = Frame::new(0, 0, 32, 32, 4, 8, 8, 1);
         f.publish(0, FrameRow::<u16> { y: vec![1; 16 * 32].into(), cb: vec![1; 8 * 16].into(), cr: vec![1; 8 * 16].into(), col: Box::new([]) });
         assert!(!f.is_published(0));
         f.publish_gray();
@@ -592,7 +644,7 @@ mod tests {
         let mut dst = [5u16; 16];
         f.copy_block::<u16>(0, 0, 0, 4, 4, &mut dst, 4);
         assert!(dst.iter().all(|&v| v == 5));
-        let g = Frame::gray(1, 0, &Frame::new(0, 0, 16, 8, 4, 10, 10));
+        let g = Frame::gray(1, 0, &Frame::new(0, 0, 16, 8, 4, 10, 10, 1));
         assert!(g.is_complete());
         assert_eq!(g.row::<u16>(0).map(|r| r.cb[0]), Some(512));
         assert_eq!(g.col_mv(15, 7), ColMv::default());

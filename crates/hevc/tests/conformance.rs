@@ -60,7 +60,98 @@ fixture_tests!(
     uhd_4k_main10,
     vt_main,
     vt_main10,
+    intra_422_10,
+    intra_422_12,
+    intra_422_nofilt,
+    medium_422_8,
+    medium_422_10,
+    medium_422_12,
+    bframes_422_10,
+    slices4_422_10,
+    rect_amp_422_10,
+    weightp_422_10,
+    tskip_422_10,
+    chroma_qp_422_10,
+    scaling_list_422_10,
+    lossless_422_10,
+    crf0_422_10,
+    odd_422_10,
+    medium_main12,
 );
+
+/// Range-extension conformance bitstreams (ITU-T JCT-VC RExt suite, not in the repository): with
+/// `FILMCRAFT_HEVC_REXT_DIR` set to a folder holding them (any layout), the 4:2:0 / 4:2:2 ones must
+/// decode bit-exactly against ffmpeg's decode, and the others (4:4:4, unsupported tools) must be
+/// refused with `Error::Unsupported`, never decoded wrongly. Skipped without the variable or ffmpeg.
+#[test]
+fn rext_conformance_streams() {
+    let Some(dir) = std::env::var_os("FILMCRAFT_HEVC_REXT_DIR").map(std::path::PathBuf::from) else {
+        eprintln!("skipped: FILMCRAFT_HEVC_REXT_DIR not set");
+        return;
+    };
+    let Some(ff) = common::ffmpeg() else { return };
+    // (stream name, expected: Some((width, height, bit depth, chroma_format_idc)) = bit-exact, None = refused)
+    let expected: &[(&str, Option<(usize, usize, u32, u32)>)] = &[
+        ("ADJUST_IPRED_ANGLE_A_RExt_Mitsubishi_2", Some((1920, 1080, 10, 2))),
+        ("GENERAL_8b_420_RExt_Sony_1", Some((400, 384, 8, 1))),
+        ("GENERAL_10b_420_RExt_Sony_1", Some((400, 384, 10, 1))),
+        ("GENERAL_12b_420_RExt_Sony_1", Some((400, 384, 12, 1))),
+        ("GENERAL_10b_422_RExt_Sony_1", Some((400, 384, 10, 2))),
+        ("GENERAL_12b_422_RExt_Sony_1", Some((400, 384, 12, 2))),
+        ("IPCM_A_RExt_NEC_2", Some((416, 240, 10, 2))),
+        ("Main_422_10_A_RExt_Sony_2", Some((1920, 1080, 10, 2))),
+        ("Main_422_10_B_RExt_Sony_2", Some((2560, 1600, 10, 2))),
+        ("WPP_AND_TILE_10Bit422Test_HIGH_TP_444_10BIT_RExt_Apple_2", None),
+        ("PERSIST_RPARAM_A_RExt_Sony_3", None),
+        ("TSCTX_8bit_RExt_SHARP_1", None),
+        ("IPCM_B_RExt_NEC", None),
+    ];
+    let mut files = Vec::new();
+    let mut stack = vec![dir];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "bit" || x == "bin") {
+                files.push(p);
+            }
+        }
+    }
+    let out = common::fixtures_dir().join("rext");
+    std::fs::create_dir_all(&out).unwrap();
+    let mut checked = 0;
+    for &(name, want) in expected {
+        let Some(path) = files.iter().find(|p| p.file_stem().is_some_and(|s| s == name)) else {
+            eprintln!("missing {name}");
+            continue;
+        };
+        let Some((w, h, bd, chroma)) = want else {
+            let err = common::decode_file_threads(path, 1).err().map(|(_, e, _)| e);
+            assert!(matches!(err, Some(filmcraft_hevc::Error::Unsupported(_))), "{name}: expected an unsupported error, got {err:?}");
+            checked += 1;
+            continue;
+        };
+        let yuv = out.join(format!("{name}.yuv"));
+        if !yuv.exists() {
+            let ok = std::process::Command::new(&ff)
+                .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+                .arg(path)
+                .args(["-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", common::pix_fmt(bd, chroma)])
+                .arg(&yuv)
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(ok, "{name}: reference decode failed");
+        }
+        let reference = std::fs::read(&yuv).unwrap();
+        for threads in [1, 0] {
+            let pics = common::decode_file_threads(path, threads).unwrap_or_else(|(au, e, _)| panic!("{name}: error at {au}: {e}"));
+            common::compare(&pics, &reference, w, h, bd, chroma).unwrap_or_else(|e| panic!("{name} (threads {threads}): {e}"));
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "no RExt conformance streams found");
+}
 
 /// Draft mode: sub-layer non-reference pictures skip deblocking and SAO and are flagged; every
 /// other picture stays bit-exact, single-threaded and frame-threaded.
@@ -125,10 +216,10 @@ fn compare_detects_mismatch() {
     let Some((hevc, yuv)) = common::ensure(f) else { return };
     let pics = common::decode_file_threads(&hevc, 1).map_err(|e| e.1).unwrap();
     let mut reference = std::fs::read(yuv).unwrap();
-    common::compare(&pics, &reference, f.width as usize, f.height as usize, f.bit_depth).unwrap();
+    common::compare(&pics, &reference, f.width as usize, f.height as usize, f.bit_depth, f.chroma).unwrap();
     let pos = reference.len() - 7;
     reference[pos] ^= 1;
-    let err = common::compare(&pics, &reference, f.width as usize, f.height as usize, f.bit_depth).unwrap_err();
+    let err = common::compare(&pics, &reference, f.width as usize, f.height as usize, f.bit_depth, f.chroma).unwrap_err();
     assert!(err.contains("plane V"), "{err}");
 }
 
