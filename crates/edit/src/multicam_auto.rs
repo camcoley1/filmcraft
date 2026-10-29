@@ -4,10 +4,12 @@
 //! (`None` for a word without a speaker label: it only keeps cuts out of itself). Consecutive
 //! words of one angle form a turn; a cut to a turn's angle is made `lead` before its first word,
 //! pulled later when that would land inside another word. Optionally a wide angle covers long
-//! silences. Overlapping speech gets no wide shot of its own: no cut may land inside a word, so a
-//! speaker who starts over another word is shown once that word has ended. Shots shorter than `min_shot` are then merged into the shot before
-//! them (the first into the one after), so a "yeah" does not flash the other camera. The result
-//! is deterministic and feeds [`crate::multicam::record`].
+//! silences (at the start, between words of any speaker, and at the end). Overlapping speech gets no
+//! wide shot of its own: no cut may land inside a word, so a speaker who starts over another word
+//! is shown once that word has ended. A long unlabelled word (music, noise) also blocks cuts.
+//! Shots shorter than `min_shot` are then merged into the shot before them (the first into the one
+//! after), so a "yeah" does not flash the other camera. The result is deterministic and feeds
+//! [`crate::multicam::record`].
 
 use filmcraft_time::{Tick, TimeRange};
 
@@ -87,39 +89,50 @@ fn turns(words: &[SpeechWord]) -> Vec<Turn> {
     out
 }
 
+fn sub(a: Tick, b: Tick) -> Tick {
+    Tick(a.0.saturating_sub(b.0))
+}
+
 /// The cuts for `words` inside `range`. `words` must be sorted by start. The first cut is at the
 /// range start; no cut lies inside a word except that one. Empty when no word has a speaker.
+///
+/// Silence is judged on every word, labelled or not, whoever speaks: a gap of `wide_after` or more
+/// between the range start, the words and the range end goes to the wide angle, and the speaker
+/// who talks next is cut back to even when it is the one who spoke before.
 pub fn auto_switch(words: &[SpeechWord], range: TimeRange, p: &AutoParams) -> Vec<Cut> {
     let (lo, hi) = (range.start, range.end());
     let all = Words::new(words);
     let turns = turns(words);
     let Some(first) = turns.first() else { return Vec::new() };
-    // (wanted start, angle) in order; made monotonic below
-    let mut events: Vec<(Tick, u32)> = Vec::new();
-    let lead_cut = |t: &Turn| all.outside_words((t.start - p.lead).max(lo));
-    let wide = p.wide.zip(p.wide_after);
-    match wide {
-        Some((w, after)) if first.start - lo >= after => {
-            events.push((lo, w));
-            events.push((lead_cut(first), first.angle));
-        }
-        _ => events.push((lo, first.angle)),
-    }
+    let lead_cut = |t: Tick| all.outside_words(sub(t, p.lead).max(lo));
+    // (wanted start, angle); sorted by time below, a later event at the same time wins
+    let mut events: Vec<(Tick, u32)> = vec![(lo, first.angle)];
     for pair in turns.windows(2) {
-        let (a, b) = (&pair[0], &pair[1]);
-        let silence = b.start - a.end;
-        match wide {
-            Some((w, after)) if silence >= after => {
-                events.push((all.outside_words(a.end), w));
-                events.push((lead_cut(b), b.angle));
-            }
-            _ if a.angle != b.angle => events.push((lead_cut(b), b.angle)),
-            _ => {}
+        if pair[0].angle != pair[1].angle {
+            events.push((lead_cut(pair[1].start), pair[1].angle));
         }
     }
+    if let Some((wide, after)) = p.wide.zip(p.wide_after) {
+        let mut spoken_to = lo;
+        for (i, w) in words.iter().enumerate() {
+            if sub(w.start, spoken_to) >= after {
+                events.push((spoken_to, wide));
+                // the next labelled speaker takes over a lead before this word
+                if let Some(angle) = words[i..].iter().find_map(|x| x.angle) {
+                    events.push((lead_cut(w.start).max(spoken_to), angle));
+                }
+            }
+            spoken_to = spoken_to.max(w.end);
+        }
+        if sub(hi, spoken_to) >= after && spoken_to < hi {
+            events.push((all.outside_words(spoken_to), wide));
+        }
+    }
+    let mut order: Vec<usize> = (0..events.len()).collect();
+    order.sort_by_key(|&i| (events[i].0, i));
     // monotonic starts inside the range: a later event at or before the previous start replaces it
     let mut segs: Vec<(Tick, u32)> = Vec::new();
-    for (t, angle) in events {
+    for (t, angle) in order.into_iter().map(|i| events[i]) {
         if t >= hi {
             continue;
         }
@@ -133,7 +146,7 @@ pub fn auto_switch(words: &[SpeechWord], range: TimeRange, p: &AutoParams) -> Ve
     while segs.len() > 1 {
         let short = (0..segs.len()).find(|&i| {
             let end = segs.get(i + 1).map_or(hi, |n| n.0);
-            end - segs[i].0 < p.min_shot
+            sub(end, segs[i].0) < p.min_shot
         });
         let Some(i) = short else { break };
         if i == 0 {
@@ -227,6 +240,22 @@ mod tests {
         // a long silence before the first word starts on the wide shot
         let words = [w(5.0, 8.0, 0)];
         assert_eq!(times(&auto_switch(&words, range(0.0, 9.0), &p)), vec![(0, 2), (4900, 0)]);
+        let p = AutoParams { min_shot: t(0.5), ..p };
+        // the same speaker after a long silence: wide in between, then back
+        let words = [w(0.0, 1.0, 0), w(10.0, 11.0, 0)];
+        assert_eq!(times(&auto_switch(&words, range(0.0, 12.0), &p)), vec![(0, 0), (1000, 2), (9900, 0)]);
+        // trailing silence goes wide
+        let words = [w(0.0, 1.0, 0), w(1.5, 4.0, 0)];
+        assert_eq!(times(&auto_switch(&words, range(0.0, 10.0), &p)), vec![(0, 0), (4000, 2)]);
+        // unlabelled speech is not silence
+        let un = SpeechWord { start: t(2.0), end: t(8.0), angle: None };
+        let words = [w(0.0, 1.0, 0), un, w(8.5, 9.0, 0)];
+        assert_eq!(times(&auto_switch(&words, range(0.0, 10.0), &p)), vec![(0, 0)]);
+        // a silence shorter than the threshold stays, and the range end limits the trailing one
+        let words = [w(0.0, 1.0, 0)];
+        assert_eq!(times(&auto_switch(&words, range(0.0, 4.5), &p)), vec![(0, 0), (1000, 2)]);
+        assert_eq!(times(&auto_switch(&words, range(0.0, 4.0), &p)), vec![(0, 0), (1000, 2)]);
+        assert_eq!(times(&auto_switch(&words, range(0.0, 3.5), &p)), vec![(0, 0)]);
     }
 
     #[test]
@@ -238,6 +267,23 @@ mod tests {
         let words = [w(0.0, 3.0, 0), SpeechWord { start: t(3.5), end: t(5.5), angle: None }, w(5.0, 9.0, 1)];
         let cuts = auto_switch(&words, range(0.0, 10.0), &params());
         assert!(cuts.iter().skip(1).all(|c| !words.iter().any(|x| x.start < c.time && c.time < x.end)), "{cuts:?}");
+    }
+
+    #[test]
+    fn extreme_ticks_never_panic() {
+        let big = Tick::MAX;
+        let low = Tick::MIN;
+        let words = [
+            SpeechWord { start: low, end: low + Tick(5), angle: Some(0) },
+            SpeechWord { start: Tick(0), end: Tick(1), angle: Some(1) },
+            SpeechWord { start: big - Tick(5), end: big, angle: Some(0) },
+        ];
+        let p = AutoParams { wide: Some(2), min_shot: Tick(0), wide_after: Some(Tick(1)), lead: Tick(i64::MAX / 8) };
+        let cuts = auto_switch(&words, TimeRange::from_bounds(low, big), &p);
+        assert!(!cuts.is_empty());
+        let p = AutoParams { wide: None, min_shot: Tick(i64::MAX), wide_after: None, lead: Tick(i64::MAX) };
+        let _ = auto_switch(&words, TimeRange::from_bounds(low, big), &p);
+        let _ = auto_switch(&words, TimeRange::from_bounds(Tick(5), Tick(5)), &p);
     }
 
     #[test]

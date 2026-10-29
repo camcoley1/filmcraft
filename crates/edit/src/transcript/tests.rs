@@ -493,3 +493,40 @@ fn phrase_fillers_must_be_contiguous() {
     // a single word is unaffected by any of this
     assert_eq!(find_fillers(&cross, &["know".to_string()]), [1..2]);
 }
+
+/// Words of a nested sequence's audio sit where the nested clip plays them, through nonzero inner
+/// and outer offsets.
+#[test]
+fn nested_sequence_words_are_mapped_through_both_offsets() {
+    let mut p = Project::new("t");
+    let settings = SequenceSettings { frame_rate: R, ..Default::default() };
+    let inner_id = p.new_sequence("inner", settings.clone(), 1, 1, None);
+    let outer_id = p.new_sequence("outer", settings, 1, 1, None);
+    // inner: the interview from its 1 s on, placed at inner 2 s, 6 s long
+    p.sequence_mut(inner_id).unwrap().audio_tracks[0].items.push(clip(1, 2.0, 6.0, 1.0));
+    // outer: inner from its 3 s on, placed at outer 10 s, 2.5 s long
+    let mut c = clip(2, 10.0, 2.5, 3.0);
+    c.item = inner_id;
+    p.sequence_mut(outer_id).unwrap().audio_tracks[0].items.push(c);
+    let tr = transcripts();
+    let inner = p.sequence(inner_id).unwrap();
+    let outer = p.sequence(outer_id).unwrap();
+    assert!(sequence_words(outer, &tr).is_empty(), "the plain mapping does not see through the nest");
+    let words = sequence_words_nested(outer, &tr, &|id| p.sequence(id));
+    assert!(!words.is_empty());
+    let direct = sequence_words(inner, &tr);
+    for w in &words {
+        assert!(w.start >= s(10.0) && w.end <= s(12.5), "{w:?}");
+        let src = direct.iter().find(|d| d.index == w.index).expect("the word comes from the inner sequence");
+        // outer = 10 + (inner - 3), clamped to the nested window [3, 5.5]
+        assert_eq!(w.start, s(10.0) + (src.start.max(s(3.0)) - s(3.0)));
+        assert_eq!(w.item, MEDIA);
+    }
+    // a sequence that contains itself ends at the depth limit
+    let mut p2 = Project::new("loop");
+    let id = p2.new_sequence("loop", SequenceSettings { frame_rate: R, ..Default::default() }, 1, 1, None);
+    let mut c = clip(3, 0.0, 5.0, 0.0);
+    c.item = id;
+    p2.sequence_mut(id).unwrap().audio_tracks[0].items.push(c);
+    assert!(sequence_words_nested(p2.sequence(id).unwrap(), &tr, &|i| p2.sequence(i)).is_empty());
+}

@@ -100,6 +100,49 @@ pub fn sequence_words(seq: &Sequence, transcripts: &Transcripts) -> Vec<SeqWord>
     out
 }
 
+/// Deepest chain of nested sequences followed for speech.
+const MAX_NEST_DEPTH: usize = 4;
+/// Most words [`sequence_words_nested`] returns.
+const MAX_NESTED_WORDS: usize = 2_000_000;
+
+/// [`sequence_words`], also reading audio clips that show a nested sequence (`nested` finds a
+/// sequence by item id): the nested sequence's words are mapped through the clip's source in point,
+/// start and speed, so they sit where the nested audio plays. Follows at most four levels (a
+/// sequence that contains itself ends there) and returns at most two million words.
+pub fn sequence_words_nested<'a>(seq: &'a Sequence, transcripts: &Transcripts, nested: &dyn Fn(ItemId) -> Option<&'a Sequence>) -> Vec<SeqWord> {
+    let mut out = collect_nested(seq, transcripts, nested, 0);
+    out.sort_by_key(|w| (w.start, w.track));
+    out
+}
+
+fn collect_nested<'a>(seq: &'a Sequence, transcripts: &Transcripts, nested: &dyn Fn(ItemId) -> Option<&'a Sequence>, depth: usize) -> Vec<SeqWord> {
+    let mut out = sequence_words(seq, transcripts);
+    if depth >= MAX_NEST_DEPTH {
+        return out;
+    }
+    for (ti, track) in seq.audio_tracks.iter().enumerate() {
+        for it in &track.items {
+            if !it.enabled || it.reverse || it.frame_hold.is_some() || it.speed <= 0.0 || transcripts.contains_key(&it.item) {
+                continue;
+            }
+            let Some(inner) = nested(it.item) else { continue };
+            let (s_in, s_out) = (it.source_in, it.source_in + ticks(it.duration.0 as f64 * it.speed));
+            let to_tl = |m: Tick| it.start + ticks((m - it.source_in).0 as f64 / it.speed);
+            for w in collect_nested(inner, transcripts, nested, depth + 1) {
+                if out.len() >= MAX_NESTED_WORDS {
+                    return out;
+                }
+                if w.end <= s_in || w.start >= s_out {
+                    continue;
+                }
+                let (a, b) = (to_tl(w.start.max(s_in)), to_tl(w.end.min(s_out)));
+                out.push(SeqWord { start: a, end: b.max(a), clip: it.id, track: ti, ..w });
+            }
+        }
+    }
+    out
+}
+
 /// Index of the word being spoken at `t` (the last word starting at or before `t` whose end is
 /// after `t`).
 pub fn word_at(words: &[SeqWord], t: Tick) -> Option<usize> {
