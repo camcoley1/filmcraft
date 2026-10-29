@@ -77,7 +77,7 @@ fn xorshift(seed: &mut u64) -> u64 {
 /// Damaged streams must never panic or hang; errors are fine.
 #[test]
 fn corrupted_streams_do_not_panic() {
-    for name in ["main_cabac_b", "baseline_cif_noise", "cavlc_b", "bpyramid"] {
+    for name in ["main_cabac_b", "baseline_cif_noise", "cavlc_b", "bpyramid", "high10_medium", "high10_cavlc_b"] {
         let f = common::fixture(name);
         let Some((h264, _)) = common::ensure(f) else { return };
         let data = std::fs::read(h264).unwrap();
@@ -100,6 +100,41 @@ fn corrupted_streams_do_not_panic() {
                 let _ = dec.flush();
                 let _ = dec.take_error();
             }
+        }
+    }
+}
+
+/// Damaged parameter sets (bit flips confined to the SPS / PPS NAL units, so that hostile bit
+/// depths, chroma formats and sizes reach the decoder) of High 10 streams: errors are fine, panics
+/// are not.
+#[test]
+fn damaged_parameter_sets_do_not_panic() {
+    for name in ["high10_medium", "high10_intra_cavlc"] {
+        let f = common::fixture(name);
+        let Some((h264, _)) = common::ensure(f) else { return };
+        let data = std::fs::read(h264).unwrap();
+        let mut ranges = Vec::new();
+        for nal in filmcraft_bitstream::annexb_nals(&data) {
+            if matches!(nal[0] & 0x1f, 7 | 8) {
+                let start = nal.as_ptr() as usize - data.as_ptr() as usize;
+                ranges.push(start + 1..start + nal.len());
+            }
+        }
+        assert!(!ranges.is_empty(), "{name}: no parameter sets");
+        let mut seed = 0x5eed_0bad_u64 ^ name.len() as u64;
+        for round in 0..60 {
+            let mut d = data.clone();
+            for _ in 0..1 + round % 3 {
+                let r = &ranges[xorshift(&mut seed) as usize % ranges.len()];
+                let pos = r.start + xorshift(&mut seed) as usize % (r.end - r.start).max(1);
+                d[pos] ^= 1 << (xorshift(&mut seed) % 8);
+            }
+            let mut dec = Decoder::with_threads(1 + round % 2);
+            for au in common::split_access_units(&d) {
+                let _ = dec.decode(au, 0);
+            }
+            let _ = dec.flush();
+            let _ = dec.take_error();
         }
     }
 }

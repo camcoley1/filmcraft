@@ -9,7 +9,7 @@
 use crate::dpb::{Dpb, Output, OutputMeta, RefMark};
 use crate::error::{Error, Result, ensure, invalid, unsupported};
 use crate::params::{Pps, Sps};
-use crate::picture::{Frame, FrameRef, MbKind, MbState, Planes, RefPic};
+use crate::picture::{Frame, FrameRef, MbKind, Pixel, RefPic};
 use crate::slice::{NalHeader, Poc, PocState, SliceHeader, SliceType, is_new_picture, nal_type};
 use crate::slicedec::{PicState, SliceDecoder};
 use crate::transform::LevelScale;
@@ -72,8 +72,26 @@ pub struct DecodeStats {
 struct Shared {
     error: Mutex<Option<Error>>,
     stats: Mutex<DecodeStats>,
-    /// Recycled picture buffers.
-    pool: Mutex<Vec<PicState>>,
+    /// Recycled picture buffers (8-bit and deeper pictures).
+    pool8: Mutex<Vec<PicState<u8>>>,
+    pool16: Mutex<Vec<PicState<u16>>>,
+}
+
+/// The recycled-buffer pool of a sample type.
+trait Pooled: Pixel {
+    fn pool(shared: &Shared) -> &Mutex<Vec<PicState<Self>>>;
+}
+
+impl Pooled for u8 {
+    fn pool(shared: &Shared) -> &Mutex<Vec<PicState<u8>>> {
+        &shared.pool8
+    }
+}
+
+impl Pooled for u16 {
+    fn pool(shared: &Shared) -> &Mutex<Vec<PicState<u16>>> {
+        &shared.pool16
+    }
 }
 
 /// H.264 decoder.
@@ -404,7 +422,7 @@ impl Decoder {
         // Activate SPS; a resolution change flushes the DPB.
         let changed = match &self.active_sps {
             None => true,
-            Some(a) => a.width() != sps.width() || a.height() != sps.height() || a.max_dpb_frames() != sps.max_dpb_frames(),
+            Some(a) => a.width() != sps.width() || a.height() != sps.height() || a.max_dpb_frames() != sps.max_dpb_frames() || a.format() != sps.format(),
         };
         if changed && self.active_sps.is_some() {
             let mut outs = Vec::new();
@@ -431,21 +449,15 @@ impl Decoder {
                 let next_id = &mut self.next_id;
                 let poc_state = &mut self.poc_state;
                 let last = self.dpb.entries.iter().filter(|e| !e.non_existing).max_by_key(|e| e.frame.id).map(|e| e.frame.clone());
+                let fmt = sps.format();
                 let mut make = |_fnum: u32| {
                     let id = *next_id;
                     *next_id += 1;
-                    let planes = match &last {
-                        Some(f) if f.mb_w == mb_w && f.mb_h() == mb_h => {
-                            let mut p = Planes::new(mb_w * 16, mb_h * 16);
-                            let (y, u, v) = f.copy_cropped((0, 0, mb_w * 16, mb_h * 16));
-                            p.y = y;
-                            p.cb = u;
-                            p.cr = v;
-                            p
-                        }
-                        _ => Planes::gray(mb_w * 16, mb_h * 16),
+                    let frame = match &last {
+                        Some(f) if f.mb_w == mb_w && f.mb_h() == mb_h && f.fmt == fmt => f.copy_samples(id, 0),
+                        _ => Frame::gray(id, 0, mb_w, mb_h, fmt),
                     };
-                    (Arc::new(Frame::from_planes(id, 0, &planes)), 0, meta.clone())
+                    (Arc::new(frame), 0, meta.clone())
                 };
                 let mut upd = |fnum: u32| poc_state.update_gap_frame(fnum, sps);
                 self.shared.stats.lock().map(|mut s| s.frame_num_gaps += 1).ok();
@@ -458,7 +470,7 @@ impl Decoder {
         let frame_poc = if sh.has_mmco5() { 0 } else { poc.frame() };
         let id = self.next_id;
         self.next_id += 1;
-        let frame = Arc::new(Frame::new(id, frame_poc, mb_w, mb_h));
+        let frame = Arc::new(Frame::new(id, frame_poc, mb_w, mb_h, sps.format()));
         self.pending = Some(PendingPic { frame, sps: sps.clone(), first: sh.clone(), poc, pts, key: sh.idr, slices: Vec::new() });
         Ok(())
     }
@@ -491,10 +503,10 @@ impl Decoder {
                 }
             }
             self.in_flight.push_back(frame.clone());
-            pool.spawn_fifo(move || run_job(frame, slices, &shared, draft));
+            pool.spawn_fifo(move || run_job_any(frame, slices, &shared, draft));
             return;
         }
-        run_job(frame, slices, &shared, draft);
+        run_job_any(frame, slices, &shared, draft);
     }
 
     fn emit(&mut self, outs: Vec<Output<FrameRef>>) {
@@ -502,11 +514,20 @@ impl Decoder {
     }
 }
 
+/// Decode all slices of one picture in its sample type.
+fn run_job_any(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared, draft: bool) {
+    if frame.fmt.stores_u8() {
+        run_job::<u8>(frame, slices, shared, draft);
+    } else {
+        run_job::<u16>(frame, slices, shared, draft);
+    }
+}
+
 /// Decode all slices of one picture and publish its rows.
-fn run_job(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared, draft: bool) {
-    let reuse = shared.pool.lock().ok().and_then(|mut p| p.pop());
+fn run_job<P: Pooled>(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared, draft: bool) {
+    let reuse = P::pool(shared).lock().ok().and_then(|mut p| p.pop());
     let mut pic = match reuse {
-        Some(mut p) if p.mb_w == frame.mb_w && p.mb_h == frame.mb_h() => {
+        Some(mut p) if p.mb_w == frame.mb_w && p.mb_h == frame.mb_h() && p.fmt == frame.fmt => {
             p.reset(frame.clone());
             p
         }
@@ -527,13 +548,7 @@ fn run_job(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared, draft: bool)
         Ok(e) => e,
         Err(_) => {
             // Make sure readers never block on this frame.
-            let fallback = Planes::gray(frame.width, frame.height);
-            let blank = vec![MbState::default(); frame.mb_w * frame.mb_h()];
-            for r in 0..frame.mb_h() {
-                if !frame.is_published(r) {
-                    frame.publish(r, Frame::make_row(&fallback, r, &blank, &|_, _, _| u32::MAX));
-                }
-            }
+            frame.publish_gray();
             pic = PicState::new(frame.clone());
             Some(Error::Invalid("internal error while decoding a picture".into()))
         }
@@ -561,14 +576,14 @@ fn run_job(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared, draft: bool)
     if let (Some(e), Ok(mut slot)) = (err, shared.error.lock()) {
         slot.get_or_insert(e);
     }
-    if let Ok(mut p) = shared.pool.lock()
+    if let Ok(mut p) = P::pool(shared).lock()
         && p.len() < 4
     {
         p.push(pic);
     }
 }
 
-fn decode_slice(s: &SliceJob, pic: &mut PicState) -> Result<()> {
+fn decode_slice<P: Pixel>(s: &SliceJob, pic: &mut PicState<P>) -> Result<()> {
     let mut sd = SliceDecoder::new(&s.sh, &s.pps, &s.sps, pic, &s.refs, &s.ls)?;
     if s.pps.entropy_coding_mode {
         sd.decode_cabac(&s.rbsp)
@@ -597,13 +612,18 @@ fn output_meta(sps: &Sps, pts: i64, key: bool) -> OutputMeta {
 fn make_picture(o: &Output<FrameRef>) -> Picture {
     let (cx, cy, cw, ch) = o.meta.crop;
     let (cx, cy, cw, ch) = (cx as usize, cy as usize, cw as usize, ch as usize);
-    let (y, u, v) = o.frame.copy_cropped((cx, cy, cw, ch));
-    let (ccw, cch) = (cw.div_ceil(2), ch.div_ceil(2));
+    let (y, u, v) = o.frame.cropped_planes((cx, cy, cw, ch));
+    let fmt = o.frame.fmt;
+    let sy = if fmt.chroma_format_idc == 2 { 1 } else { 2 };
+    let (ccw, cch) = (cw.div_ceil(2), ch.div_ceil(sy));
     Picture {
         width: cw as u32,
         height: ch as u32,
         chroma_width: ccw as u32,
         chroma_height: cch as u32,
+        chroma_format_idc: fmt.chroma_format_idc,
+        bit_depth: fmt.bit_depth_y,
+        bit_depth_chroma: fmt.bit_depth_c,
         y,
         u,
         v,

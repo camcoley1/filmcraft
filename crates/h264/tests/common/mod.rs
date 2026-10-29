@@ -20,6 +20,8 @@ pub struct Fixture {
     pub frames: u32,
     /// Extra video filter appended after the source (e.g. noise, fade).
     pub filter: &'static str,
+    /// Sample format of the source and of the reference decode (yuv420p, yuv420p10le, yuv422p...).
+    pub pix_fmt: &'static str,
     /// Encoder arguments.
     pub args: &'static [&'static str],
 }
@@ -35,6 +37,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 360,
         frames: 30,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-c:v", "h264_videotoolbox", "-profile:v", "high", "-b:v", "3M"],
     },
     Fixture {
@@ -44,6 +47,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 360,
         frames: 30,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-c:v", "h264_videotoolbox", "-profile:v", "main", "-b:v", "2M"],
     },
     Fixture {
@@ -53,6 +57,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 240,
         frames: 30,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-c:v", "h264_videotoolbox", "-profile:v", "baseline", "-b:v", "1M"],
     },
     Fixture {
@@ -62,6 +67,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 1080,
         frames: 10,
         filter: "",
+        pix_fmt: "yuv420p",
         args: &["-c:v", "h264_videotoolbox", "-profile:v", "high", "-b:v", "8M"],
     },
     // performance reference stream (see tests/perf.rs)
@@ -72,6 +78,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 1080,
         frames: 120,
         filter: "noise=alls=3:allf=t",
+        pix_fmt: "yuv420p",
         args: &["-preset", "medium", "-crf", "20"],
     },
     Fixture {
@@ -81,6 +88,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 144,
         frames: 3,
         filter: "",
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "baseline", "-x264-params", "keyint=1:no-deblock=1"],
     },
     Fixture {
@@ -90,6 +98,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 3,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "baseline", "-x264-params", "keyint=1:no-deblock=1"],
     },
     Fixture {
@@ -99,6 +108,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 3,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "high", "-x264-params", "keyint=1:no-deblock=1:cabac=0"],
     },
     Fixture {
@@ -108,6 +118,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 3,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "high", "-x264-params", "keyint=1:no-deblock=1:cabac=0:cqm=jvt"],
     },
     Fixture {
@@ -117,6 +128,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 20,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "baseline", "-x264-params", "no-deblock=1:ref=3"],
     },
     Fixture {
@@ -126,9 +138,19 @@ pub const FIXTURES: &[Fixture] = &[
         height: 144,
         frames: 30,
         filter: "",
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "baseline", "-x264-params", "keyint=15"],
     },
-    Fixture { name: "baseline_cif_noise", source: "mandelbrot", width: 352, height: 288, frames: 25, filter: NOISE, args: &["-profile:v", "baseline"] },
+    Fixture {
+        name: "baseline_cif_noise",
+        source: "mandelbrot",
+        width: 352,
+        height: 288,
+        frames: 25,
+        filter: NOISE,
+        pix_fmt: "yuv420p",
+        args: &["-profile:v", "baseline"],
+    },
     Fixture {
         name: "cavlc_b",
         source: "testsrc2",
@@ -136,6 +158,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 30,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "high", "-x264-params", "cabac=0:bframes=3"],
     },
     Fixture {
@@ -145,6 +168,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 30,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "main", "-x264-params", "cabac=0:bframes=3:direct=temporal:weightb=1"],
     },
     Fixture {
@@ -154,12 +178,152 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 30,
         filter: "fade=in:0:25",
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "main", "-x264-params", "cabac=0:weightp=2:bframes=2:weightb=1"],
     },
-    Fixture { name: "main_cabac_b", source: "testsrc2", width: 352, height: 288, frames: 30, filter: NOISE, args: &["-profile:v", "main"] },
-    Fixture { name: "high_720p", source: "smptehdbars", width: 1280, height: 720, frames: 10, filter: NOISE, args: &["-profile:v", "high"] },
-    Fixture { name: "high_1080p", source: "testsrc2", width: 1920, height: 1080, frames: 6, filter: "", args: &["-profile:v", "high"] },
-    Fixture { name: "crop_1918x1078", source: "testsrc2", width: 1918, height: 1078, frames: 5, filter: NOISE, args: &["-profile:v", "high"] },
+    Fixture { name: "main_cabac_b", source: "testsrc2", width: 352, height: 288, frames: 30, filter: NOISE, pix_fmt: "yuv420p", args: &["-profile:v", "main"] },
+    Fixture {
+        name: "high_720p",
+        source: "smptehdbars",
+        width: 1280,
+        height: 720,
+        frames: 10,
+        filter: NOISE,
+        pix_fmt: "yuv420p",
+        args: &["-profile:v", "high"],
+    },
+    Fixture { name: "high_1080p", source: "testsrc2", width: 1920, height: 1080, frames: 6, filter: "", pix_fmt: "yuv420p", args: &["-profile:v", "high"] },
+    Fixture {
+        name: "crop_1918x1078",
+        source: "testsrc2",
+        width: 1918,
+        height: 1078,
+        frames: 5,
+        filter: NOISE,
+        pix_fmt: "yuv420p",
+        args: &["-profile:v", "high"],
+    },
+    // High 10 (libx264 10-bit)
+    Fixture {
+        name: "high10_intra",
+        source: "testsrc2",
+        width: 352,
+        height: 288,
+        frames: 3,
+        filter: NOISE,
+        pix_fmt: "yuv420p10le",
+        args: &["-profile:v", "high10", "-x264-params", "keyint=1"],
+    },
+    Fixture {
+        name: "high10_intra_cavlc",
+        source: "testsrc2",
+        width: 352,
+        height: 288,
+        frames: 3,
+        filter: NOISE,
+        pix_fmt: "yuv420p10le",
+        args: &["-profile:v", "high10", "-coder", "0", "-x264-params", "keyint=1"],
+    },
+    Fixture {
+        name: "high10_medium",
+        source: "testsrc2",
+        width: 352,
+        height: 288,
+        frames: 20,
+        filter: NOISE,
+        pix_fmt: "yuv420p10le",
+        args: &["-profile:v", "high10", "-preset", "medium"],
+    },
+    Fixture {
+        name: "high10_cavlc_b",
+        source: "mandelbrot",
+        width: 352,
+        height: 288,
+        frames: 20,
+        filter: NOISE,
+        pix_fmt: "yuv420p10le",
+        args: &["-profile:v", "high10", "-coder", "0", "-bf", "3"],
+    },
+    Fixture {
+        name: "high10_bpyramid",
+        source: "mandelbrot",
+        width: 352,
+        height: 288,
+        frames: 30,
+        filter: NOISE,
+        pix_fmt: "yuv420p10le",
+        args: &["-profile:v", "high10", "-x264-params", "bframes=3:b-pyramid=normal:ref=4"],
+    },
+    Fixture {
+        name: "high10_weightp",
+        source: "testsrc2",
+        width: 352,
+        height: 288,
+        frames: 25,
+        filter: "fade=in:0:20",
+        pix_fmt: "yuv420p10le",
+        args: &["-profile:v", "high10", "-x264-params", "weightp=2:bframes=3:weightb=1"],
+    },
+    Fixture {
+        name: "high10_temporal",
+        source: "testsrc2",
+        width: 352,
+        height: 288,
+        frames: 20,
+        filter: NOISE,
+        pix_fmt: "yuv420p10le",
+        args: &["-profile:v", "high10", "-x264-params", "direct=temporal:bframes=3"],
+    },
+    Fixture {
+        name: "high10_slices_dbk",
+        source: "testsrc2",
+        width: 352,
+        height: 288,
+        frames: 12,
+        filter: NOISE,
+        pix_fmt: "yuv420p10le",
+        args: &["-profile:v", "high10", "-x264-params", "slices=4:deblock=-3,3:chroma-qp-offset=-5"],
+    },
+    Fixture {
+        name: "high10_no8x8_cqm",
+        source: "testsrc2",
+        width: 352,
+        height: 288,
+        frames: 12,
+        filter: NOISE,
+        pix_fmt: "yuv420p10le",
+        args: &["-profile:v", "high10", "-x264-params", "no-8x8dct=1:cqm=jvt"],
+    },
+    Fixture {
+        name: "high10_qp1",
+        source: "mandelbrot",
+        width: 352,
+        height: 288,
+        frames: 6,
+        filter: NOISE,
+        pix_fmt: "yuv420p10le",
+        args: &["-profile:v", "high10", "-qp", "1"],
+    },
+    Fixture {
+        name: "high10_qp51",
+        source: "testsrc2",
+        width: 352,
+        height: 288,
+        frames: 12,
+        filter: NOISE,
+        pix_fmt: "yuv420p10le",
+        args: &["-profile:v", "high10", "-qp", "51"],
+    },
+    Fixture {
+        name: "high10_odd",
+        source: "testsrc2",
+        width: 1918,
+        height: 1078,
+        frames: 3,
+        filter: NOISE,
+        pix_fmt: "yuv420p10le",
+        args: &["-profile:v", "high10", "-preset", "veryfast"],
+    },
     Fixture {
         name: "bpyramid",
         source: "testsrc2",
@@ -167,6 +331,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 30,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "high", "-x264-params", "bframes=3:b-pyramid=normal"],
     },
     Fixture {
@@ -176,6 +341,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 30,
         filter: "fade=in:0:25",
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "high", "-x264-params", "weightp=2"],
     },
     Fixture {
@@ -185,6 +351,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 30,
         filter: "fade=in:0:25",
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "high", "-x264-params", "weightb=1:bframes=3"],
     },
     Fixture {
@@ -194,6 +361,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 30,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "high", "-x264-params", "direct=temporal:bframes=3"],
     },
     Fixture {
@@ -203,6 +371,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 30,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "high", "-x264-params", "direct=spatial:bframes=3"],
     },
     Fixture {
@@ -212,6 +381,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 30,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "high", "-x264-params", "ref=4:bframes=2"],
     },
     Fixture {
@@ -221,6 +391,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 20,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "high", "-x264-params", "no-deblock=1"],
     },
     Fixture {
@@ -230,6 +401,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 20,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "high", "-x264-params", "deblock=-2,2"],
     },
     Fixture {
@@ -239,6 +411,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 20,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "high", "-x264-params", "cqm=jvt"],
     },
     Fixture {
@@ -248,6 +421,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 20,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "high", "-x264-params", "slices=4"],
     },
     Fixture {
@@ -257,6 +431,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 20,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "baseline", "-x264-params", "slices=4"],
     },
     Fixture {
@@ -266,6 +441,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 30,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "high", "-x264-params", "keyint=10"],
     },
     Fixture {
@@ -275,6 +451,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 40,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "high", "-x264-params", "open-gop=1:keyint=12:bframes=3"],
     },
     Fixture {
@@ -284,6 +461,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 20,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "high", "-x264-params", "constrained-intra=1"],
     },
     Fixture {
@@ -293,10 +471,29 @@ pub const FIXTURES: &[Fixture] = &[
         height: 288,
         frames: 20,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "high", "-x264-params", "8x8dct=0"],
     },
-    Fixture { name: "qp50", source: "testsrc2", width: 352, height: 288, frames: 20, filter: NOISE, args: &["-profile:v", "high", "-qp", "50"] },
-    Fixture { name: "qp1", source: "mandelbrot", width: 352, height: 288, frames: 10, filter: NOISE, args: &["-profile:v", "high", "-qp", "1"] },
+    Fixture {
+        name: "qp50",
+        source: "testsrc2",
+        width: 352,
+        height: 288,
+        frames: 20,
+        filter: NOISE,
+        pix_fmt: "yuv420p",
+        args: &["-profile:v", "high", "-qp", "50"],
+    },
+    Fixture {
+        name: "qp1",
+        source: "mandelbrot",
+        width: 352,
+        height: 288,
+        frames: 10,
+        filter: NOISE,
+        pix_fmt: "yuv420p",
+        args: &["-profile:v", "high", "-qp", "1"],
+    },
     Fixture {
         name: "qp1_cavlc",
         source: "mandelbrot",
@@ -304,6 +501,7 @@ pub const FIXTURES: &[Fixture] = &[
         height: 144,
         frames: 10,
         filter: NOISE,
+        pix_fmt: "yuv420p",
         args: &["-profile:v", "main", "-qp", "1", "-x264-params", "cabac=0"],
     },
 ];
@@ -345,7 +543,7 @@ pub fn ensure(f: &Fixture) -> Option<(PathBuf, PathBuf)> {
     let yuv = dir.join(format!("{}.yuv", f.name));
     if !h264.exists() {
         let tmp = filmcraft_testkit::temp_path(&h264);
-        let mut vf = format!("{}=size={}x{}:rate=25,format=yuv420p", f.source, f.width, f.height);
+        let mut vf = format!("{}=size={}x{}:rate=25,format={}", f.source, f.width, f.height, f.pix_fmt);
         if !f.filter.is_empty() {
             vf.push(',');
             vf.push_str(f.filter);
@@ -370,7 +568,7 @@ pub fn ensure(f: &Fixture) -> Option<(PathBuf, PathBuf)> {
         let tmp = filmcraft_testkit::temp_path(&yuv);
         let mut c = Command::new(&ff);
         c.args(["-hide_banner", "-loglevel", "error", "-y", "-i"]).arg(&h264);
-        c.args(["-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "yuv420p"]).arg(&tmp);
+        c.args(["-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", f.pix_fmt]).arg(&tmp);
         assert!(run(&mut c), "reference decode failed for {}", f.name);
         std::fs::rename(&tmp, &yuv).unwrap();
     }
@@ -453,8 +651,23 @@ pub fn decode_file_opts(path: &Path, threads: usize, draft: bool) -> Result<Vec<
 
 /// Compare decoded pictures with a raw yuv420p reference; returns a diagnostic on the first mismatch.
 pub fn compare(pics: &[Picture], reference: &[u8], w: usize, h: usize) -> Result<(), String> {
-    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-    let fsize = w * h + 2 * cw * ch;
+    compare_fmt(pics, reference, w, h, "yuv420p")
+}
+
+/// (bytes per sample, chroma_format_idc) of an ffmpeg pixel format name.
+pub fn pix_fmt_layout(pix_fmt: &str) -> (usize, u32) {
+    let bps = if pix_fmt.ends_with("le") { 2 } else { 1 };
+    let chroma = if pix_fmt.starts_with("yuv422") { 2 } else { 1 };
+    (bps, chroma)
+}
+
+/// [`compare`] with a raw reference in `pix_fmt` (planar 4:2:0 / 4:2:2, 8-bit or 16-bit
+/// little-endian samples).
+pub fn compare_fmt(pics: &[Picture], reference: &[u8], w: usize, h: usize, pix_fmt: &str) -> Result<(), String> {
+    let (bps, chroma) = pix_fmt_layout(pix_fmt);
+    let csy = if chroma == 2 { 1 } else { 2 };
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(csy));
+    let fsize = (w * h + 2 * cw * ch) * bps;
     let nref = reference.len() / fsize;
     for (i, p) in pics.iter().enumerate() {
         if i >= nref {
@@ -463,10 +676,23 @@ pub fn compare(pics: &[Picture], reference: &[u8], w: usize, h: usize) -> Result
         if p.width as usize != w || p.height as usize != h {
             return Err(format!("frame {i}: size {}x{} != {}x{}", p.width, p.height, w, h));
         }
+        if p.chroma_format_idc != chroma || (p.chroma_width as usize, p.chroma_height as usize) != (cw, ch) {
+            return Err(format!("frame {i}: chroma format {} ({}x{}) != {chroma} ({cw}x{ch})", p.chroma_format_idc, p.chroma_width, p.chroma_height));
+        }
         let f = &reference[i * fsize..(i + 1) * fsize];
-        let planes =
-            [("Y", &p.y[..], &f[..w * h], w, h, 16), ("U", &p.u[..], &f[w * h..w * h + cw * ch], cw, ch, 8), ("V", &p.v[..], &f[w * h + cw * ch..], cw, ch, 8)];
-        for (name, got, exp, pw, ph, mbs) in planes {
+        let sample = |buf: &[u8], k: usize| if bps == 2 { u16::from_le_bytes([buf[2 * k], buf[2 * k + 1]]) } else { buf[k] as u16 };
+        let to_vec = |pl: &filmcraft_h264::Plane, n: usize| -> Vec<u16> { (0..n).map(|k| pl.get(k)).collect() };
+        let (ys, cs) = (w * h, cw * ch);
+        let exp_y: Vec<u16> = (0..ys).map(|k| sample(f, k)).collect();
+        let exp_u: Vec<u16> = (0..cs).map(|k| sample(&f[ys * bps..], k)).collect();
+        let exp_v: Vec<u16> = (0..cs).map(|k| sample(&f[(ys + cs) * bps..], k)).collect();
+        if p.y.len() != ys || p.u.len() != cs || p.v.len() != cs {
+            return Err(format!("frame {i}: plane sizes {} / {} / {} != {ys} / {cs}", p.y.len(), p.u.len(), p.v.len()));
+        }
+        let (gy, gu, gv) = (to_vec(&p.y, ys), to_vec(&p.u, cs), to_vec(&p.v, cs));
+        let mbh_c = if chroma == 2 { 16 } else { 8 };
+        let planes = [("Y", &gy[..], &exp_y[..], w, h, 16, 16), ("U", &gu[..], &exp_u[..], cw, ch, 8, mbh_c), ("V", &gv[..], &exp_v[..], cw, ch, 8, mbh_c)];
+        for (name, got, exp, pw, ph, mbs, mbsy) in planes {
             if got != exp {
                 let mut first = None;
                 let mut count = 0usize;
@@ -489,9 +715,9 @@ pub fn compare(pics: &[Picture], reference: &[u8], w: usize, h: usize) -> Result
                     "frame {i} (poc {}, pts {}) plane {name}: first mismatch at ({x},{y}) MB {} (mb_x {}, mb_y {}): got {a} want {b}; {count} samples differ, max diff {maxd}",
                     p.poc,
                     p.pts,
-                    (y / mbs) * mb_w + x / mbs,
+                    (y / mbsy) * mb_w + x / mbs,
                     x / mbs,
-                    y / mbs
+                    y / mbsy
                 ));
             }
         }
@@ -514,11 +740,11 @@ pub fn check_fixture(name: &str) -> Result<bool, String> {
             Ok(p) => p,
             Err((au, e, partial)) => {
                 // still report comparison of what was decoded
-                let cmp = compare(&partial, &reference, f.width as usize, f.height as usize).err().unwrap_or_default();
+                let cmp = compare_fmt(&partial, &reference, f.width as usize, f.height as usize, f.pix_fmt).err().unwrap_or_default();
                 return Err(format!("{name} (threads {threads}): decode error at access unit {au}: {e} (after {} pictures) {cmp}", partial.len()));
             }
         };
-        compare(&pics, &reference, f.width as usize, f.height as usize).map_err(|e| format!("{name} (threads {threads}): {e}"))?;
+        compare_fmt(&pics, &reference, f.width as usize, f.height as usize, f.pix_fmt).map_err(|e| format!("{name} (threads {threads}): {e}"))?;
         if pics.iter().any(|p| p.draft) {
             return Err(format!("{name} (threads {threads}): draft picture without draft mode"));
         }

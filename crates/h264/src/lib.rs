@@ -1,6 +1,7 @@
 //! Clean-room pure-Rust H.264 / AVC decoder, implemented from ITU-T Rec. H.264 (ISO/IEC 14496-10).
 //!
-//! Supported: progressive (frame) coding, 8-bit 4:2:0, Baseline / Main / High profiles — CAVLC and CABAC,
+//! Supported: progressive (frame) coding, 4:2:0 at 8 to 10 bits, Baseline / Main / High / High 10
+//! profiles: CAVLC and CABAC,
 //! I/P/B slices, 8x8 transform, custom scaling matrices, weighted prediction, spatial/temporal direct,
 //! multiple slices, long-term references and all MMCOs, deblocking.
 //!
@@ -45,6 +46,7 @@ mod transform;
 
 pub use decoder::{DecodeStats, Decoder, default_threads};
 pub use error::{Error, Result};
+pub use picture::Format;
 
 /// Colour description from the VUI (ITU-T H.273 code points).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,7 +58,53 @@ pub struct ColorInfo {
     pub matrix: u8,
 }
 
-/// A decoded, cropped picture in 8-bit planar 4:2:0.
+/// Samples of one plane: 8-bit streams produce `U8`, higher bit depths `U16` (value range
+/// `0..(1 << bit_depth)`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Plane {
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+}
+
+impl Plane {
+    pub fn len(&self) -> usize {
+        match self {
+            Plane::U8(v) => v.len(),
+            Plane::U16(v) => v.len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn as_u8(&self) -> Option<&[u8]> {
+        match self {
+            Plane::U8(v) => Some(v),
+            Plane::U16(_) => None,
+        }
+    }
+    pub fn as_u16(&self) -> Option<&[u16]> {
+        match self {
+            Plane::U8(_) => None,
+            Plane::U16(v) => Some(v),
+        }
+    }
+    /// Sample `i` widened to u16 (0 outside the plane).
+    pub fn get(&self, i: usize) -> u16 {
+        match self {
+            Plane::U8(v) => v.get(i).map_or(0, |&s| s as u16),
+            Plane::U16(v) => v.get(i).copied().unwrap_or(0),
+        }
+    }
+    /// Raw bytes as written by ffmpeg `rawvideo` (8-bit, or 16-bit little endian).
+    pub fn to_le_bytes(&self) -> Vec<u8> {
+        match self {
+            Plane::U8(v) => v.clone(),
+            Plane::U16(v) => v.iter().flat_map(|s| s.to_le_bytes()).collect(),
+        }
+    }
+}
+
+/// A decoded, cropped picture in planar 4:2:0 (or 4:2:2).
 #[derive(Clone, Debug)]
 pub struct Picture {
     /// Cropped luma width.
@@ -65,9 +113,14 @@ pub struct Picture {
     pub height: u32,
     pub chroma_width: u32,
     pub chroma_height: u32,
-    pub y: Vec<u8>,
-    pub u: Vec<u8>,
-    pub v: Vec<u8>,
+    /// 1 (4:2:0) or 2 (4:2:2).
+    pub chroma_format_idc: u32,
+    /// Luma bit depth (chroma uses the same storage type).
+    pub bit_depth: u32,
+    pub bit_depth_chroma: u32,
+    pub y: Plane,
+    pub u: Plane,
+    pub v: Plane,
     pub y_stride: usize,
     pub uv_stride: usize,
     /// Presentation timestamp passed to [`Decoder::decode`] with the access unit of this picture.

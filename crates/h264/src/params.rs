@@ -515,6 +515,11 @@ impl Sps {
         self.max_dpb_frames()
     }
 
+    /// Sample format of the pictures of this SPS.
+    pub fn format(&self) -> crate::picture::Format {
+        crate::picture::Format { bit_depth_y: self.bit_depth_luma, bit_depth_c: self.bit_depth_chroma, chroma_format_idc: self.chroma_format_idc }
+    }
+
     pub fn check_supported(&self) -> Result<()> {
         if !self.frame_mbs_only {
             return unsupported("interlaced (field / MBAFF) coding");
@@ -522,8 +527,10 @@ impl Sps {
         if self.chroma_array_type() != 1 {
             return unsupported(format!("chroma_format_idc {} (only 4:2:0 is implemented)", self.chroma_format_idc));
         }
-        if self.bit_depth_luma != 8 || self.bit_depth_chroma != 8 {
-            return unsupported(format!("bit depth luma {} chroma {} (only 8-bit is implemented)", self.bit_depth_luma, self.bit_depth_chroma));
+        // (the sample paths are generic up to 14 bits; beyond High 10 / High 4:2:2 there is no
+        // reference stream to verify them against)
+        if !(8..=10).contains(&self.bit_depth_luma) || !(8..=10).contains(&self.bit_depth_chroma) {
+            return unsupported(format!("bit depth luma {} chroma {} (8 to 10 bits are implemented)", self.bit_depth_luma, self.bit_depth_chroma));
         }
         if self.qpprime_y_zero_transform_bypass {
             return unsupported("qpprime_y_zero_transform_bypass (lossless)");

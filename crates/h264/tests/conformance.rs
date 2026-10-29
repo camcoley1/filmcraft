@@ -54,7 +54,83 @@ fixture_tests!(
     vt_main,
     vt_baseline,
     vt_high_1080p,
+    high10_intra,
+    high10_intra_cavlc,
+    high10_medium,
+    high10_cavlc_b,
+    high10_bpyramid,
+    high10_weightp,
+    high10_temporal,
+    high10_slices_dbk,
+    high10_no8x8_cqm,
+    high10_qp1,
+    high10_qp51,
+    high10_odd,
 );
+
+/// JVT professional / FRExt conformance bitstreams (ITU-T, not in the repository): with
+/// `FILMCRAFT_H264_JVT_DIR` set to a folder holding them (any layout), the progressive ones this
+/// decoder supports decode bit-exactly against ffmpeg's decode, and interlaced ones are refused
+/// with `Error::Unsupported`. Skipped without the variable or ffmpeg.
+#[test]
+fn jvt_high_bit_depth_conformance_streams() {
+    let Some(dir) = std::env::var_os("FILMCRAFT_H264_JVT_DIR").map(std::path::PathBuf::from) else {
+        eprintln!("skipped: FILMCRAFT_H264_JVT_DIR not set");
+        return;
+    };
+    let Some(ff) = filmcraft_testkit::ffmpeg_or_skip("jvt conformance") else { return };
+    // (stream name, Some((width, height, pix_fmt)) = bit-exact, None = refused)
+    let expected: &[(&str, Option<(usize, usize, &str)>)] = &[
+        ("PPH10I1_Panasonic_A", Some((1280, 720, "yuv420p10le"))),
+        ("PPH10I2_Panasonic_A", Some((1280, 720, "yuv420p10le"))),
+        ("PPH10I3_Panasonic_A", Some((1280, 720, "yuv420p10le"))),
+        ("PPH10I4_Panasonic_A", None),
+    ];
+    let mut files = Vec::new();
+    let mut stack = vec![dir];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "264" || x == "jsv") {
+                files.push(p);
+            }
+        }
+    }
+    let out = filmcraft_testkit::fixtures_dir("h264/jvt");
+    let mut checked = 0;
+    for &(name, want) in expected {
+        let Some(path) = files.iter().find(|p| p.file_stem().is_some_and(|s| s == name)) else {
+            eprintln!("missing {name}");
+            continue;
+        };
+        let Some((w, h, pix_fmt)) = want else {
+            let err = common::decode_file_threads(path, 1).err().map(|(_, e, _)| e);
+            assert!(matches!(err, Some(filmcraft_h264::Error::Unsupported(_))), "{name}: expected an unsupported error, got {err:?}");
+            checked += 1;
+            continue;
+        };
+        let yuv = out.join(format!("{name}.yuv"));
+        if !yuv.exists() {
+            let ok = std::process::Command::new(&ff)
+                .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+                .arg(path)
+                .args(["-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", pix_fmt])
+                .arg(&yuv)
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(ok, "{name}: reference decode failed");
+        }
+        let reference = std::fs::read(&yuv).unwrap();
+        for threads in [1, 0] {
+            let pics = common::decode_file_threads(path, threads).unwrap_or_else(|(au, e, _)| panic!("{name}: error at {au}: {e}"));
+            common::compare_fmt(&pics, &reference, w, h, pix_fmt).unwrap_or_else(|e| panic!("{name} (threads {threads}): {e}"));
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "no JVT conformance streams found");
+}
 
 /// Draft mode (reduced-resolution playback) skips deblocking of non-reference pictures only:
 /// every other picture stays bit-exact with ffmpeg, single- and frame-threaded, the skipped ones
@@ -78,7 +154,7 @@ fn draft_mode_changes_only_flagged_non_reference_pictures() {
             let (mut draft, mut changed) = (0, 0);
             for (i, p) in pics.iter().enumerate() {
                 let r = &reference[i * fsize..(i + 1) * fsize];
-                let same = p.y == r[..w * h] && [&p.u[..], &p.v[..]].concat() == r[w * h..];
+                let same = p.y.as_u8() == Some(&r[..w * h]) && [p.u.to_le_bytes(), p.v.to_le_bytes()].concat() == r[w * h..];
                 if p.draft {
                     draft += 1;
                     changed += !same as usize;
@@ -157,8 +233,16 @@ fn concurrent_fixture_publication_is_safe() {
     }
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
     let name = Box::leak(format!("concurrent_fixture_{}_{stamp}", std::process::id()).into_boxed_str());
-    let fixture =
-        common::Fixture { name, source: "testsrc2", width: 64, height: 48, frames: 2, filter: "", args: &["-preset", "ultrafast", "-x264-params", "keyint=1"] };
+    let fixture = common::Fixture {
+        name,
+        source: "testsrc2",
+        width: 64,
+        height: 48,
+        frames: 2,
+        filter: "",
+        pix_fmt: "yuv420p",
+        args: &["-preset", "ultrafast", "-x264-params", "keyint=1"],
+    };
     let open_published = |path: &std::path::Path| {
         let mut options = std::fs::OpenOptions::new();
         options.read(true);

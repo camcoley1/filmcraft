@@ -427,7 +427,10 @@ fn build_and_check(cabac: bool, threads: usize) {
     assert_eq!(out.len(), expected.len(), "cabac={cabac}");
     for (i, (p, e)) in out.iter().zip(expected.iter()).enumerate() {
         assert_eq!((p.width as usize, p.height as usize), (MB_W * 16, MB_H * 16));
-        assert!(p.y == e.0 && p.u == e.1 && p.v == e.2, "picture {i} differs (cabac={cabac}, threads={threads})");
+        assert!(
+            p.y.as_u8() == Some(&e.0[..]) && p.u.as_u8() == Some(&e.1[..]) && p.v.as_u8() == Some(&e.2[..]),
+            "picture {i} differs (cabac={cabac}, threads={threads})"
+        );
     }
     let s = dec.stats();
     assert!(s.mb_pcm > 0 && s.frame_num_gaps == 1 && s.long_term_marks >= 3, "{s:?}");
@@ -515,7 +518,10 @@ fn weighted_check(cabac: bool, threads: usize) {
     assert!(dec.take_error().is_none());
     assert_eq!(out.len(), 4);
     for (i, (p, e)) in out.iter().zip(expected.iter()).enumerate() {
-        assert!(p.y == e.0 && p.u == e.1 && p.v == e.2, "picture {i} differs (cabac={cabac}, threads={threads})");
+        assert!(
+            p.y.as_u8() == Some(&e.0[..]) && p.u.as_u8() == Some(&e.1[..]) && p.v.as_u8() == Some(&e.2[..]),
+            "picture {i} differs (cabac={cabac}, threads={threads})"
+        );
     }
 }
 
@@ -551,8 +557,116 @@ fn poc_type1_reordering() {
             for (k, p) in out.iter().enumerate() {
                 let e = render(&contents[expected_order[k]], None);
                 assert_eq!(p.poc, expected_poc[k]);
-                assert!(p.y == e.0 && p.u == e.1 && p.v == e.2, "output {k} (cabac={cabac})");
+                assert!(p.y.as_u8() == Some(&e.0[..]) && p.u.as_u8() == Some(&e.1[..]) && p.v.as_u8() == Some(&e.2[..]), "output {k} (cabac={cabac})");
             }
         }
     }
+}
+
+/// SPS of a High 10 / High 4:2:2 picture of MB_W x MB_H macroblocks (POC type 2, one reference).
+fn sps_high(chroma_format_idc: u32, bit_depth: u32) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.write_bits(if chroma_format_idc == 2 { 122 } else { 110 }, 8);
+    w.write_bits(0, 8);
+    w.write_bits(30, 8);
+    w.write_ue(0); // sps id
+    w.write_ue(chroma_format_idc);
+    w.write_ue(bit_depth - 8); // bit_depth_luma_minus8
+    w.write_ue(bit_depth - 8); // bit_depth_chroma_minus8
+    w.write_bit(false); // qpprime_y_zero_transform_bypass_flag
+    w.write_bit(false); // seq_scaling_matrix_present_flag
+    w.write_ue(0); // log2_max_frame_num - 4
+    w.write_ue(2); // pic_order_cnt_type
+    w.write_ue(1); // max_num_ref_frames
+    w.write_bit(false);
+    w.write_ue(MB_W as u32 - 1);
+    w.write_ue(MB_H as u32 - 1);
+    w.write_bit(true); // frame_mbs_only
+    w.write_bit(true); // direct_8x8_inference
+    w.write_bit(false); // cropping
+    w.write_bit(false); // vui
+    w.rbsp_trailing();
+    nal(3, 7, &w.finish())
+}
+
+/// I_PCM at high bit depths (CAVLC and CABAC): an IDR picture of random PCM macroblocks with
+/// samples of `bit_depth` bits decodes to exactly those samples (and ffmpeg agrees).
+pub(crate) fn pcm_high_bit_depth_check(chroma_format_idc: u32, bit_depth: u32) {
+    let mbh_c = if chroma_format_idc == 2 { 16 } else { 8 };
+    let (w, h) = (MB_W * 16, MB_H * 16);
+    let (cw, ch) = (w / 2, MB_H * mbh_c);
+    for cabac in [false, true] {
+        let mut seed = 7u32 + bit_depth + chroma_format_idc;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((seed >> 8) % (1 << bit_depth)) as u16
+        };
+        let (mut y, mut u, mut v) = (vec![0u16; w * h], vec![0u16; cw * ch], vec![0u16; cw * ch]);
+        let mut mbs = Vec::new();
+        for i in 0..NMB {
+            let (x0, y0) = ((i % MB_W) * 16, (i / MB_W) * 16);
+            let mut bw = BitWriter::new();
+            for r in 0..16 {
+                for c in 0..16 {
+                    let s = next();
+                    y[(y0 + r) * w + x0 + c] = s;
+                    bw.write_bits(s as u32, bit_depth);
+                }
+            }
+            let cy0 = (i / MB_W) * mbh_c;
+            for plane in [&mut u, &mut v] {
+                for r in 0..mbh_c {
+                    for c in 0..8 {
+                        let s = next();
+                        plane[(cy0 + r) * cw + x0 / 2 + c] = s;
+                        bw.write_bits(s as u32, bit_depth);
+                    }
+                }
+            }
+            mbs.push(Some(bw.finish()));
+        }
+        let mut stream = sps_high(chroma_format_idc, bit_depth);
+        stream.extend(pps(cabac, false));
+        stream.extend(slice_nal(&Pic { idr: true, frame_num: 0, ref_idc: 3, mbs, ..Default::default() }, cabac));
+        for threads in [1, 2] {
+            let mut dec = Decoder::with_threads(threads);
+            let mut out = dec.decode(&stream, 0).unwrap();
+            out.extend(dec.flush());
+            assert!(dec.take_error().is_none());
+            assert_eq!(out.len(), 1);
+            let p = &out[0];
+            assert_eq!((p.bit_depth, p.chroma_format_idc, p.chroma_height as usize), (bit_depth, chroma_format_idc, ch));
+            assert!(p.y.as_u16() == Some(&y[..]) && p.u.as_u16() == Some(&u[..]) && p.v.as_u16() == Some(&v[..]), "cabac={cabac} bit depth {bit_depth}");
+        }
+        // ffmpeg agrees (as an oracle for the stream itself)
+        let name = format!("synth_pcm_{chroma_format_idc}_{bit_depth}_{cabac}");
+        let Some(ff) = filmcraft_testkit::ffmpeg_or_skip(&name) else { continue };
+        let dir = filmcraft_testkit::fixtures_dir("h264");
+        let src = filmcraft_testkit::temp_path(&dir.join(format!("{name}.h264")));
+        let dst = filmcraft_testkit::temp_path(&dir.join(format!("{name}.yuv")));
+        std::fs::write(&src, &stream).unwrap();
+        let pix_fmt = format!("yuv{}p{bit_depth}le", if chroma_format_idc == 2 { 422 } else { 420 });
+        let ok = std::process::Command::new(&ff)
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(&src)
+            .args(["-f", "rawvideo", "-pix_fmt", &pix_fmt])
+            .arg(&dst)
+            .status()
+            .is_ok_and(|s| s.success());
+        let got = std::fs::read(&dst).unwrap_or_default();
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+        if !ok {
+            eprintln!("skipped ffmpeg check of {name}: this ffmpeg cannot decode it");
+            continue;
+        }
+        let want: Vec<u8> = y.iter().chain(&u).chain(&v).flat_map(|s| s.to_le_bytes()).collect();
+        assert!(got == want, "ffmpeg output differs from the expected output of {name}");
+    }
+}
+
+#[test]
+fn pcm_high_10() {
+    pcm_high_bit_depth_check(1, 10);
+    pcm_high_bit_depth_check(1, 9);
 }

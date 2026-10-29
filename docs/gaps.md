@@ -66,8 +66,8 @@ platforms** G4, G9, G17; **performance** G16; **ecosystem** G11; **measurement**
 
 ## G3. 10-bit and 4:2:2 camera media needs hardware
 
-- **Missing:** our H.264 decoder is 8-bit 4:2:0 only (`crates/h264/README.md`: no High 10, High
-  4:2:2, 4:4:4, lossless, interlaced field / MBAFF). HEVC decodes Main 4:2:2 10 / 12 and Main 12 in
+- **Missing:** our H.264 decoder is 4:2:0 only (`crates/h264/README.md`: High 10 since M8e.2; no
+  High 4:2:2, 4:4:4, lossless, interlaced field / MBAFF). HEVC decodes Main 4:2:2 10 / 12 and Main 12 in
   software since M8e.1 (other range-extension tools, 4:4:4 and tiles with WPP are refused). Most mirrorless and
   cinema cameras record exactly these (Sony XAVC S-I / XAVC HS 4:2:2 10-bit, Panasonic, Canon
   XF-AVC, Fujifilm).
@@ -323,3 +323,4 @@ platforms** G4, G9, G17; **performance** G16; **ecosystem** G11; **measurement**
 | 2026-10-12 | minor | G10: MP1 (`A_MPEG/L1`) in Matroska imports (#1402) |
 | 2026-10-12 | minor | G10: OpenEXR PXR24 import |
 | 2026-10-29 | minor | G3: HEVC Main 4:2:2 10 / 12 and Main 12 software decode (M8e.1) |
+| 2026-10-29 | minor | G3: H.264 High 10 software decode (M8e.2) |
