@@ -7,6 +7,7 @@
 //! | `clip.createMulticam` | Clip ▸ Create Multi-Camera Source Sequence… | synchronised cameras → a multi-camera source sequence |
 //! | `clip.multicamEnable` | Clip ▸ Multi-Camera ▸ Enable | toggle multi-camera behaviour of nested clips |
 //! | `clip.multicamFlatten` | Clip ▸ Multi-Camera ▸ Flatten | replace multi-camera clips by the clips their angle shows |
+//! | `multicam.autoSwitch` | Clip ▸ Multi-Camera ▸ Auto-Switch by Speaker | cut a multi-camera clip to whoever is talking, from the transcript's speaker labels ([`crate::multicam_auto`]) |
 //! | `multicam.switchAngle` | | set the angle of clips (keys 1–9 when stopped, clicking an angle) |
 //! | `multicam.recordStart` / `multicam.cut` / `multicam.recordStop` | | live switching while playing: one undo step per pass |
 //! | `multicam.selectCamera1`…`9` | keys 1–9 | while recording: cut to camera N; stopped: switch the clip at the playhead |

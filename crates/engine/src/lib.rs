@@ -34,6 +34,7 @@ pub mod media_pool;
 pub mod media_watch;
 pub mod mixer;
 pub mod multicam;
+pub mod multicam_auto;
 pub mod narration;
 pub mod panels;
 pub mod paste_media;
@@ -56,6 +57,7 @@ pub mod shortcuts;
 pub mod source_monitor;
 pub mod sync;
 pub mod transcript;
+pub mod transcript_diarize;
 pub mod trim;
 pub mod voiceover;
 
@@ -461,6 +463,8 @@ pub struct Session {
     pub mask_jobs: Vec<masks::PendingTrack>,
     /// Scene Edit Detection jobs whose results are applied when they finish.
     pub scene_jobs: Vec<scene_detect::PendingScene>,
+    /// Label Speakers jobs whose labels are applied when they finish.
+    pub diarize_jobs: Vec<transcript_diarize::PendingDiarize>,
     /// Effect presets (built-in + the user's, persisted in the data directory).
     pub presets: presets::PresetLibrary,
     /// Export presets (built-in + the user's, persisted in the data directory) and favourites.
@@ -578,6 +582,7 @@ impl Session {
             media_jobs: Vec::new(),
             mask_jobs: Vec::new(),
             scene_jobs: Vec::new(),
+            diarize_jobs: Vec::new(),
             presets: Default::default(),
             export_presets: Default::default(),
             export_queue: Default::default(),
@@ -679,6 +684,7 @@ impl Session {
         proxies::poll(self);
         masks::poll(self);
         scene_detect::poll(self);
+        transcript_diarize::poll(self);
         #[cfg(feature = "sidecar")]
         ai::poll(self);
         export_tools::pump_queue(self, false);
@@ -1316,6 +1322,8 @@ mod media_test_util;
 mod media_watch_tests;
 #[cfg(test)]
 mod mixer_tests;
+#[cfg(test)]
+mod multicam_auto_tests;
 #[cfg(test)]
 mod multicam_tests;
 #[cfg(test)]

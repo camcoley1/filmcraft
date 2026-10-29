@@ -381,7 +381,7 @@ fn multicam_from_clips_selected_in_the_timeline() {
     assert!(r["item"].as_u64().is_some(), "{r}");
 }
 
-fn mc_session(audio: &str) -> (Session, Vec<ItemId>, ItemId, ItemId) {
+pub(crate) fn mc_session(audio: &str) -> (Session, Vec<ItemId>, ItemId, ItemId) {
     let dir = tmp_dir("mc-edit");
     let files: Vec<PathBuf> = ["a.mov", "b.mov", "c.mov"].iter().map(|f| dir.join(f)).collect();
     for (f, sc) in files.iter().zip([DemoScene::OceanSunset, DemoScene::CityNight, DemoScene::Aurora]) {
@@ -403,13 +403,13 @@ fn mc_session(audio: &str) -> (Session, Vec<ItemId>, ItemId, ItemId) {
     (s, items, src, edit)
 }
 
-fn v1(s: &Session) -> Vec<(i64, u32)> {
+pub(crate) fn v1(s: &Session) -> Vec<(i64, u32)> {
     let q = s.active_sequence().unwrap();
     let rate = q.settings.frame_rate;
     q.video_tracks[0].items.iter().map(|i| (rate.frame_at(i.start), i.multicam.unwrap().angle)).collect()
 }
 
-fn a1(s: &Session) -> Vec<(i64, u32)> {
+pub(crate) fn a1(s: &Session) -> Vec<(i64, u32)> {
     let q = s.active_sequence().unwrap();
     let rate = q.settings.frame_rate;
     q.audio_tracks[0].items.iter().map(|i| (rate.frame_at(i.start), i.multicam.unwrap().angle)).collect()
