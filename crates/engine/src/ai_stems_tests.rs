@@ -1,10 +1,10 @@
 //! `ai.stems` against the fake helper: the four stems in a bin, placed under the clip, one undo
 //! step; a stem of the wrong length, an over-long source, a timeout and a cancel change nothing.
 
-use filmcraft_project::{BinEntry, ItemKind, TrackKind};
+use filmcraft_project::{BinEntry, ItemId, ItemKind, TrackKind};
 use filmcraft_sidecar::JobRequest;
 use filmcraft_sidecar::fake::{ResultMode, Script};
-use filmcraft_time::Tick;
+use filmcraft_time::{TICKS_PER_SECOND, Tick, TimeRange};
 use serde_json::json;
 
 use super::super::tests::{Fixture, finish, fixture, job_error, reason, snapshot};
@@ -30,9 +30,22 @@ fn wav(seconds: f64) -> Vec<u8> {
     b
 }
 
+/// What the last `stems` job received: (rate, channels, data bytes) of its `source.wav`.
+static SOURCE: std::sync::Mutex<Option<(u32, u16, usize)>> = std::sync::Mutex::new(None);
+
 /// The fixture's source is 2 s long.
-fn stems(_: &JobRequest) -> Vec<(String, Vec<u8>)> {
+fn stems(req: &JobRequest) -> Vec<(String, Vec<u8>)> {
+    if let Ok(b) = std::fs::read(&req.inputs[0]) {
+        *SOURCE.lock().unwrap() = Some((u32::from_le_bytes(b[24..28].try_into().unwrap()), u16::from_le_bytes(b[22..24].try_into().unwrap()), b.len() - 44));
+    }
     ["vocals", "drums", "bass", "other"].iter().map(|s| (format!("{s}.wav"), wav(2.0))).collect()
+}
+
+/// The helper's input handed back as every stem (an identity separation): shows where the
+/// decoded audio lands.
+fn identity(req: &JobRequest) -> Vec<(String, Vec<u8>)> {
+    let b = std::fs::read(&req.inputs[0]).unwrap_or_default();
+    ["vocals", "drums", "bass", "other"].iter().map(|s| (format!("{s}.wav"), b.clone())).collect()
 }
 
 fn short_bass(_: &JobRequest) -> Vec<(String, Vec<u8>)> {
@@ -63,17 +76,27 @@ fn bin_items(f: &Fixture, name: &str) -> Vec<String> {
 #[test]
 fn stems_land_in_a_bin_in_one_undo_step() {
     let mut f = helper("st-bin", stems);
+    let media = f.cache.join("media");
+    f.s.ai.media_root = Some(media.clone());
     let undo = f.s.history.undo.len();
     let r = f.s.execute("ai.stems", json!({"wait": true})).unwrap();
     assert_eq!(r["applied"], true, "{r}");
     let req = f.helper.started()[0].clone();
-    // the helper gets the source decoded by FilmCraft: 2 s of 44.1 kHz float stereo in the job folder
+    // the helper got the source decoded by FilmCraft: 2 s of 44.1 kHz float stereo, deleted after
     assert_eq!(req.kind, "stems");
     assert!(req.inputs.len() == 1 && req.inputs[0].ends_with("source.wav"), "{:?}", req.inputs);
-    let wav = std::fs::read(&req.inputs[0]).unwrap();
-    assert_eq!(&wav[..4], b"RIFF");
-    assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 44_100);
-    assert_eq!(wav.len(), 44 + 2 * 44_100 * 2 * 4);
+    assert_eq!(*SOURCE.lock().unwrap(), Some((44_100, 2, 2 * 44_100 * 2 * 4)));
+    assert!(!std::path::Path::new(&req.inputs[0]).exists(), "the decoded input is deleted");
+    // the stems live in the project's AI media folder, not in the cache, and the job folder is gone
+    let out = std::path::PathBuf::from(r["outDir"].as_str().unwrap());
+    assert!(!out.exists());
+    for it in f.s.project.items.values() {
+        if let Some(m) = it.as_media().filter(|_| it.name.ends_with(".wav")) {
+            let filmcraft_project::MediaRef::File { path } = &m.media else { panic!("a file") };
+            assert!(std::path::Path::new(path).starts_with(media.join("AI Media").join(&f.s.project.id).join("stems")), "{path}");
+            assert!(std::path::Path::new(path).exists());
+        }
+    }
     assert_eq!(req.params["stems"], json!(["vocals", "drums", "bass", "other"]));
     assert_eq!(req.params["bandwidth"], "16k", "16 kHz separation by default");
     assert!(f.s.execute("ai.stems", json!({"bandwidth": "22k"})).is_err());
@@ -116,7 +139,7 @@ fn a_stem_of_the_wrong_length_changes_nothing() {
     super::super::ensure_project_id(&mut f.s);
     let before = snapshot(&f.s);
     let e = f.s.execute("ai.stems", json!({"wait": true, "place": true})).unwrap_err().to_string();
-    assert!(e.contains("bass stem is not as long as the source"), "{e}");
+    assert!(e.contains("bass stem is not as long as the decoded source"), "{e}");
     assert_eq!(snapshot(&f.s), before);
 }
 
@@ -131,8 +154,15 @@ fn long_sources_are_refused_and_jobs_are_bounded() {
         Ok(())
     })
     .unwrap();
+    // a short clip from a long recording is fine: only the range it plays is decoded
+    assert!(f.s.is_enabled("ai.stems"));
+    f.s.edit_sequence("Long clip", |q, _, _| {
+        q.video_tracks[0].items[0].duration = Tick(254_016_000_000 * 1250);
+        Ok(())
+    })
+    .unwrap();
     let e = f.s.execute("ai.stems", json!({})).unwrap_err().to_string();
-    assert!(e.contains("up to 20 min"), "{e}");
+    assert!(e.contains("uses 21 min of its source") && e.contains("up to 20 min"), "{e}");
 
     let mut g = fixture("st-timeout", Script { features: vec!["stems".into()], steps: 100_000, ..Default::default() });
     g.s.ai.limits.timeout = std::time::Duration::from_millis(50);
@@ -159,4 +189,192 @@ fn stems_need_the_feature_and_audio() {
     assert!(g.s.is_enabled("ai.stems"));
     g.s.state.selection.clear();
     assert_eq!(reason(&g.s, "ai.stems"), "select a clip with audio in the timeline");
+}
+
+/// 10 s of 48 kHz audio: silence with a one-sample click at 3.0 s on the right channel only.
+fn click_wav(path: &std::path::Path) {
+    let rate = 48_000u32;
+    let n = rate as usize * 10;
+    let mut b = Vec::new();
+    let data = (n * 2 * 2) as u32;
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&(36 + data).to_le_bytes());
+    b.extend_from_slice(b"WAVEfmt ");
+    for v in [
+        16u32.to_le_bytes().as_slice(),
+        &1u16.to_le_bytes(),
+        &2u16.to_le_bytes(),
+        &rate.to_le_bytes(),
+        &(rate * 4).to_le_bytes(),
+        &4u16.to_le_bytes(),
+        &16u16.to_le_bytes(),
+    ] {
+        b.extend_from_slice(v);
+    }
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&data.to_le_bytes());
+    for i in 0..n {
+        let r: i16 = if i == 3 * rate as usize { 30_000 } else { 0 };
+        b.extend_from_slice(&0i16.to_le_bytes());
+        b.extend_from_slice(&r.to_le_bytes());
+    }
+    std::fs::write(path, b).unwrap();
+}
+
+/// Where the loudest sample of a mono or stereo float WAV is (sample index), and its channels.
+fn peak(path: &str) -> (usize, u16) {
+    let b = std::fs::read(path).unwrap();
+    let ch = u16::from_le_bytes(b[22..24].try_into().unwrap());
+    let samples: Vec<f32> = b[44..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap()).abs()).collect();
+    let i = samples.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+    (i / ch as usize, ch)
+}
+
+/// Trimmed, sped-up and reversed clips of a 48 kHz recording: the decoded range starts on a
+/// 44.1 kHz sample, the stems carry the click within a sample of where the source has it, and the
+/// placed stems show, at every timeline time, the source time the clip shows (exactly, in ticks).
+#[test]
+fn stems_line_up_sample_accurately_with_trimmed_sped_and_reversed_clips() {
+    for (name, source_in_s, speed, reverse, channels) in
+        [("plain", 1.0, 1.0, false, vec![]), ("fast", 1.5, 2.0, false, vec![1u16]), ("rev", 0.5, 1.0, true, vec![1u16])]
+    {
+        let mut f = fixture(&format!("st-align-{name}"), Script { features: vec!["stems".into()], result: ResultMode::Custom(identity), ..Default::default() });
+        f.s.ai.media_root = Some(f.cache.join("media"));
+        let wav = f.cache.join("click.wav");
+        std::fs::create_dir_all(&f.cache).unwrap();
+        click_wav(&wav);
+        let item = ItemId(f.s.execute("file.import", json!({"paths": [wav.to_string_lossy()]})).unwrap()["items"][0].as_u64().unwrap());
+        let seq = f.s.state.active_sequence.unwrap();
+        let tps = TICKS_PER_SECOND as f64;
+        let clip =
+            f.s.edit("Place", |pr, _| {
+                let rate = pr.sequence(seq).unwrap().settings.frame_rate;
+                let mut it = pr
+                    .make_track_item(item, TrackKind::Audio, Tick::ZERO, TimeRange::new(Tick((source_in_s * tps) as i64), Tick((4.0 * tps) as i64)), rate)
+                    .unwrap();
+                it.speed = speed;
+                it.reverse = reverse;
+                it.duration = Tick((4.0 / speed * tps) as i64);
+                it.source_channels = channels.clone();
+                let id = it.id;
+                pr.sequence_mut(seq).unwrap().audio_tracks[0].items.push(it);
+                Ok(id)
+            })
+            .unwrap();
+        f.s.state.selection = vec![clip];
+        let r = f.s.execute("ai.stems", json!({"wait": true, "place": true})).unwrap();
+        assert_eq!(r["applied"], true, "{name}: {r}");
+        let q = f.s.active_sequence().unwrap();
+        let (_, c) = q.find_item(clip).unwrap();
+        let placed: Vec<_> = q.audio_tracks.iter().flat_map(|t| &t.items).filter(|i| i.name.starts_with("click.wav (")).collect();
+        assert_eq!(placed.len(), 4, "{name}");
+        let stem = f.s.project.item(placed[0].item).and_then(|i| i.as_media()).unwrap();
+        let filmcraft_project::MediaRef::File { path } = &stem.media else { panic!("a file") };
+        let (i, ch) = peak(path);
+        assert_eq!(ch, if channels.is_empty() { 2 } else { 1 }, "{name}: the clip's channels");
+        // offset of the decoded range: what the placed stem's source In lost against the clip's
+        let offset = c.source_in - placed[0].source_in;
+        assert_eq!(offset.0 % 5_760_000, 0, "{name}: the range starts on a 44.1 kHz sample");
+        let click = Tick(i as i64 * 5_760_000) + offset;
+        assert!((click.0 - (3.0 * tps) as i64).abs() <= 2 * 5_760_000, "{name}: click at {} s", click.0 as f64 / tps);
+        for p in &placed {
+            for k in 0..40 {
+                let t = c.start + Tick(c.duration.0 * k / 40);
+                assert_eq!(p.source_time_at(t) + offset, c.source_time_at(t), "{name} at {t:?}");
+            }
+        }
+    }
+}
+
+/// A linked video and audio pair is split once; the stems outlive the cache.
+#[test]
+fn a_linked_pair_is_split_once_and_stems_outlive_the_cache() {
+    let mut f = helper("st-pair", stems);
+    f.s.ai.media_root = Some(f.cache.join("media"));
+    let seq = f.s.state.active_sequence.unwrap();
+    let (v, item) = (f.clip, f.item);
+    let a =
+        f.s.edit("Link", |pr, _| {
+            let rate = pr.sequence(seq).unwrap().settings.frame_rate;
+            let mut it = pr.make_track_item(item, TrackKind::Audio, Tick::ZERO, TimeRange::new(Tick::ZERO, Tick(254_016_000_000 * 2)), rate).unwrap();
+            let q = pr.sequence_mut(seq).unwrap();
+            it.link = Some(7);
+            q.video_tracks[0].items[0].link = Some(7);
+            let id = it.id;
+            q.audio_tracks[0].items.push(it);
+            Ok(id)
+        })
+        .unwrap();
+    f.s.state.selection = vec![v, a];
+    f.s.execute("ai.stems", json!({"wait": true})).unwrap();
+    assert_eq!(f.helper.started().len(), 1, "one job for the pair");
+    assert_eq!(bin_items(&f, "Stems: interview").len(), 4);
+    // pruning the whole cache leaves the imported stems alone
+    super::super::prune_cache(&f.cache.join("AI"), 0, &[], std::time::Duration::ZERO);
+    for it in f.s.project.items.values().filter(|i| i.name.ends_with(".wav")) {
+        let filmcraft_project::MediaRef::File { path } = &it.as_media().unwrap().media else { panic!("a file") };
+        assert!(std::path::Path::new(path).exists(), "{path} survived pruning");
+    }
+}
+
+/// A saved project keeps its AI media next to it.
+#[test]
+fn a_saved_project_keeps_its_stems_beside_it() {
+    let mut f = helper("st-saved", stems);
+    std::fs::create_dir_all(&f.cache).unwrap();
+    let proj = f.cache.join("Show.fcproj");
+    f.s.execute("file.saveAs", json!({"path": proj.to_string_lossy()})).unwrap();
+    f.s.state.selection = vec![f.clip];
+    f.s.execute("ai.stems", json!({"wait": true})).unwrap();
+    let dir = f.cache.join("Show AI Media").join("stems");
+    let paths: Vec<String> =
+        f.s.project
+            .items
+            .values()
+            .filter_map(|i| match &i.as_media()?.media {
+                filmcraft_project::MediaRef::File { path } if i.name.ends_with(".wav") => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+    assert_eq!(paths.len(), 4);
+    assert!(paths.iter().all(|p| std::path::Path::new(p).starts_with(&dir) && std::path::Path::new(p).exists()), "{paths:?}");
+}
+
+/// The decode counts against the job's time limit; a job out of time never reaches the helper.
+#[test]
+fn preparing_the_input_is_inside_the_time_limit() {
+    let mut f = helper("st-deadline", stems);
+    f.s.ai.limits.timeout = std::time::Duration::ZERO;
+    let e = f.s.execute("ai.stems", json!({"wait": true})).unwrap_err().to_string();
+    assert!(e.contains("took longer"), "{e}");
+    assert!(f.helper.started().is_empty());
+}
+
+/// Not placed, the stems do not depend on where the clip is: moving it during the job keeps the
+/// result. Placing needs the clip's sequence open; otherwise the stems are only imported.
+#[test]
+fn unplaced_stems_survive_a_move_and_placing_needs_the_sequence() {
+    let mut f = fixture("st-loose", Script { features: vec!["stems".into()], steps: 3, result: ResultMode::Custom(stems), ..Default::default() });
+    f.s.ai.media_root = Some(f.cache.join("media"));
+    let id = f.s.execute("ai.stems", json!({})).unwrap()["job"].as_u64().unwrap();
+    f.s.edit_sequence("Move", |q, _, _| {
+        q.video_tracks[0].items[0].start = Tick(254_016_000_000);
+        Ok(())
+    })
+    .unwrap();
+    finish(&mut f.s, id);
+    assert_eq!(job_error(&f.s, id), None);
+    assert_eq!(bin_items(&f, "Stems: interview").len(), 4);
+
+    let mut g = helper("st-other-seq", stems);
+    g.s.ai.media_root = Some(g.cache.join("media"));
+    let id = g.s.execute("ai.stems", json!({"place": true})).unwrap()["job"].as_u64().unwrap();
+    g.s.execute("file.newSequence", json!({"name": "Other"})).unwrap();
+    let _ = g.s.drain_events();
+    finish(&mut g.s, id);
+    assert_eq!(job_error(&g.s, id), None);
+    assert_eq!(bin_items(&g, "Stems: interview").len(), 4);
+    let toasts: Vec<String> =
+        g.s.drain_events().into_iter().filter_map(|e| if let crate::Event::Toast { message, .. } = e { Some(message) } else { None }).collect();
+    assert!(toasts.iter().any(|m| m.contains("open the clip's sequence to place them")), "{toasts:?}");
 }

@@ -73,7 +73,8 @@ fn check_clip(s: &Session, c: ClipId) -> std::result::Result<(String, (u32, u32)
     if (filmcraft_project::par_ratio(src_par) - filmcraft_project::par_ratio(seq_par)).abs() > 1e-6 {
         return Err(format!("{}: its pixel aspect differs from the sequence's", it.name));
     }
-    if let Some(mo) = it.effect("motion").filter(|e| e.enabled) {
+    // checked whether Motion is on or off: the apply turns it on
+    if let Some(mo) = it.effect("motion") {
         let rotated = mo.param("rotation").is_some_and(|p| p.is_animated() || p.value.as_f64().is_some_and(|r| r != 0.0));
         let uniform = mo.param("uniform_scale").and_then(|p| p.value.as_bool()).unwrap_or(true);
         if rotated || !uniform {
@@ -96,14 +97,31 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         Some(d) => return Err(bad(cmd, format!("unknown detector `{d}`"))),
     };
     let wait = bool_p(p, "wait").unwrap_or(false);
-    let clips = clips_p(s, p);
-    let mut jobs = Vec::new();
-    for c in clips {
+    // the crop fills the sequence frame, so it must have the sequence's aspect
+    let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
+    let seq_aspect = q.settings.width as f64 / q.settings.height.max(1) as f64;
+    if ((aspect.0 / aspect.1) / seq_aspect - 1.0).abs() > 0.005 {
+        return Err(bad(
+            cmd,
+            format!(
+                "`aspect` {}:{} differs from the sequence's {}x{}: set the sequence to that aspect, or leave `aspect` out",
+                aspect.0, aspect.1, q.settings.width, q.settings.height
+            ),
+        ));
+    }
+    // every clip is checked before any job starts
+    let mut targets = Vec::new();
+    for c in clips_p(s, p) {
         let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
         if q.find_item(c).and_then(|(t, _)| q.track(t)).is_none_or(|t| t.kind != TrackKind::Video) {
             continue;
         }
         let (_, size) = check_clip(s, c).map_err(EngineError::Other)?;
+        targets.push((c, size));
+    }
+    let mut jobs = Vec::new();
+    for (c, size) in targets {
+        let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
         let (_, it) = q.find_item(c).ok_or(EngineError::NoSequence)?;
         // sample times along the clip, in media time; spread out further for very long clips
         let dur = it.duration.0.max(1) as f64;
@@ -113,7 +131,7 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         let times: Vec<f64> = mts.iter().map(|t| *t as f64 / TICKS_PER_SECOND as f64).collect();
         let params = json!({"times": times, "aspect": [aspect.0, aspect.1], "smoothing": smoothing, "followSpeed": follow, "subjectIndex": subject, "detector": detector});
         let context = json!({"mt": mts, "source": [size.0, size.1], "aspect": [aspect.0, aspect.1]});
-        let spec = super::JobSpec { kind: "reframe", label: "Auto Reframe", clips: &[c], params, context, timeout: None, prepare: None };
+        let spec = super::JobSpec { kind: "reframe", label: "Auto Reframe", clips: &[c], params, context, timeout: None, prepare: None, loose: false };
         jobs.push(super::start_job(s, spec, wait)?);
     }
     if jobs.is_empty() {
@@ -122,26 +140,36 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(if jobs.len() == 1 { jobs.remove(0) } else { json!({"jobs": jobs}) })
 }
 
-/// Keyframes `(t, value)` without those the straight line between their kept neighbours already
-/// gives (within [`THIN_PX`]); the first and last stay.
-fn thin(keys: Vec<(Tick, Vec2)>) -> Vec<(Tick, Vec2)> {
-    if keys.len() <= 2 {
-        return keys;
+/// The fewest keyframes from `keys` (sorted by time) whose straight lines pass within
+/// [`THIN_PX`] of every key dropped between them (Ramer-Douglas-Peucker on time; iterative, so
+/// no recursion depth to bound). The first and last stay.
+fn thin(keys: &[(Tick, Vec2)]) -> Vec<(Tick, Vec2)> {
+    let n = keys.len();
+    if n <= 2 {
+        return keys.to_vec();
     }
-    let mut out: Vec<(Tick, Vec2)> = Vec::with_capacity(keys.len());
-    for (i, k) in keys.iter().enumerate() {
-        let (Some(prev), Some(next)) = (out.last(), keys.get(i + 1)) else {
-            out.push(*k);
-            continue;
-        };
-        let span = (next.0.0 - prev.0.0) as f64;
-        let f = if span > 0.0 { (k.0.0 - prev.0.0) as f64 / span } else { 0.0 };
-        let lerp = Vec2::new(prev.1.x + (next.1.x - prev.1.x) * f, prev.1.y + (next.1.y - prev.1.y) * f);
-        if (lerp.x - k.1.x).abs() > THIN_PX || (lerp.y - k.1.y).abs() > THIN_PX {
-            out.push(*k);
+    let mut keep = vec![false; n];
+    keep[0] = true;
+    keep[n - 1] = true;
+    let mut stack = vec![(0usize, n - 1)];
+    while let Some((a, b)) = stack.pop() {
+        let (ka, kb) = (keys[a], keys[b]);
+        let span = (kb.0.0 - ka.0.0) as f64;
+        let mut worst = (0.0f64, a);
+        for (i, k) in keys.iter().enumerate().take(b).skip(a + 1) {
+            let f = if span > 0.0 { (k.0.0 - ka.0.0) as f64 / span } else { 0.0 };
+            let err = (ka.1.x + (kb.1.x - ka.1.x) * f - k.1.x).abs().max((ka.1.y + (kb.1.y - ka.1.y) * f - k.1.y).abs());
+            if err > worst.0 {
+                worst = (err, i);
+            }
+        }
+        if worst.0 > THIN_PX {
+            keep[worst.1] = true;
+            stack.push((a, worst.1));
+            stack.push((worst.1, b));
         }
     }
-    out
+    keys.iter().zip(keep).filter(|(_, k)| *k).map(|(k, _)| *k).collect()
 }
 
 /// Read and check `reframe.json` against what the job asked for.
@@ -169,6 +197,10 @@ fn read_result(pj: &super::PendingAi, files: &[std::path::PathBuf]) -> Result<(f
     if !(cw.is_finite() && ch.is_finite() && cw > 0.0 && ch > 0.0 && cw <= sw + 0.5 && ch <= sh + 0.5) {
         return Err(bad("the crop does not fit the frame"));
     }
+    let asked = pj.context.get("aspect").and_then(Value::as_array).and_then(|a| Some(a.first()?.as_f64()? / a.get(1)?.as_f64()?));
+    if asked.is_none_or(|a| ((cw / ch) / a - 1.0).abs() > 0.005) {
+        return Err(bad("the crop does not have the aspect that was asked for"));
+    }
     let n = pj.context.get("mt").and_then(Value::as_array).map_or(0, Vec::len);
     let centers = v.get("centers").and_then(Value::as_array).ok_or_else(|| bad("no centres"))?;
     if centers.len() != n || n == 0 {
@@ -194,11 +226,12 @@ pub(crate) fn apply(s: &mut Session, pj: &super::PendingAi, files: &[std::path::
     let (qw, qh) = s.project.sequence(seq).map(|q| (q.settings.width as f64, q.settings.height as f64)).ok_or(EngineError::NoSequence)?;
     // the crop fills the frame; Position puts the crop centre at the frame centre
     let k = (qw / cw).max(qh / ch);
-    let keys: Vec<(Tick, Vec2)> =
+    let mut keys: Vec<(Tick, Vec2)> =
         mts.iter().zip(&centers).map(|(t, c)| (*t, Vec2::new(qw / 2.0 + (sw / 2.0 - c.x) * k, qh / 2.0 + (sh / 2.0 - c.y) * k))).collect();
-    let mut keys = thin(keys);
+    // media time runs backwards in a reversed clip: sort before thinning
     keys.sort_by_key(|k| k.0);
     keys.dedup_by_key(|k| k.0);
+    let keys = thin(&keys);
     let step: super::Step = Box::new(move |s: &mut Session| {
         s.edit("Auto Reframe", move |pr, _| {
             let q = pr.sequence_mut(seq).ok_or(EngineError::NoSequence)?;

@@ -566,12 +566,15 @@ fn the_cache_is_bounded() {
     assert!(other.exists() && !dirs[1].exists() && !dirs[3].exists());
 }
 
-/// A finished job leaves no heartbeat behind.
+/// A finished job leaves no heartbeat behind; an applied job's folder goes, one whose result was
+/// not applied stays (in the prunable cache).
 #[test]
 fn the_heartbeat_ends_with_the_job() {
     let mut f = fixture("beat", Script::default());
     let r = f.s.execute("ai.echo", json!({"wait": true})).unwrap();
-    let dir = PathBuf::from(r["outDir"].as_str().unwrap());
+    assert!(!PathBuf::from(r["outDir"].as_str().unwrap()).exists(), "applied: the job folder is removed");
+    let _ = f.s.execute("ai.echo", json!({"wait": true, "failStep": 2}));
+    let dir = PathBuf::from(&f.helper.started()[1].out_dir);
     assert!(dir.join("echo.json").exists() && !dir.join(super::HEARTBEAT).exists());
 }
 
@@ -608,4 +611,25 @@ fn repeated_connects_keep_one_probe_and_no_stale_capabilities() {
     assert!(reason(&f.s, "ai.reframe").contains("does not provide `reframe`"), "the slow helper's reframe never shows");
     assert_eq!(slow.hellos(), 1);
     assert_eq!(fast.hellos(), 2, "one probe after the slow one, one for ai.status: never one per connect");
+}
+
+/// A background host asks the helper again after a while: features that became ready later (a
+/// model downloaded or converted) show up without a click.
+#[test]
+fn a_background_host_reprobes() {
+    let mut f = fixture("reprobe", Script::default());
+    f.s.ai.background = true;
+    f.s.ai.last_probe = Some(web_time::Instant::now() - super::REPROBE - Duration::from_secs(1));
+    let before = f.helper.hellos();
+    super::poll(&mut f.s);
+    assert!(f.s.ai.probe.is_some(), "a probe started");
+    let t0 = std::time::Instant::now();
+    while f.s.ai.probe.is_some() {
+        assert!(t0.elapsed() < Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(5));
+        super::poll(&mut f.s);
+    }
+    assert_eq!(f.helper.hellos(), before + 1);
+    super::poll(&mut f.s);
+    assert!(f.s.ai.probe.is_none(), "not again until REPROBE has passed");
 }

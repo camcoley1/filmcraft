@@ -72,7 +72,15 @@ pub struct AiState {
     pub stamp: Option<(u64, String)>,
     /// Jobs whose results are applied when they finish.
     pub jobs: Vec<PendingAi>,
+    /// Where an unsaved project's AI media go (`<this>/AI Media/…`); `None` = the data directory.
+    pub media_root: Option<PathBuf>,
+    /// When the helper was last asked (background hosts ask again every [`REPROBE`], so a helper
+    /// started later, or one whose models became ready, is seen without a click).
+    pub last_probe: Option<web_time::Instant>,
 }
+
+/// How often a background host asks the helper again.
+pub const REPROBE: Duration = Duration::from_secs(30);
 
 impl Default for AiState {
     fn default() -> Self {
@@ -86,6 +94,8 @@ impl Default for AiState {
             probe: None,
             stamp: None,
             jobs: Vec::new(),
+            media_root: None,
+            last_probe: None,
         }
     }
 }
@@ -118,6 +128,9 @@ pub struct ClipPrint {
 /// What a job's result depends on; [`Fingerprint::check`] tells whether it still holds.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Fingerprint {
+    /// Only the media the clips play counts (stems not placed: the result does not depend on
+    /// where the clip is).
+    pub loose: bool,
     pub generation: u64,
     pub project: String,
     pub seq: ItemId,
@@ -133,7 +146,7 @@ fn hash_json<T: serde::Serialize + ?Sized>(v: &T) -> u64 {
 }
 
 impl Fingerprint {
-    fn capture(s: &Session, seq: ItemId, clips: &[ClipId]) -> Vec<ClipPrint> {
+    fn capture(s: &Session, seq: ItemId, clips: &[ClipId], loose: bool) -> Vec<ClipPrint> {
         let Some(q) = s.project.sequence(seq) else { return Vec::new() };
         clips
             .iter()
@@ -144,7 +157,8 @@ impl Fingerprint {
                     filmcraft_project::MediaRef::File { path } => Some(path.clone()),
                     filmcraft_project::MediaRef::Generator(_) => None,
                 });
-                Some(ClipPrint { clip: *c, track, item: it.item, media: path, state: hash_json(&(it, media)) })
+                let state = if loose { hash_json(&(media, it.audio_stream, &it.source_channels)) } else { hash_json(&(it, media)) };
+                Some(ClipPrint { clip: *c, track, item: it.item, media: path, state })
             })
             .collect()
     }
@@ -156,18 +170,18 @@ impl Fingerprint {
             return Err("another project was opened".into());
         }
         let Some(q) = s.project.sequence(self.seq) else { return Err("the sequence was deleted".into()) };
-        if hash_json(&q.settings) != self.settings {
+        if !self.loose && hash_json(&q.settings) != self.settings {
             return Err("the sequence settings changed".into());
         }
         let ids: Vec<ClipId> = self.clips.iter().map(|c| c.clip).collect();
-        let now = Self::capture(s, self.seq, &ids);
+        let now = Self::capture(s, self.seq, &ids, self.loose);
         for c in &self.clips {
             match now.iter().find(|n| n.clip == c.clip) {
                 None => return Err("a target clip was deleted".into()),
                 Some(n) if n != c => return Err("a target clip changed".into()),
                 Some(_) => {}
             }
-            if q.track(c.track).is_some_and(|t| t.locked) {
+            if !self.loose && q.track(c.track).is_some_and(|t| t.locked) {
                 return Err("a target track is locked".into());
             }
         }
@@ -345,6 +359,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
 /// configured port, and cache the outcome for the commands' `enabled`. With
 /// [`AiState::background`] it runs on a worker thread and [`poll`] picks it up.
 pub fn refresh(s: &mut Session, announce: bool) {
+    s.ai.last_probe = Some(web_time::Instant::now());
     if s.sidecar.is_none() {
         s.sidecar = tcp_client(s.ai.port, s.ai.limits);
     }
@@ -603,22 +618,25 @@ pub struct JobSpec<'a> {
     pub context: Value,
     /// Wall-clock limit for this job (default: [`Limits::timeout`]).
     pub timeout: Option<Duration>,
-    /// Runs on the job's thread before the helper is asked: writes the helper's input files into
-    /// the job folder (decoded audio…) and returns them in place of the media paths. Gets the
-    /// folder and whether the job was cancelled.
+    /// Runs on the job's thread before the helper is asked, inside the job's time limit: writes the
+    /// helper's input files into the job folder (decoded audio…) and returns them in place of the
+    /// media paths; they are deleted once the helper is done. Gets the folder, whether to stop
+    /// (cancelled or out of time) and a progress callback (0..1).
     pub prepare: Option<Prepare>,
+    /// See [`Fingerprint::loose`].
+    pub loose: bool,
 }
 
 /// See [`JobSpec::prepare`].
-pub type Prepare = Box<dyn FnOnce(&std::path::Path, &dyn Fn() -> bool) -> std::result::Result<Vec<String>, String> + Send>;
+pub type Prepare = Box<dyn FnOnce(&std::path::Path, &dyn Fn() -> bool, &mut dyn FnMut(f64)) -> std::result::Result<Vec<String>, String> + Send>;
 
 pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
-    let JobSpec { kind, label, clips, params, context, timeout, prepare } = spec;
+    let JobSpec { kind, label, clips, params, context, timeout, prepare, loose } = spec;
     let client = s.sidecar.clone().ok_or_else(|| EngineError::Other(NOT_CONNECTED.into()))?;
     helper_ready(s, kind).map_err(EngineError::Other)?;
     let wait = wait && !s.ai.background;
     let seq = s.state.active_sequence.ok_or(EngineError::NoSequence)?;
-    let prints = Fingerprint::capture(s, seq, clips);
+    let prints = Fingerprint::capture(s, seq, clips, loose);
     if prints.is_empty() {
         return Err(EngineError::Other("none of the clips is in the open sequence".into()));
     }
@@ -635,7 +653,7 @@ pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
     std::fs::create_dir_all(&out_dir).map_err(|e| EngineError::Other(format!("AI cache {}: {e}", out_dir.display())))?;
     let req = JobRequest { kind: kind.into(), inputs, params, out_dir: out_dir.to_string_lossy().into() };
     let settings = s.project.sequence(seq).map(|q| hash_json(&q.settings)).unwrap_or_default();
-    let fingerprint = Fingerprint { generation: s.project_generation, project, seq, settings, clips: prints };
+    let fingerprint = Fingerprint { loose, generation: s.project_generation, project, seq, settings, clips: prints };
     let keep: Vec<PathBuf> = s.ai.jobs.iter().map(|j| j.out_dir.clone()).chain([out_dir.clone()]).collect();
     let (ai_root, cap) = (cache_root(s).join("AI"), s.ai.cache_cap);
 
@@ -660,18 +678,35 @@ pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
             }
         };
         let mut req = req;
+        // the preparation counts against the job's time limit too
+        let late = || t0.elapsed() > limits.timeout;
+        let stop = || cancelled() || late();
+        let mut scratch = Vec::new();
         let prepared = match prepare {
             Some(prepare) => {
                 *lock(&prog.status) = "Preparing the input".into();
-                prepare(std::path::Path::new(&req.out_dir), &cancelled).map(|inputs| req.inputs = inputs)
+                let mut step = |f: f64| prog.done.store((f.clamp(0.0, 1.0) * 50.0) as u64, Ordering::Relaxed);
+                prepare(std::path::Path::new(&req.out_dir), &stop, &mut step).map(|inputs| {
+                    scratch = inputs.clone();
+                    req.inputs = inputs;
+                })
             }
             None => Ok(()),
         };
         let r = match prepared {
-            Ok(()) => filmcraft_sidecar::drive(&*client, &req, &limits, &cancelled, &mut on_progress),
+            Ok(()) if late() => Err(SidecarError::Timeout(limits.timeout.as_secs())),
+            Ok(()) => {
+                let left = Limits { timeout: limits.timeout.saturating_sub(t0.elapsed()), ..limits };
+                filmcraft_sidecar::drive(&*client, &req, &left, &cancelled, &mut on_progress)
+            }
             Err(_) if cancelled() => Err(SidecarError::Cancelled),
+            Err(_) if late() => Err(SidecarError::Timeout(limits.timeout.as_secs())),
             Err(e) => Err(SidecarError::Local(format!("preparing the input: {e}"))),
         };
+        // inputs made for the helper are not needed once it is done
+        for f in scratch {
+            let _ = std::fs::remove_file(f);
+        }
         let _ = std::fs::remove_file(&beat);
         match r {
             // finished by `poll` once the result is applied (or dropped)
@@ -727,6 +762,9 @@ pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
 /// per UI frame from [`Session::poll_persistence`] and after `wait` runs.
 pub fn poll(s: &mut Session) {
     poll_probe(s);
+    if s.ai.background && s.ai.probe.is_none() && s.ai.last_probe.is_some_and(|t| t.elapsed() >= REPROBE) {
+        refresh(s, false);
+    }
     for pj in &s.ai.jobs {
         if pj.fingerprint.generation != s.project_generation
             && let Some(j) = s.jobs.iter().find(|j| j.id == pj.job)
@@ -766,7 +804,12 @@ pub fn poll(s: &mut Session) {
             Err(m)
         } else {
             match apply(s, &pj, &ready.result, &ready.files) {
-                Ok(()) => Ok(ready.report),
+                Ok(()) => {
+                    // applied: anything the project uses was moved out ([`persist_media`]); the
+                    // job folder is no longer needed
+                    let _ = std::fs::remove_dir_all(&pj.out_dir);
+                    Ok(ready.report)
+                }
                 Err(e) => {
                     let m = format!("{e}; nothing was changed");
                     s.error_toast("ai", format!("{}: {m}", pj.label));
@@ -781,6 +824,60 @@ pub fn poll(s: &mut Session) {
         *lock(&job.result) = Some(r);
         job.progress.finished.store(true, Ordering::Relaxed);
     }
+}
+
+/// Where results that become project media live (never pruned): next to the saved project as
+/// `<project name> AI Media/<feature>/<job>/`, or for an unsaved project
+/// `<data dir>/AI Media/<project id>/<feature>/<job>/`. (Saving an unsaved project later does not
+/// move them; they stay where they are and the project points there.)
+pub fn media_dir(s: &Session, pj: &PendingAi) -> PathBuf {
+    let job = pj.out_dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| format!("job-{}", pj.job));
+    let saved = s.path.as_deref().map(std::path::Path::new).and_then(|p| p.parent()).filter(|_| !cfg!(target_arch = "wasm32"));
+    let base = match saved {
+        Some(dir) => {
+            let name: String = s.project.name.chars().map(|c| if matches!(c, '/' | '\\' | ':' | '\0') { '_' } else { c }).collect();
+            dir.join(format!("{} AI Media", name.trim()))
+        }
+        None => {
+            let root = s.ai.media_root.clone().or_else(crate::autosave::default_data_dir).unwrap_or_else(crate::temp_dir);
+            root.join("AI Media").join(&pj.fingerprint.project)
+        }
+    };
+    base.join(pj.kind).join(job)
+}
+
+fn move_file(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(from, to).or_else(|_| {
+        std::fs::copy(from, to)?;
+        std::fs::remove_file(from)
+    })
+}
+
+/// Apply a result whose `files` become project media: they are moved out of the cache into
+/// [`media_dir`] first, `steps(moved paths)` run as one undo step ([`apply_atomic`]), and if that
+/// fails the files go back to the cache.
+pub fn apply_with_media(s: &mut Session, pj: &PendingAi, label: &str, files: &[PathBuf], steps: impl FnOnce(Vec<PathBuf>) -> Vec<Step>) -> Result<()> {
+    let dir = media_dir(s, pj);
+    std::fs::create_dir_all(&dir).map_err(|e| EngineError::Other(format!("{}: {e}", dir.display())))?;
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for f in files {
+        let to = dir.join(f.file_name().ok_or_else(|| EngineError::Other(format!("{}: no file name", f.display())))?);
+        if let Err(e) = move_file(f, &to) {
+            for (from, to) in moved.iter().rev() {
+                let _ = move_file(to, from);
+            }
+            return Err(EngineError::Other(format!("moving {} to {}: {e}", f.display(), dir.display())));
+        }
+        moved.push((f.clone(), to));
+    }
+    let r = apply_atomic(s, label, steps(moved.iter().map(|(_, to)| to.clone()).collect()));
+    if r.is_err() {
+        for (from, to) in moved.iter().rev() {
+            let _ = move_file(to, from);
+        }
+        let _ = std::fs::remove_dir(&dir);
+    }
+    r
 }
 
 /// One step of applying a result.
@@ -816,7 +913,7 @@ fn echo(s: &mut Session, p: &Value) -> Result<Value> {
             params[k] = json!(n);
         }
     }
-    let spec = JobSpec { kind: "echo", label: "AI Echo", clips: &clips, params, context: Value::Null, timeout: None, prepare: None };
+    let spec = JobSpec { kind: "echo", label: "AI Echo", clips: &clips, params, context: Value::Null, timeout: None, prepare: None, loose: false };
     start_job(s, spec, bool_p(p, "wait").unwrap_or(false))
 }
 

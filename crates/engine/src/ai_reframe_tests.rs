@@ -110,11 +110,33 @@ fn clips_it_cannot_reframe_are_refused() {
     f.s.execute("effects.setParam", json!({"clip": c.0, "effect": "motion", "param": "rotation", "value": 15.0})).unwrap();
     let e = f.s.execute("ai.reframe", json!({})).unwrap_err().to_string();
     assert!(e.contains("Rotation"), "{e}");
-    for (aspect, ok) in [(json!("9:16"), true), (json!([4, 5]), true), (json!("nine"), false), (json!([0, 1]), false), (json!(3), false)] {
+    // the crop fills the sequence frame: only the sequence's aspect makes sense
+    for (aspect, ok) in [
+        (json!("9:16"), true),
+        (json!([36, 64]), true),
+        (json!([4, 5]), false),
+        (json!("16:9"), false),
+        (json!("nine"), false),
+        (json!([0, 1]), false),
+        (json!(3), false),
+    ] {
         let mut g = vertical("rf-aspect", still);
         let r = g.s.execute("ai.reframe", json!({"aspect": aspect, "wait": true}));
         assert_eq!(r.is_ok(), ok, "{aspect}: {r:?}");
     }
+    // a rotation is refused even with Motion switched off (the apply switches it on)
+    let mut h = vertical("rf-off", still);
+    let c = h.clip;
+    h.s.execute("effects.setParam", json!({"clip": c.0, "effect": "motion", "param": "rotation", "value": 15.0})).unwrap();
+    let seq = h.s.state.active_sequence.unwrap();
+    h.s.edit("Motion off", |pr, _| {
+        let q = pr.sequence_mut(seq).unwrap();
+        q.video_tracks[0].items[0].effect_mut("motion").unwrap().enabled = false;
+        Ok(())
+    })
+    .unwrap();
+    let e = h.s.execute("ai.reframe", json!({})).unwrap_err().to_string();
+    assert!(e.contains("Rotation"), "{e}");
 }
 
 #[test]
@@ -147,4 +169,68 @@ fn cancel_mid_reframe_changes_nothing() {
     finish(&mut f.s, id);
     assert_eq!(job_error(&f.s, id).as_deref(), Some("stopped"));
     assert!(motion(&f).param("position").is_none_or(|p| p.keyframes.is_empty()));
+}
+
+/// A path that curves: the thinned keyframes stay within THIN_PX of every sample.
+fn parabola(req: &JobRequest) -> Vec<(String, Vec<u8>)> {
+    result(times(req).iter().map(|t| [(10.125 + 6.0 * t * t).clamp(CW / 2.0, 64.0 - CW / 2.0), 18.0]).collect())
+}
+
+fn wrong_aspect(req: &JobRequest) -> Vec<(String, Vec<u8>)> {
+    let v = json!({"source": [64, 36], "crop": [30.0, 36.0], "centers": times(req).iter().map(|_| [32.0, 18.0]).collect::<Vec<_>>()});
+    vec![("reframe.json".into(), serde_json::to_vec(&v).unwrap())]
+}
+
+/// Forward, reversed, sped-up and trimmed clips: at every sample the crop centre the helper
+/// reported lands exactly on the frame centre after Motion (checked through the renderer's own
+/// Motion matrix), and between samples the thinned path stays within THIN_PX.
+#[test]
+fn the_crop_centre_lands_on_the_frame_centre_for_any_clip_timing() {
+    for (name, write, source_in, speed, reverse, fps) in [
+        ("fwd", moving as filmcraft_sidecar::fake::Writer, 0.0, 1.0, false, 6.0),
+        ("rev", moving, 0.0, 1.0, true, 6.0),
+        ("fast", moving, 0.0, 2.0, false, 6.0),
+        ("trim", moving, 0.5, 1.0, false, 6.0),
+        ("curve", parabola, 0.0, 1.0, false, 30.0),
+    ] {
+        let mut f = vertical(&format!("rf-time-{name}"), write);
+        let seq = f.s.state.active_sequence.unwrap();
+        let tps = TICKS_PER_SECOND as f64;
+        f.s.edit("Timing", |pr, _| {
+            let it = &mut pr.sequence_mut(seq).unwrap().video_tracks[0].items[0];
+            it.source_in = Tick((source_in * tps) as i64);
+            it.speed = speed;
+            it.reverse = reverse;
+            it.duration = Tick(((2.0 - source_in) / speed * tps) as i64);
+            Ok(())
+        })
+        .unwrap();
+        f.s.execute("ai.reframe", json!({"wait": true, "sampleFps": fps})).unwrap();
+        let req = f.helper.started()[0].clone();
+        let q = f.s.active_sequence().unwrap();
+        let (_, it) = q.find_item(f.clip).unwrap();
+        let centre = |t: f64| -> f64 {
+            if name == "curve" { (10.125 + 6.0 * t * t).clamp(CW / 2.0, 64.0 - CW / 2.0) } else { (12.0 + 10.0 * t).clamp(CW / 2.0, 64.0 - CW / 2.0) }
+        };
+        let ts = times(&req);
+        if reverse {
+            assert!(ts.windows(2).all(|w| w[0] > w[1]), "{name}: a reversed clip samples media time backwards");
+        }
+        for t in &ts {
+            let mt = Tick((t * tps).round() as i64);
+            let m = filmcraft_render::motion_matrix(q, it, (64, 36), None, mt);
+            let p = m.apply(Vec2::new(centre(*t), 18.0));
+            assert!((p.x - 18.0).abs() < 0.26 && (p.y - 32.0).abs() < 1e-6, "{name} at {t}: crop centre lands at {p:?}");
+        }
+    }
+}
+
+#[test]
+fn a_crop_of_another_aspect_is_refused() {
+    let mut f = vertical("rf-crop-aspect", wrong_aspect);
+    super::super::ensure_project_id(&mut f.s);
+    let before = snapshot(&f.s);
+    let e = f.s.execute("ai.reframe", json!({"wait": true})).unwrap_err().to_string();
+    assert!(e.contains("aspect"), "{e}");
+    assert_eq!(snapshot(&f.s), before);
 }
