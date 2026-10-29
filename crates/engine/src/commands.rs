@@ -1381,15 +1381,22 @@ fn build() -> Vec<CommandSpec> {
                 }
                 // Media files through the host's reader (no whole-file read) when it has one.
                 let streamed = filmcraft_media::is_importable(std::path::Path::new(&path)) && s.services.reader(&path).is_some();
-                // a CapCut draft is bounded before it is read, not after
-                let oversized_draft = !streamed
-                    && path.to_ascii_lowercase().ends_with(".json")
-                    && s.services.file_size(&path).is_ok_and(|n| n > filmcraft_interchange::capcut::MAX_BYTES as u64);
-                if oversized_draft {
-                    errors.push(format!("{path}: larger than {} MiB", filmcraft_interchange::capcut::MAX_BYTES / (1024 * 1024)));
-                    continue;
-                }
-                let read = if streamed { Ok(Vec::new()) } else { s.services.read_file(&path) };
+                // a CapCut draft is bounded while it is read: the host never reads past the cap
+                let max = filmcraft_interchange::capcut::MAX_BYTES as u64;
+                let json = !streamed && path.to_ascii_lowercase().ends_with(".json");
+                let read = if streamed {
+                    Ok(Vec::new())
+                } else if json {
+                    match s.services.read_file_capped(&path, max) {
+                        Ok(b) if b.len() as u64 > max => {
+                            errors.push(format!("{path}: larger than {} MiB", max / (1024 * 1024)));
+                            continue;
+                        }
+                        r => r,
+                    }
+                } else {
+                    s.services.read_file(&path)
+                };
                 match read {
                     Ok(_) if streamed => match import_streamed(s, &path, bin) {
                         Ok(id) => ids.push(id.0),

@@ -115,6 +115,11 @@ pub trait Services: Send + Sync {
         let a = (offset as usize).min(b.len());
         Ok(b[a..(a + len).min(b.len())].to_vec())
     }
+    /// At most `max + 1` bytes from the start of a file, so a caller can refuse anything over
+    /// `max` without the host ever reading more. Bounded wherever `read_range` is.
+    fn read_file_capped(&self, path: &str, max: u64) -> std::io::Result<Vec<u8>> {
+        self.read_range(path, 0, usize::try_from(max.saturating_add(1)).unwrap_or(usize::MAX))
+    }
     /// A random-access reader for a media file, so containers are opened without reading the
     /// whole file (web: `Blob` range reads). `None`: the host has none; media are read whole.
     fn reader(&self, _path: &str) -> Option<std::io::Result<filmcraft_media::SharedReader>> {
@@ -180,6 +185,12 @@ impl Services for FsServices {
     fn file_size(&self, path: &str) -> std::io::Result<u64> {
         let m = std::fs::metadata(path)?;
         if m.is_file() { Ok(m.len()) } else { Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("{path} is not a file"))) }
+    }
+    fn read_file_capped(&self, path: &str, max: u64) -> std::io::Result<Vec<u8>> {
+        use std::io::Read;
+        let mut out = Vec::new();
+        std::fs::File::open(path)?.take(max.saturating_add(1)).read_to_end(&mut out)?;
+        Ok(out)
     }
     fn list_dir(&self, dir: &str) -> Option<std::io::Result<Vec<String>>> {
         let dir = if dir.is_empty() { "." } else { dir };

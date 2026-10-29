@@ -502,6 +502,53 @@ fn a_directly_imported_oversized_draft_is_refused_before_it_is_read() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// The filesystem, recording every whole-file read and able to fail size queries and capped reads.
+struct Recording {
+    whole_reads: std::sync::Mutex<Vec<String>>,
+    fail_capped: bool,
+}
+impl crate::Services for Recording {
+    fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        self.whole_reads.lock().unwrap().push(path.to_string());
+        std::fs::read(path)
+    }
+    fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
+        crate::FsServices.write_file(path, data)
+    }
+    fn file_size(&self, _path: &str) -> std::io::Result<u64> {
+        Err(std::io::Error::other("size query failed"))
+    }
+    fn read_file_capped(&self, path: &str, max: u64) -> std::io::Result<Vec<u8>> {
+        if self.fail_capped {
+            return Err(std::io::Error::other("capped read failed"));
+        }
+        crate::FsServices.read_file_capped(path, max)
+    }
+}
+
+#[test]
+fn an_oversized_draft_is_never_read_whole_and_read_errors_are_reported() {
+    let d = dir("big-draft-recorded");
+    let path = d.join("draft_content.json");
+    std::fs::File::create(&path).unwrap().set_len(300 * 1024 * 1024).unwrap();
+    let p = path.to_string_lossy().to_string();
+    for fail_capped in [false, true] {
+        let rec = std::sync::Arc::new(Recording { whole_reads: Default::default(), fail_capped });
+        let mut s = Session::new(rec.clone());
+        let e = s.execute("file.import", json!({"paths": [p]})).unwrap_err().to_string();
+        let want = if fail_capped { "capped read failed" } else { "larger than" };
+        assert!(e.contains(want), "{fail_capped}: {e}");
+        assert!(rec.whole_reads.lock().unwrap().is_empty(), "the draft was read whole: {:?}", rec.whole_reads.lock().unwrap());
+    }
+    // a draft under the cap still imports when the size query fails
+    std::fs::write(&path, DRAFT).unwrap();
+    let rec = std::sync::Arc::new(Recording { whole_reads: Default::default(), fail_capped: false });
+    let mut s = Session::new(rec);
+    let r = s.execute("file.import", json!({"paths": [p]})).unwrap();
+    assert_eq!(r["sequences"].as_array().map(Vec::len), Some(1), "{r}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 #[cfg(unix)]
 #[test]
 fn plain_xml_inside_a_library_is_contained_like_a_bundle() {
