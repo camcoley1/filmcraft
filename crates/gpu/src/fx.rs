@@ -133,6 +133,13 @@ pub(crate) struct FxStage {
     source: wgpu::RenderPipeline,
     pool: HashMap<(u32, u32), Vec<Target>>,
     used: HashSet<(u32, u32)>,
+    /// Working-texture bytes one layer may hold ([`FX_TEXTURE_BUDGET`]).
+    pub(crate) budget: u64,
+    /// Tests: refuse the next reserve (as an out-of-memory device would) / the next job.
+    #[cfg(test)]
+    pub(crate) fail_reserve: bool,
+    #[cfg(test)]
+    pub(crate) fail_job: bool,
 }
 
 /// One compute pass of a job.
@@ -430,9 +437,9 @@ pub(crate) struct Prepared {
 }
 
 /// The passes of `fx` if the GPU stage can run them on `device`: the working image fits in a
-/// texture, its working textures within [`FX_TEXTURE_BUDGET`], every table within a storage
-/// binding. None: render the layer's effects on the CPU.
-pub(crate) fn prepare(device: &wgpu::Device, fx: &LayerFx) -> Option<Prepared> {
+/// texture, its working textures within `budget` bytes ([`FX_TEXTURE_BUDGET`]), every table within
+/// a storage binding. None: render the layer's effects on the CPU.
+pub(crate) fn prepare(device: &wgpu::Device, fx: &LayerFx, budget: u64) -> Option<Prepared> {
     let (w, h) = (fx.size.0.max(1), fx.size.1.max(1));
     let limits = device.limits();
     if w > limits.max_texture_dimension_2d || h > limits.max_texture_dimension_2d {
@@ -448,7 +455,7 @@ pub(crate) fn prepare(device: &wgpu::Device, fx: &LayerFx) -> Option<Prepared> {
     }
     let n = deepest + 2;
     let bytes = (n as u64).saturating_mul(u64::from(w)).saturating_mul(u64::from(h)).saturating_mul(16);
-    if bytes > FX_TEXTURE_BUDGET {
+    if bytes > budget {
         return None;
     }
     if steps.iter().any(|s| (s.data.len() as u64).saturating_mul(4) > limits.max_storage_buffer_binding_size) {
@@ -550,7 +557,20 @@ impl FxStage {
             multiview_mask: None,
             cache: None,
         });
-        Self { px: compute("fx_px"), run: compute("fx_run"), median: compute("fx_median"), bgl, source, pool: HashMap::new(), used: HashSet::new() }
+        Self {
+            px: compute("fx_px"),
+            run: compute("fx_run"),
+            median: compute("fx_median"),
+            bgl,
+            source,
+            pool: HashMap::new(),
+            used: HashSet::new(),
+            budget: FX_TEXTURE_BUDGET,
+            #[cfg(test)]
+            fail_reserve: false,
+            #[cfg(test)]
+            fail_job: false,
+        }
     }
 
     /// Start a frame: pooled textures of sizes no layer uses by [`end_frame`](Self::end_frame)
@@ -601,6 +621,10 @@ impl FxStage {
     /// scope around the allocation: false when the device refuses, and the caller renders the
     /// layer's effects on the CPU instead (the session's GPU compositing carries on).
     pub(crate) fn reserve(&mut self, device: &wgpu::Device, p: &Prepared) -> bool {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_reserve) {
+            return false;
+        }
         let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let got = self.targets(device, p.size, p.n).len();
         match crate::poll_now(scope.pop()) {
@@ -623,6 +647,10 @@ impl FxStage {
         source_bg: wgpu::BindGroup,
         dummy: &wgpu::TextureView,
     ) -> Option<FxJob> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_job) {
+            return None;
+        }
         let (w, h) = p.size;
         let (all, n) = (&p.steps, p.n);
         let targets = self.targets(device, (w, h), n);

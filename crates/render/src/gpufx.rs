@@ -217,6 +217,9 @@ pub enum FxOp {
 /// Most mask polygon points (all masks of one effect) the GPU stage takes: its coverage pass tests
 /// every edge for the pixels near a mask, so the work per pass stays bounded.
 pub const GPU_MASK_MAX_POINTS: usize = 1024;
+/// Most active masks of one effect the GPU stage takes: every mask costs each pixel a pass of the
+/// coverage loop, even an empty one (whose coverage is constant, and not ignorable when inverted).
+pub const GPU_MASK_MAX_MASKS: usize = 32;
 
 /// Largest 3D LUT cube (entries per side) the GPU stage takes; larger cubes render on the CPU.
 pub const GPU_LUT_MAX_CUBE: usize = 65;
@@ -700,6 +703,7 @@ impl FxOp {
                 // its `min` with NaN is not Rust's
                 let near = |v: &[f32]| v.iter().all(|x| x.is_finite() && x.abs() <= 1e7);
                 op.gpu_ok()
+                    && masks.len() <= GPU_MASK_MAX_MASKS
                     && masks.iter().map(|m| m.pts.len()).sum::<usize>() <= GPU_MASK_MAX_POINTS
                     && masks.iter().all(|m| m.pts.iter().all(|p| near(p)) && near(&[m.feather, m.expansion]) && m.opacity.is_finite())
             }

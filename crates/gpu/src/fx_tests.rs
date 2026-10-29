@@ -982,7 +982,7 @@ fn lumetri_heavy_grade_timings() {
             let t0 = std::time::Instant::now();
             for _ in 0..5 {
                 let op = FxOp::eval(&e, &c, w as usize, h as usize).expect("an op");
-                let _ = fx::prepare(dev, &LayerFx { size: (w, h), decimation: 1, ops: vec![op] });
+                let _ = fx::prepare(dev, &LayerFx { size: (w, h), decimation: 1, ops: vec![op] }, fx::FX_TEXTURE_BUDGET);
             }
             t0.elapsed().as_secs_f64() * 1000.0 / 5.0
         });
@@ -1305,16 +1305,117 @@ fn working_textures_stay_within_the_budget() {
         LayerFx { size, decimation: 1, ops: vec![op] }
     };
     // 4K masked heavy grade: 4 textures × 3840 × 2160 × 16 B ≈ 531 MB, within the budget
-    assert!(fx::prepare(&dev, &masked((3840, 2160))).is_some());
+    assert!(fx::prepare(&dev, &masked((3840, 2160)), fx::FX_TEXTURE_BUDGET).is_some());
     // 7680 × 4320 with the same nesting would need ≈ 2.1 GB: refused (CPU), or beyond the texture size
-    assert!(fx::prepare(&dev, &masked((7680, 4320))).is_none());
+    assert!(fx::prepare(&dev, &masked((7680, 4320)), fx::FX_TEXTURE_BUDGET).is_none());
     // a plain grade at 7680 × 4320 needs two: 1 061 683 200 B, just within the 1 GiB budget
     // (where the device's texture size allows 8K at all)
     let plain = FxOp::eval(&effect("lumetri", &[("exposure", fl(0.2))]), &cx(Tick::ZERO, 1.0), 7680, 4320).unwrap();
-    let big = fx::prepare(&dev, &LayerFx { size: (7680, 4320), decimation: 1, ops: vec![plain.clone()] });
+    let big = fx::prepare(&dev, &LayerFx { size: (7680, 4320), decimation: 1, ops: vec![plain.clone()] }, fx::FX_TEXTURE_BUDGET);
     assert!(big.as_ref().is_none_or(|p| p.n == 2) && (big.is_some() || dev.limits().max_texture_dimension_2d < 7680));
     // 8K with one saved image (three textures, 1.59 GB): refused
     let unsharp = FxOp::eval(&effect("unsharp_mask", &[("amount", fl(100.0))]), &cx(Tick::ZERO, 1.0), 7680, 4320).unwrap();
-    assert!(fx::prepare(&dev, &LayerFx { size: (7680, 4320), decimation: 1, ops: vec![unsharp] }).is_none());
-    assert!(fx::prepare(&dev, &LayerFx { size: (3840, 2160), decimation: 1, ops: vec![plain] }).is_some());
+    assert!(fx::prepare(&dev, &LayerFx { size: (7680, 4320), decimation: 1, ops: vec![unsharp] }, fx::FX_TEXTURE_BUDGET).is_none());
+    assert!(fx::prepare(&dev, &LayerFx { size: (3840, 2160), decimation: 1, ops: vec![plain] }, fx::FX_TEXTURE_BUDGET).is_some());
+}
+
+/// Every way the GPU stage can turn a graded layer down gives the CPU render of the grade, never
+/// the ungraded frame: working textures over the budget, the device refusing them (out of memory),
+/// a table larger than the device's storage binding, and recording the prepared passes failing
+/// (which no input reaches; forced here), which renders the frame again with the layer on the CPU.
+#[test]
+fn no_preparation_failure_drops_a_grade() {
+    let Some((dev, q)) = gpu_or_skip("no_preparation_failure_drops_a_grade") else { return };
+    let (w, h) = (320usize, 180usize);
+    let grade = |lw: u32, lh: u32| {
+        let mut e = heavy_grade();
+        e.masks = effect_masks(f64::from(lw), f64::from(lh));
+        FxOp::eval_masked(&e, &cx(Tick::ZERO, 1.0), lw as usize, lh as usize).unwrap()
+    };
+    let plan = FramePlan::Layers {
+        width: w,
+        height: h,
+        layers: vec![PlanLayer {
+            frame: yuv_frame(320, 180),
+            matrix: Affine::IDENTITY,
+            opacity: 1.0,
+            blend: Blend::Normal,
+            fx: Some(Arc::new(LayerFx { size: (320, 180), decimation: 1, ops: vec![grade(320, 180)] })),
+            input: None,
+        }],
+    };
+    let cpu = execute_cpu(&plan).over_black_rgba8();
+    let FramePlan::Layers { layers, .. } = &plan else { unreachable!() };
+    let bare = FramePlan::Layers { width: w, height: h, layers: vec![PlanLayer { fx: None, ..layers[0].clone() }] };
+    let ungraded = execute_cpu(&bare).over_black_rgba8();
+    let all = vec![true; w * h];
+    let (_, graded_mean, _) = stats8(&cpu, &ungraded, &all);
+    assert!(graded_mean > 5.0, "the grade changes the picture: {graded_mean}");
+    let check = |what: &str, c: &mut GpuCompositor| {
+        c.composite(&plan);
+        let (_, _, gpu) = c.read_output().expect("readback");
+        let (p99, mean, _) = stats8(&cpu, &gpu, &all);
+        eprintln!("{what}: against the CPU render p99 {p99} mean {mean:.3}");
+        assert!(p99 <= 6 && mean < 1.5, "{what}: p99 {p99} mean {mean}: not the graded picture");
+    };
+    let mut c = GpuCompositor::new(&dev, &q);
+    check("GPU stage", &mut c);
+    c.fx.as_mut().unwrap().budget = 1;
+    check("working textures over the budget (CPU)", &mut c);
+    c.fx.as_mut().unwrap().budget = fx::FX_TEXTURE_BUDGET;
+    c.fx.as_mut().unwrap().fail_reserve = true;
+    check("device refuses the working textures (CPU)", &mut c);
+    c.fx.as_mut().unwrap().fail_job = true;
+    check("recording the passes fails (frame rendered again, layer on the CPU)", &mut c);
+    assert!(!c.fx.as_ref().unwrap().fail_job, "the forced failure was reached");
+    check("GPU stage again", &mut c);
+    // a device whose storage bindings cannot hold the grade's tables (the curves alone are 36 KB)
+    let instance = wgpu::Instance::default();
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).expect("the adapter of `device()`");
+    let limits = wgpu::Limits { max_storage_buffer_binding_size: 16 * 1024, ..wgpu::Limits::downlevel_defaults() }.using_resolution(adapter.limits());
+    let small = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() }));
+    match small {
+        Ok((sdev, sq)) => {
+            assert!(sdev.limits().max_storage_buffer_binding_size <= 16 * 1024);
+            assert!(fx::prepare(&sdev, &LayerFx { size: (320, 180), decimation: 1, ops: vec![grade(320, 180)] }, fx::FX_TEXTURE_BUDGET).is_none());
+            let mut c = GpuCompositor::new(&sdev, &sq);
+            check("tables over the storage binding (CPU)", &mut c);
+        }
+        Err(e) => eprintln!("SKIPPED the small-binding device: {e}"),
+    }
+}
+
+/// Masks without area still cost every pixel a pass of the coverage loop (and an inverted empty
+/// mask still covers everything), so the stage takes at most `GPU_MASK_MAX_MASKS` of them: many
+/// empty and inverted-empty masks go to the CPU, a few stay on the GPU and match the CPU.
+#[test]
+fn empty_masks_are_bounded_and_match_cpu() {
+    use filmcraft_project::MaskMode;
+    let flat =
+        |inverted: bool, mode: MaskMode| filmcraft_render::mask::FlatMask { pts: Vec::new(), feather: 4.0, expansion: 0.0, opacity: 0.9, inverted, mode };
+    let many: Vec<_> = (0..filmcraft_render::gpufx::GPU_MASK_MAX_MASKS + 1).map(|i| flat(i % 2 == 1, MaskMode::Add)).collect();
+    assert!(!FxOp::Masked { op: Box::new(FxOp::BlackWhite), masks: many }.gpu_ok(), "too many masks: CPU");
+    let Some((dev, q)) = gpu_or_skip("empty_masks_are_bounded_and_match_cpu") else { return };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let (w, h) = (320u32, 180u32);
+    let px = demo_picture(w, h);
+    let frame = VideoFrame::rgba_f32(w, h, px.clone());
+    for (name, masks) in [
+        ("empty Add masks", (0..8).map(|_| flat(false, MaskMode::Add)).collect::<Vec<_>>()),
+        ("inverted empty masks", (0..8).map(|_| flat(true, MaskMode::Add)).collect()),
+        (
+            "mixed empty, inverted, Intersect / Difference",
+            vec![flat(true, MaskMode::Add), flat(false, MaskMode::Intersect), flat(true, MaskMode::Difference), flat(false, MaskMode::Lighten)],
+        ),
+        ("as many as allowed", (0..filmcraft_render::gpufx::GPU_MASK_MAX_MASKS).map(|i| flat(i % 3 == 0, MaskMode::Add)).collect()),
+    ] {
+        let op = FxOp::Masked { op: Box::new(FxOp::BlackWhite), masks };
+        assert!(op.gpu_ok(), "{name}");
+        let mut cpu = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.clone() };
+        op.apply(&mut cpu);
+        let (_, _, gpu) = c.effect_image(&frame, &LayerFx { size: (w, h), decimation: 1, ops: vec![op] }).expect("effect image");
+        let (fl_diff, b8) = diff_float_and_8bit(&cpu.px, &gpu);
+        eprintln!("{name}: max float diff {fl_diff:.2e}, max 8-bit diff {b8}");
+        assert!(fl_diff <= 1.0 / 255.0 && b8 <= 1, "{name}: {fl_diff} / {b8}");
+    }
 }

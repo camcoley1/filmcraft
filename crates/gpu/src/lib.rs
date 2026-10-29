@@ -755,7 +755,7 @@ impl GpuCompositor {
                 continue;
             };
             let ready = match self.fx.as_mut() {
-                Some(stage) => fx::prepare(&self.device, lfx).filter(|p| stage.reserve(&self.device, p)),
+                Some(stage) => fx::prepare(&self.device, lfx, stage.budget).filter(|p| stage.reserve(&self.device, p)),
                 None => None,
             };
             if ready.is_some() {
@@ -784,6 +784,10 @@ impl GpuCompositor {
         let mut bind_groups = Vec::with_capacity(layers.len());
         // the effect stage of each layer with effects (recorded right before its draw)
         let mut jobs: Vec<Option<fx::FxJob>> = Vec::with_capacity(layers.len());
+        // a layer whose prepared passes could not be recorded (no input reaches this after the
+        // pre-check; tests force it): the frame is rendered again with that layer's effects done on
+        // the CPU, so no path ever draws a layer without its grade
+        let mut retry: Option<usize> = None;
         for (i, (l, k)) in layers.iter().zip(&keys).enumerate() {
             // (every frame was just uploaded; a missing upload draws transparent texels)
             let src = self.src_info(&l.frame, *k).unwrap_or(SrcInfo {
@@ -833,10 +837,11 @@ impl GpuCompositor {
                         SrcInfo { kind: 1, code_scale: 1.0, code_levels: 1.0, alpha: 0.0, chroma: l.size(), size: l.size(), color: l.frame.color, input: None };
                     (Self::uniforms(&s, &l.matrix, l.opacity, l.blend, (w, h)), [j.result.clone(), self.dummy.clone(), self.dummy.clone(), self.dummy.clone()])
                 }
+                None if l.fx.is_some() => {
+                    retry = Some(i);
+                    break;
+                }
                 None => {
-                    // (a layer with effects only gets here if recording its prepared passes failed
-                    // after the pre-check above accepted them and reserved their textures, which
-                    // no input reaches; it is then drawn without them, where the working image would be)
                     let m = match &l.fx {
                         Some(lfx) => {
                             let n = 1.0 / lfx.decimation.max(1) as f64;
@@ -865,6 +870,17 @@ impl GpuCompositor {
             };
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("layer"), layout, entries: &entries });
             bind_groups.push((bg, region));
+        }
+        if let Some(i) = retry {
+            log::warn!("GPU effects of layer {i} could not be recorded; rendering them on the CPU");
+            let mut again: Vec<PlanLayer> = layers.iter().map(|l| (*l).clone()).collect();
+            if let Some(l) = again.get_mut(i)
+                && let Some(lfx) = l.fx.take()
+            {
+                let img = filmcraft_render::plan::effect_image(&l.frame, &lfx);
+                *l = PlanLayer::new(Arc::new(VideoFrame::rgba_f32(img.w as u32, img.h as u32, img.px)), l.matrix, l.opacity, l.blend);
+            }
+            return self.render_plan(&FramePlan::Layers { width: w as usize, height: h as usize, layers: again }, None, clear, resolve);
         }
         if let Some(f) = self.fx.as_mut() {
             f.end_frame();
@@ -1015,8 +1031,8 @@ impl GpuCompositor {
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&views[3]) },
             ],
         });
-        let p = fx::prepare(&self.device, fx)?;
         let stage = self.fx.as_mut()?;
+        let p = fx::prepare(&self.device, fx, stage.budget)?;
         stage.begin_frame();
         if !stage.reserve(&self.device, &p) {
             return None;
