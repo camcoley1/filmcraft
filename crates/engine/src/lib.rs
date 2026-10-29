@@ -1301,9 +1301,9 @@ mod file_tests;
 #[cfg(test)]
 mod gap_selection_tests;
 #[cfg(test)]
-mod hevc422_import_tests;
-#[cfg(test)]
 mod image_sequence_tests;
+#[cfg(test)]
+mod import_422_tests;
 #[cfg(test)]
 mod individual_selection_tests;
 #[cfg(test)]

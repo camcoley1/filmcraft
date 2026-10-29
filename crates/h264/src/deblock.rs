@@ -1,4 +1,4 @@
-//! Deblocking filter (8.7) for progressive frames, 4:2:0, any bit depth.
+//! Deblocking filter (8.7) for progressive frames, 4:2:0 and 4:2:2, any bit depth.
 
 use crate::picture::{MbKind, MbState, Pixel};
 use crate::slicedec::{PicState, SliceInfo};
@@ -396,15 +396,15 @@ pub fn deblock_mb<P: Pixel>(pic: &mut PicState<P>, addr: usize, mb_w: usize) {
     let t8 = q.transform_8x8;
     // bS[dir][edge][segment]; dir 0 = vertical edges (x), 1 = horizontal edges (y)
     let mut bs = [[[0u8; 4]; 4]; 2];
+    // (bS of the internal edges inside 8x8 transform blocks is derived too: the luma filter skips
+    // them, but 4:2:2 chroma filters the horizontal chroma edges at chroma rows 4 and 12)
     if q.kind.is_intra() {
         for dir in 0..2 {
             if (if dir == 0 { left } else { top }).is_some() {
                 bs[dir][0] = [4; 4];
             }
             for e in 1..4 {
-                if !(t8 && e % 2 == 1) {
-                    bs[dir][e] = [3; 4];
-                }
+                bs[dir][e] = [3; 4];
             }
         }
     } else {
@@ -434,9 +434,6 @@ pub fn deblock_mb<P: Pixel>(pic: &mut PicState<P>, addr: usize, mb_w: usize) {
                 continue;
             }
             for e in 1..4 {
-                if t8 && e % 2 == 1 {
-                    continue;
-                }
                 for k in 0..4 {
                     let (rq, rp) = if dir == 0 { (k * 4 + e, k * 4 + e - 1) } else { (e * 4 + k, e * 4 + k - 4) };
                     bs[dir][e][k] = if (q.nz_mask >> rp) & 1 != 0 || (q.nz_mask >> rq) & 1 != 0 { 2 } else { motion_bs(&qm[rp], &qm[rq]) };
@@ -460,10 +457,10 @@ pub fn deblock_mb<P: Pixel>(pic: &mut PicState<P>, addr: usize, mb_w: usize) {
     let (bd_y, bd_c) = (pic.bd_y, pic.bd_c);
     let width = pic.planes.width;
     let cwidth = pic.planes.cwidth;
-    // luma
+    // luma (no edges inside 8x8 transform blocks)
     for dir in 0..2 {
         for e in 0..4 {
-            if bs[dir][e] == [0; 4] {
+            if bs[dir][e] == [0; 4] || (t8 && e % 2 == 1) {
                 continue;
             }
             let qpp = if e == 0 { p_qp[dir].map(|p| p.0).unwrap_or(q_qp) } else { q_qp };
@@ -480,11 +477,15 @@ pub fn deblock_mb<P: Pixel>(pic: &mut PicState<P>, addr: usize, mb_w: usize) {
             }
         }
     }
-    // chroma (4:2:0): edges at chroma samples 0 and 4 use the bS of luma edges 0 and 2
+    // chroma: vertical edges at chroma columns 0 and 4 use the bS of luma edges 0 and 2; horizontal
+    // edges at chroma rows 0 and 4 (4:2:0) use luma edges 0 and 2, at rows 0, 4, 8 and 12 (4:2:2)
+    // luma edges 0 to 3
+    let mbh_c = pic.fmt.mb_height_c();
     for c in 0..2 {
         for dir in 0..2 {
-            for ce in 0..2 {
-                let e = ce * 2;
+            let n_edges = if dir == 1 && mbh_c == 16 { 4 } else { 2 };
+            for ce in 0..n_edges {
+                let e = if n_edges == 4 { ce } else { ce * 2 };
                 if bs[dir][e] == [0; 4] {
                     continue;
                 }
@@ -494,10 +495,13 @@ pub fn deblock_mb<P: Pixel>(pic: &mut PicState<P>, addr: usize, mb_w: usize) {
                     continue;
                 }
                 let plane = if c == 0 { &mut pic.planes.cb } else { &mut pic.planes.cr };
-                if dir == 0 {
-                    P::vertical::<8>(plane, cwidth, mx * 8 + ce * 4, my * 8, &ep, true, bd_c);
+                let y0 = my * mbh_c;
+                if dir == 1 {
+                    P::horizontal::<8>(plane, cwidth, mx * 8, y0 + ce * 4, &ep, true, bd_c);
+                } else if mbh_c == 16 {
+                    P::vertical::<16>(plane, cwidth, mx * 8 + ce * 4, y0, &ep, true, bd_c);
                 } else {
-                    P::horizontal::<8>(plane, cwidth, mx * 8, my * 8 + ce * 4, &ep, true, bd_c);
+                    P::vertical::<8>(plane, cwidth, mx * 8 + ce * 4, y0, &ep, true, bd_c);
                 }
             }
         }

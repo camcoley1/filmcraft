@@ -66,9 +66,25 @@ fixture_tests!(
     high10_qp1,
     high10_qp51,
     high10_odd,
+    high422_8_intra,
+    high422_8_medium,
+    high422_8_cavlc_b,
+    high422_10_intra,
+    high422_10_intra_cavlc,
+    high422_10_medium,
+    high422_10_bpyramid,
+    high422_10_weightp,
+    high422_10_temporal,
+    high422_10_slices_dbk,
+    high422_10_chroma_qp6,
+    high422_10_no8x8_cqm,
+    high422_10_qp1,
+    high422_10_qp51,
+    high422_10_odd,
 );
 
-/// JVT professional / FRExt conformance bitstreams (ITU-T, not in the repository): with
+/// JVT professional / FRExt conformance bitstreams (High 10 Intra, High 4:2:2 and High 4:2:2 Intra;
+/// ITU-T, not in the repository): with
 /// `FILMCRAFT_H264_JVT_DIR` set to a folder holding them (any layout), the progressive ones this
 /// decoder supports decode bit-exactly against ffmpeg's decode, and interlaced ones are refused
 /// with `Error::Unsupported`. Skipped without the variable or ffmpeg.
@@ -85,6 +101,25 @@ fn jvt_high_bit_depth_conformance_streams() {
         ("PPH10I2_Panasonic_A", Some((1280, 720, "yuv420p10le"))),
         ("PPH10I3_Panasonic_A", Some((1280, 720, "yuv420p10le"))),
         ("PPH10I4_Panasonic_A", None),
+        ("Hi422FR1_SONY_A", Some((352, 288, "yuv422p"))),
+        ("Hi422FR2_SONY_A", Some((352, 288, "yuv422p"))),
+        ("Hi422FR3_SONY_A", Some((352, 288, "yuv422p"))),
+        ("Hi422FR4_SONY_A", Some((352, 288, "yuv422p"))),
+        ("Hi422FR6_SONY_A", Some((352, 288, "yuv422p10le"))),
+        ("Hi422FR7_SONY_A", Some((352, 288, "yuv422p10le"))),
+        ("Hi422FR8_SONY_A", Some((352, 288, "yuv422p10le"))),
+        ("Hi422FR9_SONY_A", Some((352, 288, "yuv422p10le"))),
+        ("Hi422FR10_SONY_B", Some((352, 288, "yuv422p"))),
+        ("Hi422FR11_SONY_B", Some((352, 288, "yuv422p"))),
+        ("Hi422FR12_SONY_B", Some((352, 288, "yuv422p"))),
+        ("Hi422FR13_SONY_B", Some((352, 288, "yuv422p10le"))),
+        ("Hi422FR14_SONY_B", Some((352, 288, "yuv422p10le"))),
+        ("Hi422FR15_SONY_B", Some((352, 288, "yuv422p10le"))),
+        ("Hi422FREXT16_SONY_A", None),
+        ("PPH422I1_Panasonic_A", Some((1280, 720, "yuv422p10le"))),
+        ("PPH422I2_Panasonic_A", Some((1280, 720, "yuv422p10le"))),
+        ("PPH422I3_Panasonic_A", Some((1280, 720, "yuv422p10le"))),
+        ("PPH422I4_Panasonic_A", None),
     ];
     let mut files = Vec::new();
     let mut stack = vec![dir];

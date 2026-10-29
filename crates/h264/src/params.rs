@@ -524,8 +524,8 @@ impl Sps {
         if !self.frame_mbs_only {
             return unsupported("interlaced (field / MBAFF) coding");
         }
-        if self.chroma_array_type() != 1 {
-            return unsupported(format!("chroma_format_idc {} (only 4:2:0 is implemented)", self.chroma_format_idc));
+        if self.chroma_array_type() != 1 && self.chroma_array_type() != 2 {
+            return unsupported(format!("chroma_format_idc {} (only 4:2:0 and 4:2:2 are implemented)", self.chroma_format_idc));
         }
         // (the sample paths are generic up to 14 bits; beyond High 10 / High 4:2:2 there is no
         // reference stream to verify them against)

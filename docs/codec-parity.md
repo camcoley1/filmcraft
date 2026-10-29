@@ -15,7 +15,7 @@ contents). Percent is ready-for-real-work for that codec: depth, profiles, speed
 
 | Codec | Premiere | Our decode | Our encode | Fidelity and tests | % | Est. |
 |---|---|---|---|---|---|---|
-| H.264 / AVC | decode all common profiles incl. High 10, 4:2:2 (XAVC S-I, AVC-Intra); encode 8/10-bit | own decoder, **4:2:0 only** (Baseline / Main / High / High 10, CABAC / CAVLC); no 4:2:2 / 4:4:4, interlaced field / MBAFF, lossless | own encoder (High / Main / Baseline, B-frames, CBR / VBR / 2-pass); 8-bit 4:2:0 only; hardware VideoToolbox / NVENC | decode bit-exact on 37+ conformance streams, 500–600 fps 1080p; encode ffprobe-checked, byte-identical across machines | 65% | 20–35 h |
+| H.264 / AVC | decode all common profiles incl. High 10, 4:2:2 (XAVC S-I, AVC-Intra); encode 8/10-bit | own decoder (Baseline / Main / High / High 10 / High 4:2:2 and Intra, 8-10 bit, CABAC / CAVLC); no 4:4:4, interlaced field / MBAFF, lossless | own encoder (High / Main / Baseline, B-frames, CBR / VBR / 2-pass); 8-bit 4:2:0 only; hardware VideoToolbox / NVENC | decode bit-exact on 37+ conformance streams, 500–600 fps 1080p; encode ffprobe-checked, byte-identical across machines | 65% | 20–35 h |
 | HEVC / H.265 | decode Main, Main 10, 4:2:2 10 (XAVC HS); encode 8/10-bit, HDR | own decoder Main / Main 10 / Main Still Picture / Main 12 / Main 4:2:2 10 / 12 (and Intra), bit-exact on 58 fixtures and 9 JCT-VC RExt conformance streams, ~225 fps 1080p; **no 4:4:4, most RExt coding tools refused** | **hardware only** (VideoToolbox 8-bit; NVENC 8-bit and Main 10 HDR on Windows); no software encoder | NVENC round trip 48.9 dB (8-bit), 71.1 dB (10-bit); ffprobe | 60% | 30–60 h |
 | ProRes 422 family / 4444 / XQ | decode + encode all | own decode + encode, all six profiles, alpha | yes (export UI exposes 422 flavours; 4444 / XQ request #342) | ±1 LSB, 318 fps | 85% | 3–6 h |
 | ProRes RAW | decode | none (#345) | — | — | 0% | 30–50 h (spec availability uncertain) |
@@ -52,7 +52,7 @@ contents). Percent is ready-for-real-work for that codec: depth, profiles, speed
 
 - **Ahead of Premiere:** VP9, Opus, APV decode / encode; bit-exact software decoders everywhere,
   including Linux and FreeBSD, where Premiere does not run.
-- **Behind, by user impact:** 4:2:2 H.264 in software (HEVC 4:2:2 10 decodes since M8e.1, H.264 High 10 since M8e.2) ([G3](gaps.md#g3-10-bit-and-422-camera-media-needs-hardware)),
+- **Behind, by user impact:** interlaced (field / MBAFF) H.264 in software (10-bit / 4:2:2 HEVC and H.264 decode since M8e) ([G3](gaps.md#g3-10-bit-and-422-camera-media-needs-hardware)),
   E-AC-3, camera RAW, HEVC and AV1 software encoding, MPEG-2 / JPEG 2000 encoding for broadcast
   and DCP, DV, WMV.
 - **Codec dimension: ~60%, 150–250 h** ([target-app-parity.md](target-app-parity.md#by-dimension)).
@@ -61,6 +61,7 @@ contents). Percent is ready-for-real-work for that codec: depth, profiles, speed
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-29 | minor | H.264: High 4:2:2 software decode (M8e.3) |
 | 2026-10-29 | minor | H.264: High 10 software decode (M8e.2) |
 | 2026-10-29 | minor | HEVC: Main 4:2:2 10 / 12 and Main 12 software decode (M8e.1) |
 | 2026-10-11 | minor | CinemaDNG / DNG decode (#1065) |

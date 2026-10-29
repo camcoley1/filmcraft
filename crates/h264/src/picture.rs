@@ -162,7 +162,8 @@ pub struct MbState {
     /// CAVLC: TotalCoeff per luma 4x4 block (raster). CABAC: coded_block_flag.
     pub nnz: [u8; 16],
     /// Same for chroma AC blocks [Cb, Cr][raster 2x2].
-    pub nnz_c: [[u8; 4]; 2],
+    /// Raster 2 x (MbHeightC / 4) chroma AC blocks: index row * 2 + column.
+    pub nnz_c: [[u8; 8]; 2],
     /// CABAC coded_block_flag of DC blocks: bit0 luma (I16x16), bit1 Cb, bit2 Cr.
     pub cbf_dc: u8,
     /// Luma 4x4 blocks (raster bit) with non-zero coefficients, for deblocking bS = 2.
@@ -195,7 +196,7 @@ impl Default for MbState {
             intra_chroma_mode: 0,
             intra_modes: [2; 16],
             nnz: [0; 16],
-            nnz_c: [[0; 4]; 2],
+            nnz_c: [[0; 8]; 2],
             cbf_dc: 0,
             nz_mask: 0,
             ref_idx: [[-1; 4]; 2],

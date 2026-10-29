@@ -136,6 +136,35 @@ pub fn idct4_dc_add<P: Pixel>(dc: i32, dst: &mut [P], stride: usize, bd: u32) {
     }
 }
 
+/// 4:2:2 chroma DC: 2x4 transform + scaling (8.5.11.1, 8.5.11.2). `c` holds the eight
+/// chromaDCLevel values in parsing order; on return `c[row * 2 + col]` is dcC of the 4x4 block at
+/// (col, row) of the 8x16 chroma block. `qp_dc` is QP'C,DC = QP'C + 3.
+pub fn chroma_dc_dequant_422(c: &mut [i32; 8], qp_dc: i32, ls00: i32) {
+    // raster 4 rows x 2 columns from the parsing order (8-328)
+    const POS: [usize; 8] = [0, 2, 1, 5, 3, 6, 4, 7];
+    let mut m = [0i32; 8];
+    for (k, &p) in POS.iter().enumerate() {
+        m[k] = c[p];
+    }
+    // f = A * m * B: 4-point transform of each column, then the 2-point transform of each row
+    let mut t = [0i32; 8];
+    for j in 0..2 {
+        let (a, b, cc, d) = (m[j], m[2 + j], m[4 + j], m[6 + j]);
+        t[j] = a.wrapping_add(b).wrapping_add(cc).wrapping_add(d);
+        t[2 + j] = a.wrapping_add(b).wrapping_sub(cc).wrapping_sub(d);
+        t[4 + j] = a.wrapping_sub(b).wrapping_sub(cc).wrapping_add(d);
+        t[6 + j] = a.wrapping_sub(b).wrapping_add(cc).wrapping_sub(d);
+    }
+    for i in 0..4 {
+        let (a, b) = (t[2 * i], t[2 * i + 1]);
+        let f = [a.wrapping_add(b), a.wrapping_sub(b)];
+        for j in 0..2 {
+            let v = f[j].wrapping_mul(ls00);
+            c[2 * i + j] = if qp_dc >= 36 { v << (qp_dc / 6 - 6) } else { v.wrapping_add(1 << (5 - qp_dc / 6)) >> (6 - qp_dc / 6) };
+        }
+    }
+}
+
 #[inline(always)]
 fn idct8_1d(d: [i32; 8]) -> [i32; 8] {
     let a0 = d[0] + d[4];

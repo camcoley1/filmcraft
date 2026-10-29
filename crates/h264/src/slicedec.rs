@@ -169,8 +169,8 @@ pub(crate) struct MbCur {
 pub(crate) struct Scratch<P> {
     /// Luma: 16 4x4 blocks (raster block index * 16 + raster coefficient) or 4 8x8 blocks (b8 * 64 + raster).
     pub coef: [i32; 256],
-    /// Chroma: [Cb, Cr][raster 2x2 block * 16 + raster coefficient].
-    pub coef_c: [[i32; 64]; 2],
+    /// Chroma: [Cb, Cr][raster 2 x (MbHeightC / 4) block * 16 + raster coefficient].
+    pub coef_c: [[i32; 128]; 2],
     /// Luma blocks with coefficients: raster 4x4 bits, or b8 bits in 8x8 mode.
     pub blk_nz: u16,
     /// Chroma blocks with coefficients (bit per raster 2x2 block).
@@ -184,7 +184,7 @@ impl<P: Pixel> Scratch<P> {
     pub fn new() -> Box<Self> {
         Box::new(Scratch {
             coef: [0; 256],
-            coef_c: [[0; 64]; 2],
+            coef_c: [[0; 128]; 2],
             blk_nz: 0,
             c_nz: [0; 2],
             pred: [[P::default(); 256]; 2],
@@ -427,9 +427,10 @@ impl<'a, P: Pixel> SliceDecoder<'a, P> {
 
     fn nc_chroma(&self, c: usize, raster: usize) -> i32 {
         let (bx, by) = (raster & 1, raster >> 1);
+        let rows = self.pic.fmt.mb_height_c() / 4;
         let cur = self.mb();
         let a = if bx > 0 { Some(cur.nnz_c[c][raster - 1]) } else { self.nb[0].map(|m| self.pic.mbs[m].nnz_c[c][by * 2 + 1]) };
-        let b = if by > 0 { Some(cur.nnz_c[c][raster - 2]) } else { self.nb[1].map(|m| self.pic.mbs[m].nnz_c[c][2 + bx]) };
+        let b = if by > 0 { Some(cur.nnz_c[c][raster - 2]) } else { self.nb[1].map(|m| self.pic.mbs[m].nnz_c[c][(rows - 1) * 2 + bx]) };
         match (a, b) {
             (Some(a), Some(b)) => (a as i32 + b as i32 + 1) >> 1,
             (Some(a), None) => a as i32,
@@ -947,16 +948,17 @@ impl<'a, P: Pixel> SliceDecoder<'a, P> {
 
     fn add_chroma(&mut self) {
         let stride = self.pic.planes.cwidth;
+        let mbh = self.pic.fmt.mb_height_c();
         for c in 0..2 {
             if self.s.c_nz[c] == 0 {
                 continue;
             }
-            for b in 0..4 {
+            for b in 0..mbh / 2 {
                 if self.s.c_nz[c] & (1 << b) == 0 {
                     continue;
                 }
                 let px = self.mb_x * 8 + (b & 1) * 4;
-                let py = self.mb_y * 8 + (b >> 1) * 4;
+                let py = self.mb_y * mbh + (b >> 1) * 4;
                 let Some(blk) = self.s.coef_c[c].get_mut(b * 16..).and_then(|c| c.first_chunk_mut::<16>()) else {
                     continue;
                 };
@@ -1102,7 +1104,7 @@ impl<'a, P: Pixel> SliceDecoder<'a, P> {
         st.qp = 0;
         st.qpc = qpc;
         st.nnz = [16; 16];
-        st.nnz_c = [[16; 4]; 2];
+        st.nnz_c = [[16; 8]; 2];
         st.cbf_dc = 7;
         st.cbp = 0x2f;
         st.nz_mask = 0xffff;
@@ -1192,14 +1194,24 @@ impl<'a, P: Pixel> SliceDecoder<'a, P> {
         }
     }
 
-    /// Chroma DC levels (4:2:0: 4 values in raster order) for component `c`.
-    pub fn put_chroma_dc(&mut self, c: usize, levels: &[i32; 4]) {
-        let mut v = *levels;
+    /// Chroma DC levels for component `c`: 4 (4:2:0, raster order) or 8 (4:2:2, parsing order).
+    pub fn put_chroma_dc(&mut self, c: usize, levels: &[i32; 8]) {
         let qpc = self.chroma_qp(self.qp, c) + self.qp_bd_c;
         let list = if self.mb().kind.is_intra() { 1 + c } else { 4 + c };
-        let ls00 = self.ls.ls4[list][(qpc % 6) as usize][0];
-        transform::chroma_dc_dequant_420(&mut v, qpc, ls00);
-        for (b, &dc) in v.iter().enumerate() {
+        let mut v = *levels;
+        let n = if self.pic.fmt.mb_height_c() == 16 {
+            // QP'C,DC = QP'C + 3 (8-330)
+            let qp_dc = qpc + 3;
+            let ls00 = self.ls.ls4[list][(qp_dc % 6) as usize][0];
+            transform::chroma_dc_dequant_422(&mut v, qp_dc, ls00);
+            8
+        } else {
+            let ls00 = self.ls.ls4[list][(qpc % 6) as usize][0];
+            let Some(v4) = v.first_chunk_mut::<4>() else { return };
+            transform::chroma_dc_dequant_420(v4, qpc, ls00);
+            4
+        };
+        for (b, &dc) in v.iter().enumerate().take(n) {
             if dc != 0 {
                 self.s.coef_c[c][b * 16] = dc;
                 self.s.c_nz[c] |= 1 << b;
@@ -1452,16 +1464,19 @@ impl<'a, P: Pixel> SliceDecoder<'a, P> {
             }
         }
         let cbp_c = cbp >> 4;
+        // 4 * NumC8x8 chroma DC coefficients and AC blocks per component
+        let nc_dc = self.pic.fmt.mb_height_c() / 2;
         if cbp_c & 3 != 0 {
             for c in 0..2 {
-                let mut lv = [0i32; 4];
-                cavlc::residual_block(r, &mut lv, 0, 3, 4, -1)?;
+                let mut lv = [0i32; 8];
+                let nc = if nc_dc == 8 { -2 } else { -1 };
+                cavlc::residual_block(r, &mut lv, 0, nc_dc - 1, nc_dc, nc)?;
                 self.put_chroma_dc(c, &lv);
             }
         }
         if cbp_c & 2 != 0 {
             for c in 0..2 {
-                for b in 0..4 {
+                for b in 0..nc_dc {
                     let nc = self.nc_chroma(c, b);
                     let mut lv = [0i32; 16];
                     let tc = cavlc::residual_block(r, &mut lv[1..], 0, 14, 15, nc)?;

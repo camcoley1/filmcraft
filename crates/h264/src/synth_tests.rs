@@ -636,7 +636,9 @@ pub(crate) fn pcm_high_bit_depth_check(chroma_format_idc: u32, bit_depth: u32) {
             assert_eq!(out.len(), 1);
             let p = &out[0];
             assert_eq!((p.bit_depth, p.chroma_format_idc, p.chroma_height as usize), (bit_depth, chroma_format_idc, ch));
-            assert!(p.y.as_u16() == Some(&y[..]) && p.u.as_u16() == Some(&u[..]) && p.v.as_u16() == Some(&v[..]), "cabac={cabac} bit depth {bit_depth}");
+            let wide = |pl: &crate::Plane| -> Vec<u16> { (0..pl.len()).map(|i| pl.get(i)).collect() };
+            assert!(wide(&p.y) == y && wide(&p.u) == u && wide(&p.v) == v, "cabac={cabac} bit depth {bit_depth}");
+            assert_eq!(p.y.as_u8().is_some(), bit_depth == 8);
         }
         // ffmpeg agrees (as an oracle for the stream itself)
         let name = format!("synth_pcm_{chroma_format_idc}_{bit_depth}_{cabac}");
@@ -645,7 +647,8 @@ pub(crate) fn pcm_high_bit_depth_check(chroma_format_idc: u32, bit_depth: u32) {
         let src = filmcraft_testkit::temp_path(&dir.join(format!("{name}.h264")));
         let dst = filmcraft_testkit::temp_path(&dir.join(format!("{name}.yuv")));
         std::fs::write(&src, &stream).unwrap();
-        let pix_fmt = format!("yuv{}p{bit_depth}le", if chroma_format_idc == 2 { 422 } else { 420 });
+        let depth = if bit_depth == 8 { String::new() } else { format!("{bit_depth}le") };
+        let pix_fmt = format!("yuv{}p{depth}", if chroma_format_idc == 2 { 422 } else { 420 });
         let ok = std::process::Command::new(&ff)
             .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
             .arg(&src)
@@ -660,7 +663,7 @@ pub(crate) fn pcm_high_bit_depth_check(chroma_format_idc: u32, bit_depth: u32) {
             eprintln!("skipped ffmpeg check of {name}: this ffmpeg cannot decode it");
             continue;
         }
-        let want: Vec<u8> = y.iter().chain(&u).chain(&v).flat_map(|s| s.to_le_bytes()).collect();
+        let want: Vec<u8> = y.iter().chain(&u).chain(&v).flat_map(|&s| if bit_depth == 8 { vec![s as u8] } else { s.to_le_bytes().to_vec() }).collect();
         assert!(got == want, "ffmpeg output differs from the expected output of {name}");
     }
 }
@@ -669,4 +672,10 @@ pub(crate) fn pcm_high_bit_depth_check(chroma_format_idc: u32, bit_depth: u32) {
 fn pcm_high_10() {
     pcm_high_bit_depth_check(1, 10);
     pcm_high_bit_depth_check(1, 9);
+}
+
+#[test]
+fn pcm_high_422() {
+    pcm_high_bit_depth_check(2, 8);
+    pcm_high_bit_depth_check(2, 10);
 }
