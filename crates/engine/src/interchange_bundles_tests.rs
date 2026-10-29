@@ -489,3 +489,48 @@ fn draft_in_a_very_wide_folder_is_still_found() {
     assert_eq!(r["sequences"].as_array().map(Vec::len), Some(1), "{r}");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn a_directly_imported_oversized_draft_is_refused_before_it_is_read() {
+    let d = dir("big-draft");
+    let path = d.join("draft_content.json");
+    let f = std::fs::File::create(&path).unwrap();
+    f.set_len(300 * 1024 * 1024).unwrap();
+    let mut s = Session::default();
+    let e = s.execute("file.import", json!({"paths": [path.to_string_lossy()]})).unwrap_err().to_string();
+    assert!(e.contains("larger than"), "{e}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(unix)]
+#[test]
+fn plain_xml_inside_a_library_is_contained_like_a_bundle() {
+    use crate::media_test_util::make_movie;
+    let d = dir("lib-plain");
+    let secret = d.join("secret.mov");
+    make_movie(&secret, filmcraft_media::DemoScene::Aurora, 160, 90, 12);
+    let lib = d.join("Lib.fcpbundle");
+    std::fs::create_dir_all(lib.join("Exports")).unwrap();
+    std::fs::create_dir_all(lib.join("Media")).unwrap();
+    make_movie(&lib.join("Media/ok.mov"), filmcraft_media::DemoScene::CityNight, 160, 90, 12);
+    std::os::unix::fs::symlink(&secret, lib.join("Media/linked.mov")).unwrap();
+    let doc = |src: &str| INFO.replace("media/boats.mov", src);
+    let run = |src: &str| {
+        std::fs::write(lib.join("Exports/cut.fcpxml"), doc(src)).unwrap();
+        let mut s = Session::default();
+        let r = s.execute("file.import", json!({"paths": [lib.to_string_lossy()]})).unwrap();
+        r["documents"][0].clone()
+    };
+    // inside the library, with a ../ step: links
+    let inside = run("../Media/ok.mov");
+    assert_eq!(inside["linkedMedia"], 1, "{inside}");
+    // climbing out of the library, or a link inside it that leads out: refused
+    for src in ["../../secret.mov", "../Media/linked.mov"] {
+        let r = run(src);
+        assert_eq!(r["linkedMedia"], 0, "{src}: {r}");
+        assert!(r["report"].as_array().unwrap().iter().any(|e| e.as_str().unwrap_or("").contains("resolve outside")), "{src}: {r}");
+    }
+    // the file's own absolute location is still allowed
+    assert_eq!(run(&secret.to_string_lossy())["linkedMedia"], 1);
+    let _ = std::fs::remove_dir_all(&d);
+}

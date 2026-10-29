@@ -225,7 +225,7 @@ fn import_fcpbundle(s: &mut Session, dir: &str) -> Result<Value> {
             } else {
                 let p = std::path::Path::new(&d);
                 read_owned(s, dir, &d, DOC_MAX_BYTES).and_then(|b| {
-                    import_doc(s, &d, p.parent().map(|x| x.to_string_lossy().to_string()), p.file_stem().map(|n| n.to_string_lossy().to_string()), None, &b, Format::Fcpxml)
+                    import_doc(s, &d, p.parent().map(|x| x.to_string_lossy().to_string()), p.file_stem().map(|n| n.to_string_lossy().to_string()), Some(dir.to_string()), &b, Format::Fcpxml)
                 })
             };
             match r {
