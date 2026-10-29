@@ -680,7 +680,7 @@ impl FxOp {
                 let advanced_ok = advanced.as_deref().is_none_or(|a| {
                     a.look_k.is_finite()
                         && a.wheels.as_ref().is_none_or(|w| w.rgb.iter().all(|c| fin(c)) && fin(&w.light))
-                        && a.curves.iter().flatten().all(|c| fin(c))
+                        && a.curves.iter().flatten().all(|c| fin(c) && c.len() == crate::effects::CURVE_SAMPLES)
                 });
                 let hsl_ok = hsl
                     .as_deref()
@@ -696,9 +696,12 @@ impl FxOp {
                     && sharpen.as_ref().is_none_or(|s| s.2.is_finite())
             }
             FxOp::Masked { op, masks } => {
+                // within ±1e7 working pixels: farther, the shader's squared lengths overflow f32 and
+                // its `min` with NaN is not Rust's
+                let near = |v: &[f32]| v.iter().all(|x| x.is_finite() && x.abs() <= 1e7);
                 op.gpu_ok()
                     && masks.iter().map(|m| m.pts.len()).sum::<usize>() <= GPU_MASK_MAX_POINTS
-                    && masks.iter().all(|m| m.pts.iter().all(|p| fin(p)) && fin(&[m.feather, m.expansion, m.opacity]))
+                    && masks.iter().all(|m| m.pts.iter().all(|p| near(p)) && near(&[m.feather, m.expansion]) && m.opacity.is_finite())
             }
         }
     }
