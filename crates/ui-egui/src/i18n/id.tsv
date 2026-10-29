@@ -442,6 +442,7 @@
 	Show finished jobs	Tampilkan tugas yang selesai
 	Cancelled	Dibatalkan
 	Failed: {e}	Gagal: {e}
+	Done: {w}	Selesai: {w}
 	Done	Selesai
 	No background jobs.	Tidak ada tugas latar belakang.
 	Recover Unsaved Changes	Pulihkan Perubahan yang Belum Disimpan

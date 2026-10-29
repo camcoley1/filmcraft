@@ -707,7 +707,7 @@ impl Progress {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Report {
     pub path: String,
     pub frames: u64,

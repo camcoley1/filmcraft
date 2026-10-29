@@ -432,6 +432,7 @@
 	Show finished jobs	Mostra processi completati
 	Cancelled	Annullato
 	Failed: {e}	Non riuscito: {e}
+	Done: {w}	Fatto: {w}
 	Done	Fatto
 	No background jobs.	Nessun processo in background.
 	Recover Unsaved Changes	Recupera modifiche non salvate

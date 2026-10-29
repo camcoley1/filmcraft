@@ -162,6 +162,21 @@ fn events_report_background_jobs() {
     // reported once
     s.poll_persistence();
     assert_eq!(s.log.entries.len(), 6);
+    // a finished job's warnings: an Events panel warning and a toast each, once
+    let d = job(904, "Export hdr.mp4");
+    s.jobs.push(d.clone());
+    s.poll_persistence();
+    s.drain_events();
+    let warning = "HDR H.265 is not available for this export (Main 10 refused): exported as tone-mapped SDR (Rec. 709)";
+    *d.result.lock().unwrap() = Some(Ok(filmcraft_export::Report { path: "hdr.mp4".into(), warnings: vec![warning.into()], ..Default::default() }));
+    s.poll_persistence();
+    let line = format!("Export hdr.mp4: {warning}");
+    assert!(s.log.entries.iter().any(|e| e.level == crate::panels::Level::Warning && e.message == line), "the warning is in the Events panel");
+    let toasts: Vec<String> =
+        s.drain_events().into_iter().filter_map(|e| if let crate::Event::Toast { message, .. } = e { Some(message) } else { None }).collect();
+    assert_eq!(toasts, vec![line.clone()]);
+    s.poll_persistence();
+    assert!(!s.drain_events().into_iter().any(|e| matches!(e, crate::Event::Toast { .. })), "reported once");
 }
 
 /// #620: project notes are saved in the project file; typing (one `merge` key) is one undo step.

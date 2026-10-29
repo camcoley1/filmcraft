@@ -472,6 +472,7 @@
 	Show finished jobs	Abgeschlossene Aufträge anzeigen
 	Cancelled	Abgebrochen
 	Failed: {e}	Fehlgeschlagen: {e}
+	Done: {w}	Fertig: {w}
 	Done	Fertig
 	No background jobs.	Keine Hintergrundaufträge.
 	Recover Unsaved Changes	Nicht gespeicherte Änderungen wiederherstellen

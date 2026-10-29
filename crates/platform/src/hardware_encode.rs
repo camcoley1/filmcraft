@@ -193,24 +193,23 @@ pub fn videotoolbox_encoder_factory(
         Format::Hevc => "HEVC",
         _ => return None,
     };
+    // HDR H.265 (Main 10) has no other encoder, and the export falls back to tone-mapped SDR when it
+    // is declined: the reason goes with the error, so the export's warning can say why
+    let declined = |why: String| {
+        log::info!("hardware {name} encoding declined: {why}");
+        filmcraft_export::note_hw_encode_declined();
+        (format == Format::Hevc && s.signal.is_hdr()).then(|| Err(ExportError::Unsupported(format!("VideoToolbox HEVC Main 10: {why}"))))
+    };
     let config = match config_for(w, h, rate, s) {
         Ok(c) => c,
-        Err(why) => {
-            log::info!("hardware {name} encoding declined: {why}");
-            filmcraft_export::note_hw_encode_declined();
-            return None;
-        }
+        Err(why) => return declined(why),
     };
     match VtEncoder::new(config) {
         Ok(vt) => {
             filmcraft_export::note_hw_encode_session();
             Some(Ok(Box::new(HardwareEncoder::new(vt, s.signal))))
         }
-        Err(why) => {
-            log::info!("hardware {name} encoding declined: {why}");
-            filmcraft_export::note_hw_encode_declined();
-            None
-        }
+        Err(why) => declined(why),
     }
 }
 

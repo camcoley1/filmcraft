@@ -790,13 +790,20 @@ fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &T
                 });
             }
             // VideoToolbox (macOS) H.264 and H.265 can reorder frames; off by default. Hidden where the
-            // hardware path declines the export anyway (CRF, two-pass, MXF), so it never does nothing.
+            // hardware path declines the export anyway (`hardware_encode::config_for`: CRF, two-pass,
+            // MXF, HDR H.264, odd output sizes, non-square pixels), so it is never shown doing nothing.
             let videotoolbox = cfg!(target_os = "macos") && f != Format::Av1 && (f == Format::Hevc || s.hardware_encoding == HardwareEncoding::Auto);
-            let declined = s.format.is_mxf() || matches!(s.bitrate_mode, BitrateMode::Crf | BitrateMode::Vbr2Pass);
+            let out = s.resolve(seq_w, seq_h, FrameRate::FPS_24, 48_000);
+            let declined = s.format.is_mxf()
+                || matches!(s.bitrate_mode, BitrateMode::Crf | BitrateMode::Vbr2Pass)
+                || (f == Format::H264 && seq_hdr && !s.sdr)
+                || !out.width.is_multiple_of(2)
+                || !out.height.is_multiple_of(2)
+                || s.pixel_aspect.is_some_and(|(n, d)| n != d);
             if videotoolbox && !declined {
                 row(ui, t, tl!("B-Frames"), |ui| {
                     let label = tl!("Let the hardware encoder use B-frames");
-                    // `check`, with a hover note on the trade-off
+                    // what `check` does, keeping the response for the hover note on the trade-off
                     let r = ui.checkbox(&mut s.hardware_b_frames, label);
                     reg.add("export.video.hardwareBFrames", r.rect, label);
                     r.on_hover_text(tl!("Smaller files at the same quality. Off keeps the frames in display order and lands closer to the target bitrate."));

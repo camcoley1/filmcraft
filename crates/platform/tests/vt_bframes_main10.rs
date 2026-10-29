@@ -525,6 +525,13 @@ fn main_10_rejects_mismatched_pictures_and_clamps_hostile_floats() {
     let v = e.video.as_ref().unwrap();
     assert!(v.color.is_some() && v.mastering_display.is_some() && v.content_light == Some((0, 0)));
     assert!(eight.sample_entry().video.as_ref().unwrap().color.is_none());
+    // an HDR H.265 configuration VideoToolbox refuses: an error with its reason (the export then
+    // falls back to tone-mapped SDR and says why), not a silent decline
+    let odd = videotoolbox_encoder_factory(Format::Hevc, W + 1, H, RATE, &ExportSettings { signal: ColorSignal::PQ, ..base.clone() });
+    let Some(Err(e)) = odd else { panic!("an error for an HDR session that cannot be created") };
+    assert!(e.to_string().contains("Main 10") && e.to_string().contains("odd picture size"), "{e}");
+    // SDR declines stay silent (None): the export's own "not available" error, as before
+    assert!(videotoolbox_encoder_factory(Format::Hevc, W + 1, H, RATE, &base).is_none());
     // the edit list starts at the first picture, one reorder depth into the media
     assert!(ten.media_start().is_some_and(|s| s > 0 && s % 1001 == 0), "{:?}", ten.media_start());
     assert_eq!(eight.media_start(), None, "nothing encoded yet");

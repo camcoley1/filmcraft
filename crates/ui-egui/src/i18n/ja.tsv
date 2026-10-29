@@ -432,6 +432,7 @@
 	Show finished jobs	終了したジョブを表示
 	Cancelled	キャンセル済み
 	Failed: {e}	失敗しました: {e}
+	Done: {w}	完了: {w}
 	Done	完了
 	No background jobs.	バックグラウンドジョブはありません。
 	Recover Unsaved Changes	未保存の変更を復元

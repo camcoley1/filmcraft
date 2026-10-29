@@ -175,7 +175,11 @@ pub fn progress(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let status = match (done, err) {
                 (true, Some(e)) if e.to_ascii_lowercase().contains("cancel") => tl!("Cancelled").to_string(),
                 (true, Some(e)) => tlf!("Failed: {e}", e),
-                (true, None) => tl!("Done").to_string(),
+                (true, None) => match j["result"]["warnings"][0].as_str() {
+                    // the export did something other than what was asked (HDR written as SDR): say what
+                    Some(w) => tlf!("Done: {w}", w),
+                    None => tl!("Done").to_string(),
+                },
                 (false, _) => {
                     let s = j["status"].as_str().unwrap_or("");
                     let n = format!("{} / {}", j["done"].as_u64().unwrap_or(0), j["total"].as_u64().unwrap_or(0));

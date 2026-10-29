@@ -435,6 +435,7 @@
 	Show finished jobs	Mostrar tareas terminadas
 	Cancelled	Cancelada
 	Failed: {e}	Error: {e}
+	Done: {w}	Terminada: {w}
 	Done	Terminada
 	No background jobs.	No hay tareas en segundo plano.
 	Recover Unsaved Changes	Recuperar cambios no guardados

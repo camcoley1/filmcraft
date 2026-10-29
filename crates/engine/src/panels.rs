@@ -108,6 +108,7 @@ impl EventLog {
 /// Report background jobs that started or finished since the last call.
 pub fn log_jobs(s: &mut Session) {
     let mut out = Vec::new();
+    let mut toasts = Vec::new();
     for j in &s.jobs {
         let finished = j.result.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let known = s.log.jobs.get(&j.id).copied();
@@ -118,6 +119,14 @@ pub fn log_jobs(s: &mut Session) {
             && let Some(r) = finished
         {
             let cancelled = j.progress.cancel.load(std::sync::atomic::Ordering::Relaxed);
+            if let Ok(r) = &r {
+                // what the job did differently from what was asked (an HDR H.265 export written as
+                // SDR): the Events panel and a toast, so it is not only in the JSON
+                for w in &r.warnings {
+                    out.push((Level::Warning, format!("{}: {w}", j.label)));
+                    toasts.push(format!("{}: {w}", j.label));
+                }
+            }
             out.push(match r {
                 Ok(_) => (Level::Info, format!("Finished: {}", j.label)),
                 Err(_) if cancelled => (Level::Warning, format!("Cancelled: {}", j.label)),
@@ -130,6 +139,9 @@ pub fn log_jobs(s: &mut Session) {
     }
     for (l, m) in out {
         s.log.push(l, "job", m);
+    }
+    for message in toasts {
+        s.events.push(crate::Event::Toast { message, error: false });
     }
 }
 

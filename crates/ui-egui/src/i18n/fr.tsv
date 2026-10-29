@@ -437,6 +437,7 @@
 	Show finished jobs	Afficher les tâches terminées
 	Cancelled	Annulée
 	Failed: {e}	Échec : {e}
+	Done: {w}	Terminée : {w}
 	Done	Terminée
 	No background jobs.	Aucune tâche en arrière-plan.
 	Recover Unsaved Changes	Récupérer les modifications non enregistrées

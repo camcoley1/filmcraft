@@ -612,8 +612,15 @@ pub fn start_job(s: &mut Session, kind: &'static str, label: &str, clips: &[Clip
                 *lock(&prog.status) = format!("{} result file(s) ready; applying", files.len());
                 let bytes = files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
                 let extra_files = files.iter().map(|f| f.to_string_lossy().to_string()).collect();
-                let report =
-                    filmcraft_export::Report { path: req.out_dir.clone(), frames: 0, seconds: t0.elapsed().as_secs_f64(), bytes, render_fps: 0.0, extra_files };
+                let report = filmcraft_export::Report {
+                    path: req.out_dir.clone(),
+                    frames: 0,
+                    seconds: t0.elapsed().as_secs_f64(),
+                    bytes,
+                    render_fps: 0.0,
+                    extra_files,
+                    warnings: Vec::new(),
+                };
                 *lock(&out) = Some(Ready { result, files, report });
                 return;
             }

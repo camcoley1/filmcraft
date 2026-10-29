@@ -426,6 +426,7 @@
 	Show finished jobs	显示已完成的任务
 	Cancelled	已取消
 	Failed: {e}	失败：{e}
+	Done: {w}	已完成：{w}
 	Done	已完成
 	No background jobs.	无后台任务。
 	Recover Unsaved Changes	恢复未保存的更改

@@ -234,6 +234,17 @@ fn h265_shows_the_h264_family_controls_without_the_h264_only_ones() {
     d.app().ui.export.settings.hardware_encoding = filmcraft_engine::export::HardwareEncoding::Auto;
     d.frames(4);
     assert_eq!(d.has("export.video.hardwareBFrames"), cfg!(target_os = "macos"), "H.264, hardware encoding on");
+    // hidden where the hardware path declines the export: non-square pixels, CRF
+    d.app().ui.export.settings.pixel_aspect = Some((4, 3));
+    d.frames(4);
+    assert!(!d.has("export.video.hardwareBFrames"), "non-square pixels");
+    d.app().ui.export.settings.pixel_aspect = None;
+    d.app().ui.export.settings.bitrate_mode = filmcraft_engine::export::BitrateMode::Crf;
+    d.frames(4);
+    assert!(!d.has("export.video.hardwareBFrames"), "CRF");
+    d.app().ui.export.settings.bitrate_mode = filmcraft_engine::export::BitrateMode::Vbr1Pass;
+    d.frames(4);
+    assert_eq!(d.has("export.video.hardwareBFrames"), cfg!(target_os = "macos"), "back for VBR");
     d.app().ui.export.settings = ExportSettings { format: Format::Hevc, ..Default::default() };
     d.frames(4);
     for id in [
