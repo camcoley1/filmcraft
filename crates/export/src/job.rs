@@ -232,7 +232,8 @@ impl Exporter {
         // HDR sequences export HDR (H.264 / ProRes / DNxHR / APV, and H.265 where a registered encoder
         // writes Main 10) unless SDR is asked for; elsewhere H.265 is tone-mapped 8-bit SDR
         let pipe = q.settings.color;
-        let mut hdr_out = hdr_output(pipe.working.is_hdr(), settings.sdr, settings.video_format(), crate::hdr_available);
+        let pipe_working_hdr = pipe.working.is_hdr();
+        let mut hdr_out = hdr_output(pipe_working_hdr, settings.sdr, settings.video_format(), crate::hdr_available);
         let mut settings = settings.clone();
         settings.signal = match (hdr_out, pipe.working) {
             (true, filmcraft_color::WorkingSpace::Rec2100Pq) => ColorSignal::PQ,
@@ -250,6 +251,12 @@ impl Exporter {
         let range = export_range(&project, seq, &settings)?;
         let mut pipe = Arc::new(Pipeline::new(project.clone(), seq, &settings, hdr_out)?);
         let mut warnings = Vec::new();
+        // an HDR sequence H.265 cannot write as HDR on this machine (no 10-bit encoder): tone-mapped SDR,
+        // which the report says, unless SDR was asked for
+        if pipe_working_hdr && !settings.sdr && !hdr_out && settings.video_format() == Format::Hevc {
+            let why = crate::hdr_unavailable_reason(Format::Hevc).unwrap_or_else(|| "no 10-bit H.265 encoder on this machine".into());
+            warnings.push(format!("HDR H.265 is not available here ({why}): exported as tone-mapped SDR (Rec. 709)"));
+        }
         let venc = match make_venc(&settings, pipe.w, pipe.h, pipe.rate) {
             Ok(v) => v,
             // H.265 HDR depends on the machine's 10-bit encoder taking this export (its size, a free

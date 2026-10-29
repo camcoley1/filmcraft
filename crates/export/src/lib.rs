@@ -1044,6 +1044,30 @@ pub fn register_hdr_probe(format: Format, probe: fn() -> bool) {
     }
 }
 
+type ReasonProbe = (Format, fn() -> Option<String>);
+
+fn hdr_reasons() -> &'static RwLock<Vec<ReasonProbe>> {
+    static P: OnceLock<RwLock<Vec<ReasonProbe>>> = OnceLock::new();
+    P.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Say how to find out why the registered encoder of `format` cannot write HDR here, when its
+/// [`register_hdr_probe`] probe says so (the export's warning then names it). Registering the same
+/// function twice is harmless.
+pub fn register_hdr_unavailable_reason(format: Format, reason: fn() -> Option<String>) {
+    let mut g = hdr_reasons().write().unwrap_or_else(|e| e.into_inner());
+    if !g.iter().any(|(f, r)| *f == format && std::ptr::fn_addr_eq(*r, reason)) {
+        g.push((format, reason));
+    }
+}
+
+/// Why `format` cannot write HDR here, if a registered encoder says (None: no reason known).
+pub fn hdr_unavailable_reason(format: Format) -> Option<String> {
+    let reasons: Vec<fn() -> Option<String>> =
+        hdr_reasons().read().unwrap_or_else(|e| e.into_inner()).iter().filter(|(f, _)| *f == format).map(|(_, r)| *r).collect();
+    reasons.into_iter().find_map(|r| r())
+}
+
 /// Whether a registered probe says the encoder of `format` writes HDR here (false without one).
 pub fn hdr_available(format: Format) -> bool {
     // the probes run outside the lock: one may take a while

@@ -78,6 +78,7 @@ pub fn register() -> Availability {
         // HDR sequences export as HEVC Main 10 (PQ / HLG) where VideoToolbox takes 10-bit pictures; elsewhere
         // they are tone-mapped to SDR
         filmcraft_export::register_hdr_probe(filmcraft_export::Format::Hevc, hardware_encode::hevc_main10_available);
+        filmcraft_export::register_hdr_unavailable_reason(filmcraft_export::Format::Hevc, hardware_encode::hevc_main10_unavailable_reason);
         // the probe creates a hardware session (about 0.1 s): answer it now, off the UI thread,
         // before the first draw of the format list asks
         hardware_encode::warm_hevc_probe();

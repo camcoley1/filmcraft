@@ -128,6 +128,17 @@ pub fn hevc_available() -> bool {
 }
 
 static MAIN10_PROBE: OnceLock<bool> = OnceLock::new();
+/// Why [`hevc_main10_available`] said no (set once, by the probe).
+static MAIN10_DECLINED: OnceLock<String> = OnceLock::new();
+
+/// Why this machine has no HEVC Main 10 encoder, once [`hevc_main10_available`] said so (the HDR
+/// export warning names it; `filmcraft_export::register_hdr_unavailable_reason`).
+pub fn hevc_main10_unavailable_reason() -> Option<String> {
+    if !hevc_main10_available() {
+        return Some(MAIN10_DECLINED.get().cloned().unwrap_or_else(|| "no hardware HEVC encoder".into()));
+    }
+    None
+}
 
 /// Whether this machine's hardware HEVC encoder takes 10-bit pictures (HEVC Main 10, PQ-tagged), asked
 /// once by creating a small session: what lets an HDR sequence export as HDR H.265
@@ -151,6 +162,7 @@ pub fn hevc_main10_available() -> bool {
         let result = VtEncoder::new(probe);
         if let Err(why) = &result {
             log::info!("no hardware HEVC Main 10 encoder: {why}");
+            let _ = MAIN10_DECLINED.set(format!("VideoToolbox HEVC Main 10: {why}"));
         }
         result.is_ok()
     })
