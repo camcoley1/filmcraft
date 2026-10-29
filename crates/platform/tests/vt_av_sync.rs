@@ -5,6 +5,12 @@
 //! is there (the last one at its time), and the audio lasts as long as the video up to the
 //! container's rounding. H.264 and H.265, 30000/1001 and 25 fps, AAC in MP4 and PCM in QuickTime.
 //!
+//! The bounds are sample-level: the flash and the burst start within 1 ms of each other (the
+//! burst's time taken from the decoded audio's own first timestamp, after the edit list), and the
+//! AAC track's priming edit (1024 samples = 21.33 ms at 48 kHz, more than the bound) is checked to
+//! be what moves the burst into place: decoding with the edit lists ignored puts it exactly the
+//! priming late. B-frame exports are checked to really be reordered.
+//!
 //! Its own test binary: the encoder counters are process-wide. Skips (SKIPPED) without a
 //! VideoToolbox encoder (`FILMCRAFT_REQUIRE_VT=1` makes that a failure) or without ffmpeg / ffprobe.
 #![cfg(target_os = "macos")]
@@ -93,12 +99,46 @@ fn video_brightness(ffmpeg: &Path, path: &str) -> Vec<f64> {
     out.stdout.chunks_exact(64).map(|f| f.iter().map(|b| f64::from(*b)).sum::<f64>() / 64.0).collect()
 }
 
-/// The audio as ffmpeg decodes it (edit list / priming applied), mono f32 at [`SR`].
-fn audio_samples(ffmpeg: &Path, path: &str) -> Vec<f32> {
+/// The audio as ffmpeg decodes it, mono f32 at [`SR`]: edit list / priming applied, or with
+/// `ignore_edits` as the samples are stored.
+fn audio_samples(ffmpeg: &Path, path: &str, ignore_edits: bool) -> Vec<f32> {
     let sr = SR.to_string();
-    let out = Command::new(ffmpeg).args(["-v", "error", "-i", path, "-map", "0:a:0", "-ac", "1", "-ar", &sr, "-f", "f32le", "-"]).output().unwrap();
+    let edits = if ignore_edits { "1" } else { "0" };
+    let out = Command::new(ffmpeg)
+        .args(["-v", "error", "-ignore_editlist", edits, "-i", path, "-map", "0:a:0", "-ac", "1", "-ar", &sr, "-f", "f32le", "-"])
+        .output()
+        .unwrap();
     assert!(out.status.success(), "ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
     out.stdout.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
+}
+
+/// Presentation time (s) of the first decoded audio frame, after the edit list: the origin of the
+/// decoded samples.
+fn audio_origin(ffprobe: &Path, path: &str) -> f64 {
+    let out = Command::new(ffprobe)
+        .args(["-v", "error", "-select_streams", "a:0", "-show_frames", "-show_entries", "frame=pts_time", "-of", "csv=p=0", path])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "ffprobe: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| l.trim().trim_end_matches(',').parse().ok()).expect("an audio frame time")
+}
+
+/// The first sample of the tone burst (index into decoded samples).
+fn onset(a: &[f32]) -> Option<usize> {
+    a.iter().position(|v| v.abs() > 0.05)
+}
+
+/// The MP4 / QuickTime tracks as written: the video's B-frame timing (edit list start and how many
+/// samples are reordered) and the audio's edit list start (AAC priming), in their own timescales.
+fn track_timing(path: &str) -> (i64, usize, i64, u32) {
+    let bytes = std::fs::read(path).unwrap();
+    let f = filmcraft_isobmff::open(&bytes[..]).unwrap();
+    let edit = |t: &filmcraft_isobmff::Track| t.edits.first().map_or(0, |e| e.media_time);
+    let v = &f.tracks[f.track_of_kind(filmcraft_isobmff::TrackKind::Video).unwrap()];
+    let a = &f.tracks[f.track_of_kind(filmcraft_isobmff::TrackKind::Audio).unwrap()];
+    let start = edit(v);
+    let reordered = v.samples.iter().filter(|s| s.pts - s.dts != start).count();
+    (start, reordered, edit(a), a.timescale)
 }
 
 #[test]
@@ -156,20 +196,46 @@ fn flash_and_click_stay_in_sync() {
                     assert!(light[flash] > 200.0 && light.iter().filter(|v| **v > 128.0).count() == 1, "{name}: one white frame, {light:?}");
                     let t_flash = times[flash];
 
-                    // audio: the burst's onset, and the length
-                    let a = audio_samples(&ffmpeg, &path);
-                    let onset = a.iter().position(|v| v.abs() > 0.05).unwrap_or_else(|| panic!("{name}: no tone burst"));
-                    let t_click = onset as f64 / f64::from(SR);
+                    // the video really is reordered with B-frames (an edit list start and composition
+                    // offsets that differ from it), and in decoding order without
+                    let (v_start, reordered, a_start, a_scale) = track_timing(&path);
+                    if b_frames {
+                        assert!(v_start > 0 && reordered > 0, "{name}: not reordered (edit start {v_start}, {reordered} reordered samples)");
+                    } else {
+                        assert_eq!((v_start, reordered), (0, 0), "{name}: reordered without B-frames");
+                    }
+
+                    // audio: the burst's onset after the edit list, from the decoded audio's own origin
+                    let a = audio_samples(&ffmpeg, &path, false);
+                    let origin = audio_origin(&ffprobe, &path);
+                    let at = onset(&a).unwrap_or_else(|| panic!("{name}: no tone burst"));
+                    let t_click = origin + at as f64 / f64::from(SR);
                     let dur_a = a.len() as f64 / f64::from(SR);
+                    // the priming: AAC's edit list skips its 1024 priming samples, and that is what puts
+                    // the burst in place (stored samples: exactly the priming late); PCM has none
+                    let priming = if audio == AudioCodec::Aac { 1024 } else { 0 };
+                    assert_eq!((a_start, a_scale), (priming, SR), "{name}: audio edit list start");
+                    let raw = audio_samples(&ffmpeg, &path, true);
+                    let raw_at = onset(&raw).unwrap_or_else(|| panic!("{name}: no tone burst in the stored samples"));
+                    let shift = (raw_at as f64 - at as f64) / f64::from(SR);
+                    let want_shift = f64::from(priming as u32) / f64::from(SR);
+                    assert!(
+                        (shift - want_shift).abs() <= 1e-3,
+                        "{name}: the stored burst is {:.2} ms late, want the priming {:.2} ms",
+                        shift * 1e3,
+                        want_shift * 1e3
+                    );
                     let dur_v = frames as f64 * frame_s;
                     // AAC ends on a whole 1024-sample frame unless the edit list trims it; PCM is exact
                     let slack = if audio == AudioCodec::Aac { 1024.0 / f64::from(SR) + 1e-3 } else { 1e-3 };
                     eprintln!(
-                        "{name}: flash frame {flash} at {t_flash:.4} s, click at {t_click:.4} s (Δ {:+.2} ms), audio {dur_a:.4} s / video {dur_v:.4} s",
-                        (t_click - t_flash) * 1000.0
+                        "{name}: flash frame {flash} at {t_flash:.5} s, click at {t_click:.5} s (Δ {:+.3} ms; audio origin {origin}, priming {priming}, stored burst {:+.2} ms later), video edit {v_start} / {reordered} reordered, audio {dur_a:.4} s / video {dur_v:.4} s",
+                        (t_click - t_flash) * 1000.0,
+                        shift * 1e3
                     );
                     assert_eq!(flash as i64, MARK, "{name}: the flash is on frame {flash}");
-                    assert!((t_click - t_flash).abs() <= frame_s, "{name}: click {t_click} vs flash {t_flash}");
+                    // sample level: well under the 21.33 ms a missing priming correction would leave
+                    assert!((t_click - t_flash).abs() <= 1e-3, "{name}: click {t_click} vs flash {t_flash}");
                     assert!((dur_a - dur_v).abs() <= slack, "{name}: audio {dur_a} s, video {dur_v} s");
                     ran += 1;
                 }
