@@ -17,8 +17,10 @@ struct U {
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var src: texture_2d<f32>;
 @group(0) @binding(2) var dst: texture_storage_2d<rgba32float, write>;
-// Unsharp Mask: the image before blurring.
+// A saved earlier image (Unsharp Mask: the image before blurring).
 @group(0) @binding(3) var aux: texture_2d<f32>;
+// The pass's tables (curve LUTs, 3D LUTs, mask polygons...).
+@group(0) @binding(4) var<storage, read> data: array<f32>;
 
 const OP_BRIGHTNESS_CONTRAST: u32 = 1u;
 const OP_PROC_AMP: u32 = 2u;
