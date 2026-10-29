@@ -532,6 +532,10 @@ impl Sps {
         if !(8..=10).contains(&self.bit_depth_luma) || !(8..=10).contains(&self.bit_depth_chroma) {
             return unsupported(format!("bit depth luma {} chroma {} (8 to 10 bits are implemented)", self.bit_depth_luma, self.bit_depth_chroma));
         }
+        // (pictures carry one bit depth for all planes; every reference stream has equal ones)
+        if self.bit_depth_luma != self.bit_depth_chroma {
+            return unsupported(format!("unequal luma / chroma bit depths {}/{}", self.bit_depth_luma, self.bit_depth_chroma));
+        }
         if self.qpprime_y_zero_transform_bypass {
             return unsupported("qpprime_y_zero_transform_bypass (lossless)");
         }

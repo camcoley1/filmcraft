@@ -126,7 +126,7 @@ pub fn hevc_disposable(sample: &[u8], length_size: usize, highest_tid: Option<u8
 
 /// A plane as a tight `w`×`h` buffer. Decoders hand over owned planes that usually are tight
 /// already: those are moved, not copied (a 2160p 4:2:0 picture is 12 MB per copy).
-pub(crate) fn tight_plane<T: Copy>(src: Vec<T>, stride: usize, w: usize, h: usize) -> Vec<T> {
+pub(crate) fn tight_plane<T: Copy + Default>(src: Vec<T>, stride: usize, w: usize, h: usize) -> Vec<T> {
     if stride == w && src.len() >= w * h {
         let mut v = src;
         v.truncate(w * h);
@@ -134,7 +134,18 @@ pub(crate) fn tight_plane<T: Copy>(src: Vec<T>, stride: usize, w: usize, h: usiz
     }
     let mut out = Vec::with_capacity(w * h);
     for y in 0..h {
-        out.extend_from_slice(&src[y * stride..y * stride + w]);
+        match src.get(y * stride..y * stride + w) {
+            Some(line) => out.extend_from_slice(line),
+            // (a short plane: repeat the last full line, or the first sample, never panic)
+            None => {
+                let fill = out.len().checked_sub(w).and_then(|o| out.get(o..o + w).map(<[T]>::to_vec));
+                match (fill, src.first()) {
+                    (Some(line), _) => out.extend_from_slice(&line),
+                    (None, Some(&s)) => out.extend(std::iter::repeat_n(s, w)),
+                    (None, None) => out.extend(std::iter::repeat_n(T::default(), w)),
+                }
+            }
+        }
     }
     out
 }
@@ -385,6 +396,7 @@ impl VideoDecoder for H264Decoder {
 /// (`filmcraft_frame::pool`) instead of the allocator.
 fn recycle_h264_planes() {
     filmcraft_h264::set_plane_allocator(filmcraft_frame::pool::take_u8);
+    filmcraft_h264::set_plane_allocator_u16(filmcraft_frame::pool::take_u16);
 }
 
 /// Worker threads each H.264 decoder uses (frame threading; 1 on wasm).
@@ -560,7 +572,7 @@ impl Vp9Decoder {
             (false, true) => (Chroma::C444, true),
         };
         // planes are moved (tight already), not copied
-        fn expand<T: Copy>(v: Vec<T>, cw: usize, ch: usize, h: usize, rows_440: bool) -> Vec<T> {
+        fn expand<T: Copy + Default>(v: Vec<T>, cw: usize, ch: usize, h: usize, rows_440: bool) -> Vec<T> {
             if !rows_440 {
                 return tight_plane(v, cw, cw, ch);
             }

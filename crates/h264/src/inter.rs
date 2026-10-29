@@ -50,7 +50,7 @@ fn tap6(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) -> i32 {
 
 #[inline(always)]
 fn clip1<P: Pixel>(v: i32, bd: u32) -> P {
-    P::from_i32(v.clamp(0, (1 << bd) - 1))
+    P::clip(v, bd)
 }
 
 /// Copy `n` samples with a fixed-size move for the common block widths.

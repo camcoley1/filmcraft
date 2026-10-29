@@ -235,7 +235,7 @@ file; `H264_BENCH_ITERS=n` (and `H264_THREADS=t`, `H264_DRAFT=1`) turns it into 
 
 - Interlaced coding (field pictures, PAFF, MBAFF): streams with `frame_mbs_only_flag = 0` return
   `Error::Unsupported`.
-- 4:4:4 / monochrome, more than 10 bits (High 4:4:4 Predictive) and lossless
+- 4:4:4 / monochrome, more than 10 bits (High 4:4:4 Predictive), unequal luma / chroma bit depths and lossless
   (`qpprime_y_zero_transform_bypass`) return `Error::Unsupported`. The sample paths are generic up
   to 14 bits, but nothing verifies them above 10.
 - FMO (slice groups), SP/SI slices, data partitioning (Extended profile), MVC/SVC NAL units.

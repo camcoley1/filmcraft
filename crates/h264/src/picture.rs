@@ -9,6 +9,9 @@ pub trait Pixel: Copy + Default + PartialEq + std::fmt::Debug + Send + Sync + 's
     fn to_i32(self) -> i32;
     /// `v` (a sample value, already clipped to the bit depth) in the storage type.
     fn from_i32(v: i32) -> Self;
+    /// `v` clipped to the sample range of bit depth `bd` (Clip1): `0..=255` for `u8`, whatever
+    /// `bd`, so the 8-bit loops keep a constant bound.
+    fn clip(v: i32, bd: u32) -> Self;
     /// The rows of `f` if they are stored with this type.
     fn rows(f: &Frame) -> Option<&[OnceLock<FrameRow<Self>>]>;
     fn wrap_rows(rows: Box<[OnceLock<FrameRow<Self>>]>) -> Rows;
@@ -26,6 +29,10 @@ impl Pixel for u8 {
     #[inline(always)]
     fn from_i32(v: i32) -> Self {
         v as u8
+    }
+    #[inline(always)]
+    fn clip(v: i32, _bd: u32) -> Self {
+        v.clamp(0, 255) as u8
     }
     #[inline(always)]
     fn rows(f: &Frame) -> Option<&[OnceLock<FrameRow<u8>>]> {
@@ -55,6 +62,10 @@ impl Pixel for u16 {
         v as u16
     }
     #[inline(always)]
+    fn clip(v: i32, bd: u32) -> Self {
+        v.clamp(0, (1 << bd) - 1) as u16
+    }
+    #[inline(always)]
     fn rows(f: &Frame) -> Option<&[OnceLock<FrameRow<u16>>]> {
         match &f.rows {
             Rows::U16(r) => Some(r),
@@ -68,7 +79,7 @@ impl Pixel for u16 {
         Plane::U16(v)
     }
     fn alloc(n: usize) -> Vec<u16> {
-        Vec::with_capacity(n)
+        PLANE_ALLOCATOR_U16.get().copied().unwrap_or(Vec::with_capacity)(n)
     }
 }
 
@@ -286,10 +297,19 @@ impl Frame {
         self.fmt.mb_height_c()
     }
 
-    /// Publish MB row `r` (ignored if already published, or not of the frame's sample type).
+    /// Publish MB row `r` (ignored if already published). A row of the other sample type (never
+    /// built by the decoder) is replaced by a grey one, so that no reader waits for it forever.
     pub fn publish<P: Pixel>(&self, r: usize, row: FrameRow<P>) {
-        if let Some(cell) = P::rows(self).and_then(|rows| rows.get(r)) {
-            let _ = cell.set(row);
+        match P::rows(self) {
+            Some(rows) => {
+                if let Some(cell) = rows.get(r) {
+                    let _ = cell.set(row);
+                }
+            }
+            None => {
+                debug_assert!(false, "row of the wrong sample type");
+                self.publish_gray();
+            }
         }
     }
 
@@ -445,12 +465,12 @@ impl Frame {
     #[inline]
     pub fn chroma_window<P: Pixel>(&self, c: usize, x0: i32, y0: i32, w: usize, h: usize, out: &mut [P], os: usize) {
         let (cw, ch) = (self.cwidth, self.cheight);
-        let mbh = self.mb_height_c();
+        let (sh, mask) = (self.mb_height_c().trailing_zeros(), self.mb_height_c() - 1);
         for r in 0..h {
             let yy = (y0 + r as i32).clamp(0, ch as i32 - 1) as usize;
-            let Some(row) = self.row::<P>(yy / mbh) else { return };
+            let Some(row) = self.row::<P>(yy >> sh) else { return };
             let plane = if c == 0 { &row.cb } else { &row.cr };
-            let Some(line) = plane.get((yy % mbh) * cw..(yy % mbh) * cw + cw) else { return };
+            let Some(line) = plane.get((yy & mask) * cw..(yy & mask) * cw + cw) else { return };
             let Some(out) = out.get_mut(r * os..) else { return };
             copy_line::<P, 16>(line, x0, out, w);
         }
@@ -507,6 +527,13 @@ pub fn set_plane_allocator(alloc: fn(usize) -> Vec<u8>) {
 
 fn plane_allocator() -> fn(usize) -> Vec<u8> {
     PLANE_ALLOCATOR.get().copied().unwrap_or(Vec::with_capacity)
+}
+
+static PLANE_ALLOCATOR_U16: std::sync::OnceLock<fn(usize) -> Vec<u16>> = std::sync::OnceLock::new();
+
+/// [`set_plane_allocator`] for the 16-bit planes of pictures deeper than 8 bits.
+pub fn set_plane_allocator_u16(alloc: fn(usize) -> Vec<u16>) {
+    let _ = PLANE_ALLOCATOR_U16.set(alloc);
 }
 
 /// Copy `w` samples of `line` starting at x0 into `out`; when possible a fixed-size block of `N`

@@ -30,16 +30,26 @@ impl LevelScale {
     }
 }
 
+/// Bound of scaled coefficients: conforming streams stay within 2^(7 + BitDepth) (8.5.12.1), at
+/// most 2^21 here; hostile levels are clamped so that the transform sums (growth below 2^9 over
+/// both passes) cannot overflow.
+const COEF_LIMIT: i32 = 1 << 21;
+
+#[inline(always)]
+fn bound(v: i32) -> i32 {
+    v.clamp(-COEF_LIMIT, COEF_LIMIT)
+}
+
 /// Scale one 4x4 AC coefficient (8.5.12.1, not the DC of Intra16x16 / chroma blocks).
 #[inline(always)]
 pub fn scale4(c: i32, ls: i32, qp: i32) -> i32 {
-    if qp >= 24 { c.wrapping_mul(ls) << (qp / 6 - 4) } else { c.wrapping_mul(ls).wrapping_add(1 << (3 - qp / 6)) >> (4 - qp / 6) }
+    bound(if qp >= 24 { c.wrapping_mul(ls) << (qp / 6 - 4) } else { c.wrapping_mul(ls).wrapping_add(1 << (3 - qp / 6)) >> (4 - qp / 6) })
 }
 
 /// Scale one 8x8 coefficient (8.5.13.1).
 #[inline(always)]
 pub fn scale8(c: i32, ls: i32, qp: i32) -> i32 {
-    if qp >= 36 { c.wrapping_mul(ls) << (qp / 6 - 6) } else { c.wrapping_mul(ls).wrapping_add(1 << (5 - qp / 6)) >> (6 - qp / 6) }
+    bound(if qp >= 36 { c.wrapping_mul(ls) << (qp / 6 - 6) } else { c.wrapping_mul(ls).wrapping_add(1 << (5 - qp / 6)) >> (6 - qp / 6) })
 }
 
 /// Intra16x16 luma DC: inverse Hadamard + scaling (8.5.10). `c` is raster order (row*4+col);
@@ -67,7 +77,7 @@ pub fn luma_dc_dequant(c: &mut [i32; 16], qp: i32, ls00: i32) {
         let f = [s01 + s23, s01 - s23, d01 - d23, d01 + d23];
         for i in 0..4 {
             c[i * 4 + j] =
-                if qp >= 36 { f[i].wrapping_mul(ls00) << (qp / 6 - 6) } else { f[i].wrapping_mul(ls00).wrapping_add(1 << (5 - qp / 6)) >> (6 - qp / 6) };
+                bound(if qp >= 36 { f[i].wrapping_mul(ls00) << (qp / 6 - 6) } else { f[i].wrapping_mul(ls00).wrapping_add(1 << (5 - qp / 6)) >> (6 - qp / 6) });
         }
     }
 }
@@ -80,14 +90,14 @@ pub fn chroma_dc_dequant_420(c: &mut [i32; 4], qp: i32, ls00: i32) {
     let d1 = c[2].wrapping_sub(c[3]);
     let f = [s0.wrapping_add(s1), d0.wrapping_add(d1), s0.wrapping_sub(s1), d0.wrapping_sub(d1)];
     for k in 0..4 {
-        c[k] = (f[k].wrapping_mul(ls00) << (qp / 6)) >> 5;
+        c[k] = bound((f[k].wrapping_mul(ls00) << (qp / 6)) >> 5);
     }
 }
 
 /// `p + r` clipped to the sample range of bit depth `bd` (8-292).
 #[inline(always)]
 fn add_clip<P: Pixel>(p: P, r: i32, bd: u32) -> P {
-    P::from_i32((p.to_i32() + r).clamp(0, (1 << bd) - 1))
+    P::clip(p.to_i32().wrapping_add(r), bd)
 }
 
 /// Inverse 4x4 transform of raster-order `d` and add to `dst` (8.5.12.2, 8.5.14).
@@ -160,7 +170,7 @@ pub fn chroma_dc_dequant_422(c: &mut [i32; 8], qp_dc: i32, ls00: i32) {
         let f = [a.wrapping_add(b), a.wrapping_sub(b)];
         for j in 0..2 {
             let v = f[j].wrapping_mul(ls00);
-            c[2 * i + j] = if qp_dc >= 36 { v << (qp_dc / 6 - 6) } else { v.wrapping_add(1 << (5 - qp_dc / 6)) >> (6 - qp_dc / 6) };
+            c[2 * i + j] = bound(if qp_dc >= 36 { v << (qp_dc / 6 - 6) } else { v.wrapping_add(1 << (5 - qp_dc / 6)) >> (6 - qp_dc / 6) });
         }
     }
 }

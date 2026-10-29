@@ -225,7 +225,7 @@ pub fn pred8x8<P: Pixel>(plane: &mut [P], stride: usize, x: usize, y: usize, mod
 
 #[inline(always)]
 fn clip<P: Pixel>(v: i32, bd: u32) -> P {
-    P::from_i32(v.clamp(0, (1 << bd) - 1))
+    P::clip(v, bd)
 }
 
 /// Intra_16x16 prediction (8.3.3) for the macroblock at luma (x, y).
