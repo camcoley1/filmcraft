@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use filmcraft_project::{ItemId, ItemKind, Transcript};
 use filmcraft_speech::SAMPLE_RATE;
-use filmcraft_speech::diarize::{Params, diarize_with};
+use filmcraft_speech::diarize::{Params, diarize_report};
 use serde_json::{Value, json};
 
 use crate::commands::{CommandSpec, bad, bool_p, f64_p, u64_p};
@@ -139,7 +139,10 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
         let r = label(&*src, len, &base_run, &params, &prog);
         let secs = t0.elapsed().as_secs_f64();
         *lock(&prog.status) = match &r {
-            Ok((_, n)) => format!("Found {n} speaker(s) ({secs:.1}s)"),
+            Ok((_, n)) => {
+                let coarse = lock(&prog.status).starts_with("Very long");
+                format!("Found {n} speaker(s) ({secs:.1}s){}", if coarse { "; the recording is very long, so speech was grouped coarsely" } else { "" })
+            }
             Err(e) if e == "stopped" => "Stopped: nothing was changed".into(),
             Err(e) => e.clone(),
         };
@@ -232,9 +235,12 @@ pub(crate) fn label(
     let audio = decode_chunked(src, len, prog)?;
     *lock(&prog.status) = "Clustering voices".into();
     let mut t = base.clone();
-    let n = diarize_with(&audio, &mut t, params, &cancelled).ok_or_else(|| "stopped".to_string())?;
+    let out = diarize_report(&audio, &mut t, params, &cancelled).ok_or_else(|| "stopped".to_string())?;
     prog.done.store(prog.total.load(Ordering::Relaxed), Ordering::Relaxed);
-    Ok((t, n))
+    if out.coarse {
+        *lock(&prog.status) = "Very long recording: speech was grouped coarsely".into();
+    }
+    Ok((t, out.speakers))
 }
 
 /// Apply finished jobs (one undo step each) and drop finished / cancelled ones. Called once per UI

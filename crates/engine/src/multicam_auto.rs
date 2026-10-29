@@ -63,7 +63,7 @@ fn explicit(p: &Value) -> bool {
 fn target(s: &Session, p: &Value) -> Result<Target> {
     let cmd = "multicam.autoSwitch";
     let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
-    let usable = |i: &TrackItem| i.multicam.is_some_and(|m| m.enabled) && s.project.sequence(i.item).is_some();
+    let usable = |i: &TrackItem| i.enabled && i.multicam.is_some_and(|m| m.enabled) && s.project.sequence(i.item).is_some();
     let found = |c| q.find_item(c).and_then(|(tid, it)| (q.track(tid)?.kind == TrackKind::Video && usable(it)).then(|| (tid, it.clone())));
     let anchor = if explicit(p) {
         // what was named, or an error: never another clip
@@ -86,7 +86,12 @@ fn target(s: &Session, p: &Value) -> Result<Target> {
     let (track, clip) = anchor;
     let items = &q.track(track).ok_or(EngineError::NoSequence)?.items;
     let at = items.iter().position(|i| i.id == clip.id).ok_or(EngineError::NoSequence)?;
-    let follows = |a: &TrackItem, b: &TrackItem| a.item == b.item && usable(b) && a.end() == b.start && a.source_out() == b.source_in;
+    // a piece of the run: plain speed, and it picks up exactly where the one before it stopped
+    let plain = |i: &TrackItem| (i.speed - 1.0).abs() <= 1e-9 && !i.reverse && i.frame_hold.is_none();
+    let follows = |a: &TrackItem, b: &TrackItem| a.item == b.item && usable(b) && plain(b) && a.end() == b.start && a.source_out() == b.source_in;
+    if !plain(&clip) {
+        return Err(bad(cmd, format!("clip {} has a speed change, reverse or frame hold: reset it first", clip.id.0)));
+    }
     let (mut lo, mut hi) = (at, at);
     while lo > 0 && follows(&items[lo - 1], &items[lo]) {
         lo -= 1;
@@ -95,20 +100,35 @@ fn target(s: &Session, p: &Value) -> Result<Target> {
         hi += 1;
     }
     let run: Vec<TrackItem> = items[lo..=hi].to_vec();
-    if let Some(bad_piece) = run.iter().find(|i| (i.speed - 1.0).abs() > 1e-9 || i.reverse || i.frame_hold.is_some()) {
-        return Err(bad(cmd, format!("clip {} has a speed change, reverse or frame hold: reset it first", bad_piece.id.0)));
-    }
     Ok(Target { track, clip, run })
 }
 
 fn can_auto_switch(s: &Session) -> std::result::Result<(), String> {
     has_seq(s)?;
     let t = target(s, &Value::Null).map_err(|e| e.to_string())?;
-    let src = s.project.sequence(t.clip.item).ok_or("the clip has no multi-camera source")?;
-    if sequence_words_nested(src, &s.project.transcripts, &|id| s.project.sequence(id)).is_empty() {
+    // cheap enough for a menu check: does any audio the clip plays have a transcript?
+    if !plays_transcript(s, t.clip.item, 0, &mut 200) {
         return Err("the multi-camera audio has no transcript (Transcribe first)".into());
     }
     Ok(())
+}
+
+/// Whether an audio clip of `seq`, or of a sequence nested in it (a few levels, a bounded number
+/// of looks), has a transcript with words.
+fn plays_transcript(s: &Session, seq: filmcraft_project::ItemId, depth: usize, looks: &mut usize) -> bool {
+    let Some(q) = s.project.sequence(seq) else { return false };
+    for it in q.audio_tracks.iter().flat_map(|t| t.items.iter()).filter(|i| i.enabled) {
+        if s.project.transcripts.get(&it.item).is_some_and(|t| !t.words.is_empty()) {
+            return true;
+        }
+        if depth < 4 && *looks > 0 && s.project.sequence(it.item).is_some() {
+            *looks -= 1;
+            if plays_transcript(s, it.item, depth + 1, looks) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn seconds_p(p: &Value, key: &str, default: f64, cmd: &str) -> Result<Tick> {

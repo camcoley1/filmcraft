@@ -439,3 +439,38 @@ fn chunked_decoding_matches_a_whole_decode_across_chunk_boundaries() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A session whose clip has been cut into three pieces by a first run, then `mutate` applied to
+/// the pieces; returns how many pieces a run anchored at piece `anchor` takes (or the error).
+fn pieces_after(mutate: impl FnOnce(&mut Vec<filmcraft_project::TrackItem>), anchor: usize) -> std::result::Result<u64, String> {
+    let (mut s, items, _, _) = mc_session("camera1");
+    set_transcript(&mut s, items[0], &[(0.0, 0.5, 0), (0.6, 1.0, 0), (1.5, 2.0, 1), (2.1, 2.5, 1), (3.0, 3.5, 0)]);
+    s.execute("multicam.autoSwitch", json!({"minShotSeconds": 0.5, "leadSeconds": LEAD})).unwrap();
+    let seq = s.state.active_sequence.unwrap();
+    let mut p = (*s.project).clone();
+    mutate(&mut p.sequence_mut(seq).unwrap().video_tracks[0].items);
+    let id = p.sequence(seq).unwrap().video_tracks[0].items[anchor].id.0;
+    s.project = std::sync::Arc::new(p);
+    s.execute("multicam.autoSwitch", json!({"clip": id, "minShotSeconds": 0.5, "leadSeconds": LEAD}))
+        .map(|r| r["pieces"].as_u64().unwrap())
+        .map_err(|e| e.to_string())
+}
+
+#[test]
+fn a_run_stops_at_gaps_source_jumps_disabled_and_changed_pieces() {
+    let frame = FrameRate::FPS_24.frame_duration();
+    // untouched: all three pieces
+    assert_eq!(pieces_after(|_| {}, 0), Ok(3));
+    // a gap after piece 0: it is a run of one, and the rest another of two
+    assert_eq!(pieces_after(|v| v[0].duration -= frame, 0), Ok(1));
+    assert_eq!(pieces_after(|v| v[0].duration -= frame, 1), Ok(2));
+    // a jump in the source after piece 1
+    assert_eq!(pieces_after(|v| v[2].source_in += frame, 1), Ok(2));
+    assert_eq!(pieces_after(|v| v[2].source_in += frame, 2), Ok(1));
+    // a disabled piece and a piece with a speed change end the run instead of refusing it
+    assert_eq!(pieces_after(|v| v[2].enabled = false, 0), Ok(2));
+    assert_eq!(pieces_after(|v| v[2].speed = 2.0, 1), Ok(2));
+    // but the targeted piece itself must be plain
+    let e = pieces_after(|v| v[1].speed = 2.0, 1).unwrap_err();
+    assert!(e.contains("speed change"), "{e}");
+}
