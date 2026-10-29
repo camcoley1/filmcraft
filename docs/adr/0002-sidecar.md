@@ -87,6 +87,13 @@ AI features run in **`craft-ai`**, a separate Python process installed by craft-
     `craft-suite/sidecar/LICENSES.md` before it is added; AGPL (Ultralytics YOLO) and
     non-commercial weights are out.
 
+13. **A feature may call a hosted service through the helper (M8f, Generative Extend).** Only the
+    helper talks to the network, with the user's own key (`FAL_KEY` or `~/.config/craft-ai/fal.env`,
+    never put in a project, a job folder, a log or a result); the feature is offered only while a
+    key is present, and the command's description says that it costs money and sends the clip's
+    frame to the provider. FilmCraft itself still opens no outbound connection. The service and
+    its terms are recorded in `LICENSES.md` instead of a weights licence.
+
 ## Consequences
 
 - The fork is no longer pure Rust end to end: AI features need a Python 3.12 install. The product
