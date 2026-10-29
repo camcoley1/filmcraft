@@ -81,13 +81,18 @@ pub fn chunks(t: &Transcript, p: &Params) -> Vec<std::ops::Range<usize>> {
 /// whole two-hour file would be about 700 MB).
 const BLOCK_SECONDS: usize = 30;
 /// Most chunks clustered. The distances are held as a triangle of `f32` (4000 chunks: 32 MB); more
-/// chunks than this are joined by doubling the minimum chunk length until they fit.
+/// chunks than this are joined in pairs until they fit (see [`plan`]).
 pub const MAX_CHUNKS: usize = 4000;
 
 /// MFCC frames of `audio`: (frame count, per-frame energy in dB, `N_MFCC` coefficients per frame).
 /// Computed in blocks with enough context at each side that every frame is exactly the frame the
 /// whole-file computation gives; `cancel` is asked between blocks (`None`: cancelled).
 fn mfcc_frames(audio: &[f32], cancel: &dyn Fn() -> bool) -> Option<(usize, Vec<f32>, Vec<f32>)> {
+    mfcc_frames_in(audio, BLOCK_SECONDS * SAMPLE_RATE as usize / crate::mel::HOP, cancel)
+}
+
+/// [`mfcc_frames`] with `block` frames per block (at least one).
+fn mfcc_frames_in(audio: &[f32], block: usize, cancel: &dyn Fn() -> bool) -> Option<(usize, Vec<f32>, Vec<f32>)> {
     use crate::mel::{HOP, N_FFT};
     let frames = audio.len() / HOP;
     let mut energy = vec![0f32; frames];
@@ -98,7 +103,7 @@ fn mfcc_frames(audio: &[f32], cancel: &dyn Fn() -> bool) -> Option<(usize, Vec<f
             (std::f32::consts::PI * k as f32 * (m as f32 + 0.5) / N_MELS as f32).cos()
         })
         .collect();
-    let block = BLOCK_SECONDS * SAMPLE_RATE as usize / HOP;
+    let block = block.max(1);
     // a frame's window reaches N_FFT / 2 either side of its centre
     let margin = (N_FFT / 2).div_ceil(HOP) * HOP;
     let mut f0 = 0;
@@ -204,9 +209,13 @@ impl Clusters {
     fn closest(&self) -> Option<(f32, usize, usize)> {
         let mut best: Option<(f32, usize, usize)> = None;
         for k in 0..self.n {
-            if self.active[k] && self.nn[k].1 != usize::MAX && best.is_none_or(|b| self.nn[k].0 < b.0) {
-                let o = self.nn[k].1;
-                best = Some((self.nn[k].0, k.min(o), k.max(o)));
+            let o = self.nn[k].1;
+            if self.active[k] && o != usize::MAX {
+                // smallest distance, then the lexicographically first pair: the textbook scan order
+                let cand = (self.nn[k].0, k.min(o), k.max(o));
+                if best.is_none_or(|b| cand.0 < b.0 || (cand.0 == b.0 && (cand.1, cand.2) < (b.1, b.2))) {
+                    best = Some(cand);
+                }
             }
         }
         best
@@ -235,7 +244,8 @@ impl Clusters {
                 self.nn[k] = self.nearest(k);
             } else {
                 let d = self.dist(k, i);
-                if d < self.nn[k].0 {
+                // on an exact tie the lower index stays the nearest, as a fresh scan would pick it
+                if d < self.nn[k].0 || (d == self.nn[k].0 && i < self.nn[k].1) {
                     self.nn[k] = (d, i);
                 }
             }
@@ -249,28 +259,77 @@ pub fn diarize(audio: &[f32], t: &mut Transcript, p: &Params) -> usize {
     diarize_with(audio, t, p, &|| false).unwrap_or(0)
 }
 
+/// Longest time any chunk parameter may have (an hour): hostile values are brought into range.
+const MAX_PARAM: Tick = Tick(3600 * filmcraft_time::TICKS_PER_SECOND);
+
+fn sane(p: &Params) -> Params {
+    let t = |v: Tick| Tick(v.0.clamp(0, MAX_PARAM.0));
+    let d = Params::default();
+    Params {
+        chunk_gap: t(p.chunk_gap),
+        min_chunk: t(p.min_chunk),
+        max_chunk: t(p.max_chunk),
+        threshold: if p.threshold.is_finite() { p.threshold } else { d.threshold },
+        max_speakers: p.max_speakers.clamp(1, 64),
+    }
+}
+
+/// The chunks that will be clustered and whether they had to be grouped more coarsely than
+/// `p` says because there were more than [`MAX_CHUNKS`] (a very long recording). Chunk parameters
+/// are brought into range first (negative to zero, at most an hour); neighbouring chunks are then
+/// joined in pairs until they fit, in a bounded number of passes.
+pub fn plan(t: &Transcript, p: &Params) -> (Vec<std::ops::Range<usize>>, bool) {
+    let p = sane(p);
+    let mut ch = chunks(t, &p);
+    let mut coarse = false;
+    // more than can be clustered: join neighbours in pairs (each pass halves them, so a handful
+    // of passes is enough for any transcript; raising the minimum chunk length instead would join
+    // everything into one chunk)
+    for _ in 0..40 {
+        if ch.len() <= MAX_CHUNKS {
+            break;
+        }
+        ch = ch.chunks(2).filter_map(|c| Some(c.first()?.start..c.last()?.end)).collect();
+        coarse = true;
+    }
+    (ch, coarse)
+}
+
+/// What [`diarize_report`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Outcome {
+    pub speakers: usize,
+    /// The recording had more speech segments than can be clustered, so they were grouped
+    /// coarsely (see [`plan`]); labels may be less exact.
+    pub coarse: bool,
+}
+
 /// [`diarize`] that asks `cancel` between blocks of audio and between merges of clusters and
 /// returns `None` (leaving `t` as it was) as soon as it says yes.
 pub fn diarize_with(audio: &[f32], t: &mut Transcript, p: &Params, cancel: &dyn Fn() -> bool) -> Option<usize> {
+    diarize_report(audio, t, p, cancel).map(|o| o.speakers)
+}
+
+/// [`diarize_with`] that also says whether the speech had to be grouped coarsely.
+pub fn diarize_report(audio: &[f32], t: &mut Transcript, p: &Params, cancel: &dyn Fn() -> bool) -> Option<Outcome> {
+    if cancel() {
+        return None;
+    }
     if t.words.is_empty() {
-        return Some(0);
+        return Some(Outcome { speakers: 0, coarse: false });
     }
-    // more chunks than can be clustered: join short ones until they fit
-    let mut p = p.clone();
-    let mut ch = chunks(t, &p);
-    while ch.len() > MAX_CHUNKS && p.min_chunk < Tick(i64::MAX / 4) {
-        p.min_chunk = Tick(p.min_chunk.0.saturating_mul(2));
-        ch = chunks(t, &p);
-    }
+    let p = sane(p);
+    let (ch, coarse) = plan(t, &p);
+    let done = |speakers: usize| Some(Outcome { speakers, coarse });
     let one = |t: &mut Transcript| {
         t.speakers = vec![Speaker { name: "Speaker 1".into() }];
         for w in &mut t.words {
             w.speaker = Some(0);
         }
-        Some(1)
+        done(1)
     };
     if ch.len() < 2 {
-        return one(t);
+        return if cancel() { None } else { one(t) };
     }
     let (frames, energy, mfcc) = mfcc_frames(audio, cancel)?;
     // chunk vectors: mean and std of MFCC 1..N over voiced frames
@@ -335,11 +394,11 @@ pub fn diarize_with(audio: &[f32], t: &mut Transcript, p: &Params, cancel: &dyn 
         let small = (0..n).find(|&c| cl.active[c] && cl.members[c].iter().map(|&i| weight[i]).sum::<f32>() < 0.05 * total);
         let Some(si) = small else { break };
         let near = (0..n).filter(|&c| cl.active[c] && c != si).min_by(|&a, &b| cl.dist(si, a).total_cmp(&cl.dist(si, b))).unwrap_or(0);
-        let (keep, gone) = (near.min(si), near.max(si));
-        cl.merge(keep, gone);
+        // the merged cluster keeps the nearest one's place in the order, as in the textbook version
+        cl.merge(near, si);
     }
     if cl.live == 1 {
-        return one(t);
+        return if cancel() { None } else { one(t) };
     }
     // number speakers by first appearance
     let mut label = vec![0usize; n];
@@ -361,7 +420,7 @@ pub fn diarize_with(audio: &[f32], t: &mut Transcript, p: &Params, cancel: &dyn 
         }
     }
     t.speakers = (0..order.len()).map(|i| Speaker { name: format!("Speaker {}", i + 1) }).collect();
-    Some(order.len())
+    done(order.len())
 }
 
 #[cfg(test)]
@@ -465,17 +524,22 @@ mod tests {
     }
 
     #[test]
-    fn blocked_mfcc_frames_equal_the_whole_file_frames() {
-        // 70 s: three blocks, the last one short; compare with one block-sized pass over everything
-        let audio = noise(70 * 16_000 + 123, 7);
-        let (frames, energy, mfcc) = mfcc_frames(&audio, &|| false).unwrap();
-        let (f2, mel) = crate::mel::mel_energies(&audio, N_MELS);
-        assert_eq!(frames, f2);
-        for f in [0, 1, 2999, 3000, 3001, 5999, 6000, 6001, frames - 1] {
-            let e: f32 = (0..N_MELS).map(|m| mel[m * frames + f]).sum();
-            assert_eq!(energy[f], 10.0 * (e + 1e-10).log10(), "energy of frame {f}");
+    fn blocked_mfcc_frames_equal_the_whole_file_frames_coefficient_by_coefficient() {
+        // short inputs, lengths that are not whole frames, and blocks of 1, 7, 100 frames and one
+        // block for everything: every energy and every coefficient identical
+        for len in [0usize, 1, 159, 160, 161, 399, 400, 401, 1600, 16_000 + 77, 3 * 16_000 + 3] {
+            let audio = noise(len, 11 + len as u32);
+            let whole = mfcc_frames_in(&audio, usize::MAX / 2, &|| false).unwrap();
+            for block in [1usize, 2, 3, 7, 100, 1000] {
+                let blocked = mfcc_frames_in(&audio, block, &|| false).unwrap();
+                assert_eq!(blocked.0, whole.0, "frames, len {len} block {block}");
+                assert_eq!(blocked.1, whole.1, "energy, len {len} block {block}");
+                assert_eq!(blocked.2, whole.2, "mfcc, len {len} block {block}");
+            }
         }
-        assert!(mfcc.iter().all(|v| v.is_finite()));
+        // and the default block size over a file of several blocks agrees with a single block
+        let audio = noise(70 * 16_000 + 123, 7);
+        assert_eq!(mfcc_frames(&audio, &|| false).unwrap(), mfcc_frames_in(&audio, usize::MAX / 2, &|| false).unwrap());
     }
 
     #[test]
@@ -539,6 +603,75 @@ mod tests {
         out
     }
 
+    /// Voice-like audio and words for `n` chunks: alternating two timbres, a second apart.
+    fn many_chunks(n: usize) -> (Vec<f32>, Transcript) {
+        let mut audio = Vec::new();
+        let mut words = Vec::new();
+        for k in 0..n {
+            let t0 = audio.len() as f64 / 16_000.0;
+            audio.extend(noise(12_800, 100 + (k % 7) as u32).iter().map(|v| v * (1.0 + (k % 2) as f32)));
+            words.push(Word::new(format!("w{k}"), seconds_tick(t0), seconds_tick(t0 + 0.8)));
+            audio.extend(vec![0f32; 8000]);
+        }
+        (audio, Transcript { words, ..Default::default() })
+    }
+
+    #[test]
+    fn cancelling_works_on_the_single_chunk_path_and_inside_the_merge_loop() {
+        // one chunk: a cancel is honoured, nothing changes
+        let words = vec![Word::new("a", seconds_tick(0.0), seconds_tick(1.0))];
+        let base = Transcript { words, ..Default::default() };
+        let mut t = base.clone();
+        assert!(diarize_with(&noise(16_000, 1), &mut t, &Params::default(), &|| true).is_none());
+        assert_eq!(t, base);
+        let mut t = base.clone();
+        assert_eq!(diarize_with(&noise(16_000, 1), &mut t, &Params::default(), &|| false), Some(1));
+
+        // 200 chunks: well over 64 merges. Count the checks of a full run, then cancel at each of
+        // the last ones (they are inside the merge loop and after it): always None and unchanged
+        let (audio, base) = many_chunks(200);
+        let calls = std::cell::Cell::new(0usize);
+        let mut t = base.clone();
+        diarize_with(&audio, &mut t, &Params::default(), &|| {
+            calls.set(calls.get() + 1);
+            false
+        })
+        .unwrap();
+        let total = calls.get();
+        assert!(total >= 8, "checks: {total}");
+        for at in [total - 1, total - 2, total - 3] {
+            let n = std::cell::Cell::new(0usize);
+            let mut t = base.clone();
+            let r = diarize_with(&audio, &mut t, &Params::default(), &|| {
+                n.set(n.get() + 1);
+                n.get() > at
+            });
+            assert!(r.is_none(), "cancelled at check {at} of {total}");
+            assert_eq!(t, base);
+        }
+    }
+
+    #[test]
+    fn exact_ties_merge_in_the_textbook_order() {
+        // many equal vectors and equal distances: grid points, duplicates, symmetric triples
+        let sets: Vec<Vec<Vec<f32>>> = vec![
+            (0..40).map(|i| vec![(i % 4) as f32, (i % 3) as f32]).collect(),
+            (0..30).map(|i| vec![(i / 3) as f32]).collect(),
+            vec![vec![0.0]; 12],
+            (0..25).map(|i| vec![(i % 5) as f32, (i / 5) as f32]).collect(),
+        ];
+        for vecs in sets {
+            let mut cl = Clusters::new(&vecs, &|| false).unwrap();
+            let mut got = Vec::new();
+            while cl.live > 1 {
+                let (_, i, j) = cl.closest().unwrap();
+                got.push((cl.members[i][0], cl.members[j][0]));
+                cl.merge(i, j);
+            }
+            assert_eq!(got, naive_merges(&vecs), "{} vectors", vecs.len());
+        }
+    }
+
     #[test]
     fn cached_clustering_merges_in_the_same_order_as_the_textbook_version() {
         let vecs: Vec<Vec<f32>> = (0..60).map(|i| noise(8, 100 + i).iter().map(|v| v * (1.0 + (i % 3) as f32)).collect()).collect();
@@ -555,16 +688,58 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// `n` words of 0.2 s with 0.1 s between them (one chunk each with these parameters).
+    fn dense_words(n: usize) -> Vec<Word> {
+        (0..n).map(|i| Word::new("x", seconds_tick(i as f64 * 0.3), seconds_tick(i as f64 * 0.3 + 0.2))).collect()
+    }
+
+    fn dense_params() -> Params {
+        Params { chunk_gap: seconds_tick(0.05), min_chunk: seconds_tick(0.1), max_chunk: seconds_tick(0.4), ..Params::default() }
+    }
+
     #[test]
     fn more_chunks_than_the_limit_are_joined_and_still_labelled() {
-        // 6000 half-second "words" a second apart: 6000 chunks, over MAX_CHUNKS
-        let n = 6000usize;
-        let words: Vec<Word> = (0..n).map(|i| Word::new("x", seconds_tick(i as f64 * 1.0), seconds_tick(i as f64 * 1.0 + 0.8))).collect();
-        let audio = noise(n * 16_000, 3);
-        let mut t = Transcript { words, ..Default::default() };
-        let k = diarize_with(&audio, &mut t, &Params::default(), &|| false).unwrap();
-        assert!(k >= 1);
+        let n = MAX_CHUNKS + 1500;
+        let t = Transcript { words: dense_words(n), ..Default::default() };
+        let p = dense_params();
+        assert_eq!(chunks(&t, &p).len(), n, "one chunk per word before joining");
+        let (ch, coarse) = plan(&t, &p);
+        assert!(coarse && ch.len() <= MAX_CHUNKS && ch.len() > 1, "{}", ch.len());
+        // joined chunks tile the words
+        assert_eq!(ch.first().unwrap().start, 0);
+        assert_eq!(ch.last().unwrap().end, n);
+        assert!(ch.windows(2).all(|w| w[0].end == w[1].start));
+        // and a real run labels every word
+        let audio = noise((n as f64 * 0.3) as usize * 16_000 + 16_000, 3);
+        let mut t = t;
+        let out = diarize_report(&audio, &mut t, &p, &|| false).unwrap();
+        assert!(out.coarse && out.speakers >= 1);
         assert!(t.words.iter().all(|w| w.speaker.is_some()));
+        // under the limit nothing is grouped coarsely
+        let few = Transcript { words: dense_words(50), ..Default::default() };
+        assert!(!plan(&few, &p).1);
+    }
+
+    #[test]
+    fn hostile_parameters_end_and_are_brought_into_range() {
+        let n = MAX_CHUNKS + 100;
+        let words = dense_words(n);
+        let audio = noise((n as f64 * 0.3) as usize * 16_000 + 16_000, 9);
+        let zero = Tick(0);
+        let hostile = [
+            Params { chunk_gap: zero, min_chunk: zero, max_chunk: zero, threshold: 0.4, max_speakers: 0 },
+            Params { chunk_gap: Tick(-5), min_chunk: Tick(i64::MIN), max_chunk: Tick(i64::MIN), threshold: f32::NAN, max_speakers: usize::MAX },
+            Params { chunk_gap: Tick(i64::MAX), min_chunk: Tick(i64::MAX), max_chunk: Tick(i64::MAX), threshold: f32::INFINITY, max_speakers: 3 },
+            Params { chunk_gap: seconds_tick(0.05), min_chunk: seconds_tick(0.1), max_chunk: zero, threshold: -1.0, max_speakers: 2 },
+        ];
+        for p in hostile {
+            let t = Transcript { words: words.clone(), ..Default::default() };
+            let (ch, _) = plan(&t, &p);
+            assert!(ch.len() <= MAX_CHUNKS, "{p:?}: {}", ch.len());
+            let mut t = t;
+            let out = diarize_report(&audio, &mut t, &p, &|| false).expect("ends");
+            assert!(out.speakers >= 1);
+        }
     }
 
     /// Cost of a long file (run by hand: `cargo test -p filmcraft-speech --lib measure_long -- --ignored --nocapture`).
@@ -574,8 +749,11 @@ mod tests {
         let hours: f64 = std::env::var("DIARIZE_HOURS").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
         let secs = (hours * 3600.0) as usize;
         let audio = noise(secs * 16_000, 5);
-        // a "word" of 0.8 s every second: one chunk per second of audio
-        let words: Vec<Word> = (0..secs).map(|i| Word::new("x", seconds_tick(i as f64), seconds_tick(i as f64 + 0.8))).collect();
+        // a 0.8 s "word" every DIARIZE_PERIOD seconds (default 1.8: about 4000 chunks in 2 hours,
+        // the clustering ceiling; 1.0 gives one chunk per second)
+        let period: f64 = std::env::var("DIARIZE_PERIOD").ok().and_then(|v| v.parse().ok()).unwrap_or(1.8);
+        let words: Vec<Word> =
+            (0..(secs as f64 / period) as usize).map(|i| Word::new("x", seconds_tick(i as f64 * period), seconds_tick(i as f64 * period + 0.8))).collect();
         let mut t = Transcript { words, ..Default::default() };
         let t0 = std::time::Instant::now();
         let n = diarize_with(&audio, &mut t, &Params::default(), &|| false).unwrap();
