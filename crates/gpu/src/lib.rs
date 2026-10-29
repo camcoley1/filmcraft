@@ -739,20 +739,34 @@ impl GpuCompositor {
             None
         };
         let out_view = Self::target(&self.device, &mut self.output, w, h, OUTPUT_FORMAT, wgpu::TextureUsages::COPY_SRC);
-        // Layers whose effects the GPU stage can't run (no stage on this device, or a working image
-        // larger than a texture) are rendered on the CPU here and drawn as plain RGBA layers.
-        let max_side = self.device.limits().max_texture_dimension_2d;
-        let cpu_fx: Vec<Option<PlanLayer>> = layers
-            .iter()
-            .map(|l| {
-                let lfx = l.fx.as_ref()?;
-                if self.fx.is_some() && lfx.size.0.max(lfx.size.1) <= max_side {
-                    return None;
-                }
-                let img = filmcraft_render::plan::effect_image(&l.frame, lfx);
-                Some(PlanLayer::new(Arc::new(VideoFrame::rgba_f32(img.w as u32, img.h as u32, img.px)), l.matrix, l.opacity, l.blend))
-            })
-            .collect();
+        // Layers whose effects the GPU stage can't run (no stage on this device, a working image
+        // larger than a texture, working textures beyond the budget or refused by the device, a
+        // table beyond a storage binding: `fx::prepare` / `FxStage::reserve`) are rendered on the
+        // CPU here and drawn as plain RGBA layers; the others keep their prepared passes.
+        if let Some(f) = self.fx.as_mut() {
+            f.begin_frame();
+        }
+        let mut prepared: Vec<Option<fx::Prepared>> = Vec::with_capacity(layers.len());
+        let mut cpu_fx: Vec<Option<PlanLayer>> = Vec::with_capacity(layers.len());
+        for l in layers.iter() {
+            let Some(lfx) = l.fx.as_ref() else {
+                prepared.push(None);
+                cpu_fx.push(None);
+                continue;
+            };
+            let ready = match self.fx.as_mut() {
+                Some(stage) => fx::prepare(&self.device, lfx).filter(|p| stage.reserve(&self.device, p)),
+                None => None,
+            };
+            if ready.is_some() {
+                prepared.push(ready);
+                cpu_fx.push(None);
+                continue;
+            }
+            prepared.push(None);
+            let img = filmcraft_render::plan::effect_image(&l.frame, lfx);
+            cpu_fx.push(Some(PlanLayer::new(Arc::new(VideoFrame::rgba_f32(img.w as u32, img.h as u32, img.px)), l.matrix, l.opacity, l.blend)));
+        }
         let resolved: Vec<&PlanLayer> = layers.iter().zip(&cpu_fx).map(|(l, c)| c.as_ref().unwrap_or(l)).collect();
         let layers = resolved;
         let keys: Vec<(usize, u32, u32)> = layers
@@ -770,10 +784,7 @@ impl GpuCompositor {
         let mut bind_groups = Vec::with_capacity(layers.len());
         // the effect stage of each layer with effects (recorded right before its draw)
         let mut jobs: Vec<Option<fx::FxJob>> = Vec::with_capacity(layers.len());
-        if let Some(f) = self.fx.as_mut() {
-            f.begin_frame();
-        }
-        for (l, k) in layers.iter().zip(&keys) {
+        for (i, (l, k)) in layers.iter().zip(&keys).enumerate() {
             // (every frame was just uploaded; a missing upload draws transparent texels)
             let src = self.src_info(&l.frame, *k).unwrap_or(SrcInfo {
                 kind: 1,
@@ -808,9 +819,9 @@ impl GpuCompositor {
                             wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&views[3]) },
                         ],
                     });
-                    match self.fx.as_mut() {
-                        Some(f) => f.job(&self.device, &self.queue, lfx, sbg, &self.dummy),
-                        None => None,
+                    match (self.fx.as_mut(), prepared.get(i).and_then(Option::as_ref)) {
+                        (Some(f), Some(p)) => f.job(&self.device, &self.queue, p, sbg, &self.dummy),
+                        _ => None,
                     }
                 }
                 None => None,
@@ -823,9 +834,9 @@ impl GpuCompositor {
                     (Self::uniforms(&s, &l.matrix, l.opacity, l.blend, (w, h)), [j.result.clone(), self.dummy.clone(), self.dummy.clone(), self.dummy.clone()])
                 }
                 None => {
-                    // (a layer with effects only gets here if its job failed, which the CPU
-                    // fallback above rules out; it is then drawn without them, where the working
-                    // image would be)
+                    // (a layer with effects only gets here if recording its prepared passes failed
+                    // after the pre-check above accepted them and reserved their textures, which
+                    // no input reaches; it is then drawn without them, where the working image would be)
                     let m = match &l.fx {
                         Some(lfx) => {
                             let n = 1.0 / lfx.decimation.max(1) as f64;
@@ -1004,9 +1015,13 @@ impl GpuCompositor {
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&views[3]) },
             ],
         });
+        let p = fx::prepare(&self.device, fx)?;
         let stage = self.fx.as_mut()?;
         stage.begin_frame();
-        let job = stage.job(&self.device, &self.queue, fx, sbg, &self.dummy)?;
+        if !stage.reserve(&self.device, &p) {
+            return None;
+        }
+        let job = stage.job(&self.device, &self.queue, &p, sbg, &self.dummy)?;
         let row = (w * 16).div_ceil(256) * 256;
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fx-readback"),

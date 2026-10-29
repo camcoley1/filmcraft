@@ -27,6 +27,12 @@ pub const BOX_PER_PIXEL_MAX: u32 = 32;
 /// GPUs, whose watchdog ends a dispatch that runs too long, run 4K grades as four bands).
 pub const BAND_PIXELS: u32 = 1 << 21;
 
+/// Most bytes of working textures one layer's effects may hold (Rgba32Float, the image read, the
+/// one written, and the saved ones). Beyond it the layer's effects render on the CPU instead of
+/// asking the device for more (integrated GPUs share system memory: a 4K masked grade needs four
+/// textures, about 530 MB; an 8K one would need 2 GB).
+pub const FX_TEXTURE_BUDGET: u64 = 1 << 30;
+
 const OP_BRIGHTNESS_CONTRAST: u32 = 1;
 const OP_PROC_AMP: u32 = 2;
 const OP_TINT: u32 = 3;
@@ -121,6 +127,7 @@ type Target = (wgpu::Texture, wgpu::TextureView);
 pub(crate) struct FxStage {
     px: wgpu::ComputePipeline,
     run: wgpu::ComputePipeline,
+    median: wgpu::ComputePipeline,
     bgl: wgpu::BindGroupLayout,
     /// Draws a layer's source into a working texture (`composite.wgsl` `fs`, no blending).
     source: wgpu::RenderPipeline,
@@ -131,6 +138,7 @@ pub(crate) struct FxStage {
 /// One compute pass of a job.
 struct Dispatch {
     run: bool,
+    median: bool,
     bg: wgpu::BindGroup,
     groups: (u32, u32),
 }
@@ -154,6 +162,11 @@ pub(crate) struct FxJob {
 /// and saves nest.
 struct Step {
     run: bool,
+    /// HSL Denoise: its own entry point (`fx_median`), so the window's private array does not
+    /// weigh on every other per-pixel pass.
+    median: bool,
+    /// Work per pixel relative to a plain pass: the band of rows one dispatch covers shrinks by it.
+    cost: u32,
     code: u32,
     i1: [u32; 4],
     p: [f32; 24],
@@ -171,7 +184,7 @@ fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
     for (d, s) in q.iter_mut().zip(p) {
         *d = *s;
     }
-    Step { run: false, code, i1, p: q, saves: 0, restore: false, data: Vec::new() }
+    Step { run: false, median: false, cost: 1, code, i1, p: q, saves: 0, restore: false, data: Vec::new() }
 }
 
 /// Mark `group` (the passes of one op, in order) as working on a saved copy of its input: the
@@ -237,7 +250,11 @@ fn advanced_step(a: &filmcraft_render::effects::LumetriAdvanced) -> Step {
 fn hsl_steps(h: &filmcraft_render::effects::HslSecondary) -> Vec<Step> {
     let mut g = vec![step(OP_HSL_KEY, [0; 4], &[h.hc, h.hr, h.smin, h.lmin, h.lmax, h.soft])];
     if let Some(r) = h.median_radius() {
-        g.push(step(OP_HSL_MEDIAN, [r as u32, 0, 0, 0], &[h.denoise.min(1.0)]));
+        let mut m = step(OP_HSL_MEDIAN, [r as u32, 0, 0, 0], &[h.denoise.min(1.0)]);
+        m.median = true;
+        // a (2r+1)² window sorted per pixel
+        m.cost = ((2 * r as u32 + 1).pow(2) / 16).max(1);
+        g.push(m);
     }
     let radii: Vec<u32> = h.blur_radii().into_iter().map(|r| r.min(u32::MAX as usize) as u32).collect();
     boxes(&radii, false, true, &mut g);
@@ -284,6 +301,8 @@ fn steps(op: &FxOp) -> Vec<Step> {
             if !g.is_empty() {
                 let mut mix = step(OP_MASK_MIX, [0; 4], &[]);
                 mix.data = mask_data(masks);
+                // every edge of every mask, for the pixels near one
+                mix.cost = (masks.iter().map(|m| m.pts.len() as u32).sum::<u32>() / 64).max(1);
                 g.push(mix);
                 out.extend(saving(g));
             }
@@ -401,6 +420,43 @@ fn steps(op: &FxOp) -> Vec<Step> {
     out
 }
 
+/// A layer's effect passes, checked against the device: built once per frame by the compositor's
+/// pre-check ([`prepare`]), which sends the layer to the CPU when they do not fit, then recorded.
+pub(crate) struct Prepared {
+    steps: Vec<Step>,
+    /// Working textures: the one read, the one written, and the deepest nesting of saved images.
+    pub(crate) n: usize,
+    size: (u32, u32),
+}
+
+/// The passes of `fx` if the GPU stage can run them on `device`: the working image fits in a
+/// texture, its working textures within [`FX_TEXTURE_BUDGET`], every table within a storage
+/// binding. None: render the layer's effects on the CPU.
+pub(crate) fn prepare(device: &wgpu::Device, fx: &LayerFx) -> Option<Prepared> {
+    let (w, h) = (fx.size.0.max(1), fx.size.1.max(1));
+    let limits = device.limits();
+    if w > limits.max_texture_dimension_2d || h > limits.max_texture_dimension_2d {
+        return None;
+    }
+    let steps: Vec<Step> = fx.ops.iter().flat_map(steps).collect();
+    let mut depth = 0usize;
+    let mut deepest = 0usize;
+    for s in &steps {
+        depth += s.saves as usize;
+        deepest = deepest.max(depth);
+        depth = depth.checked_sub(usize::from(s.restore))?;
+    }
+    let n = deepest + 2;
+    let bytes = (n as u64).saturating_mul(u64::from(w)).saturating_mul(u64::from(h)).saturating_mul(16);
+    if bytes > FX_TEXTURE_BUDGET {
+        return None;
+    }
+    if steps.iter().any(|s| (s.data.len() as u64).saturating_mul(4) > limits.max_storage_buffer_binding_size) {
+        return None;
+    }
+    Some(Prepared { steps, n, size: (w, h) })
+}
+
 impl FxStage {
     /// Whether `device` can run the stage: compute shaders with 16×16 workgroups and a storage
     /// texture (WebGL2-class devices can't; they render effects on the CPU).
@@ -494,7 +550,7 @@ impl FxStage {
             multiview_mask: None,
             cache: None,
         });
-        Self { px: compute("fx_px"), run: compute("fx_run"), bgl, source, pool: HashMap::new(), used: HashSet::new() }
+        Self { px: compute("fx_px"), run: compute("fx_run"), median: compute("fx_median"), bgl, source, pool: HashMap::new(), used: HashSet::new() }
     }
 
     /// Start a frame: pooled textures of sizes no layer uses by [`end_frame`](Self::end_frame)
@@ -541,29 +597,34 @@ impl FxStage {
     /// uniforms map the frame onto the working image). None when the working image does not fit
     /// in a texture (the layer is then drawn without its effects — never larger than the source
     /// frame, which would not have uploaded either).
+    /// Reserve the working textures of `p` (pooled for the frame), with an out-of-memory error
+    /// scope around the allocation: false when the device refuses, and the caller renders the
+    /// layer's effects on the CPU instead (the session's GPU compositing carries on).
+    pub(crate) fn reserve(&mut self, device: &wgpu::Device, p: &Prepared) -> bool {
+        let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let got = self.targets(device, p.size, p.n).len();
+        match crate::poll_now(scope.pop()) {
+            Some(None) => got >= p.n,
+            Some(Some(e)) => {
+                log::warn!("GPU effects of a {}x{} layer need more memory than the device has, rendering them on the CPU: {e}", p.size.0, p.size.1);
+                // let the failed textures go, so a later frame does not reuse them
+                self.pool.remove(&p.size);
+                false
+            }
+            None => false,
+        }
+    }
+
     pub(crate) fn job(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        fx: &LayerFx,
+        p: &Prepared,
         source_bg: wgpu::BindGroup,
         dummy: &wgpu::TextureView,
     ) -> Option<FxJob> {
-        let (w, h) = (fx.size.0.max(1), fx.size.1.max(1));
-        let max = device.limits().max_texture_dimension_2d;
-        if w > max || h > max {
-            return None;
-        }
-        let all: Vec<Step> = fx.ops.iter().flat_map(steps).collect();
-        // working textures: the one being read, the one being written, and the saved images
-        let mut depth = 0usize;
-        let mut deepest = 0usize;
-        for s in &all {
-            depth += s.saves as usize;
-            deepest = deepest.max(depth);
-            depth = depth.saturating_sub(usize::from(s.restore));
-        }
-        let n = deepest + 2;
+        let (w, h) = p.size;
+        let (all, n) = (&p.steps, p.n);
         let targets = self.targets(device, (w, h), n);
         let views: Vec<wgpu::TextureView> = targets.iter().map(|t| t.1.clone()).collect();
         // passes without tables share one (the binding needs a buffer)
@@ -576,7 +637,7 @@ impl FxStage {
         let mut dispatches = Vec::with_capacity(all.len());
         let mut cur = 0usize;
         let mut saved: Vec<usize> = Vec::new();
-        for s in &all {
+        for s in all {
             for _ in 0..s.saves {
                 saved.push(cur);
             }
@@ -601,7 +662,7 @@ impl FxStage {
             };
             // per-pixel passes over bands of rows (`BAND_PIXELS`); a running-sum pass is one
             // invocation per line already
-            let band = if s.run { h } else { (BAND_PIXELS / w).max(16).next_multiple_of(16).min(h) };
+            let band = if s.run { h } else { (BAND_PIXELS / s.cost.max(1) / w).max(16).next_multiple_of(16).min(h) };
             let mut y0 = 0;
             while y0 < h {
                 let rows = band.min(h - y0);
@@ -636,7 +697,7 @@ impl FxStage {
                 } else {
                     (w.div_ceil(16), rows.div_ceil(16))
                 };
-                dispatches.push(Dispatch { run: s.run, bg, groups });
+                dispatches.push(Dispatch { run: s.run, median: s.median, bg, groups });
                 y0 += rows;
             }
             cur = dst;
@@ -678,7 +739,13 @@ impl FxStage {
         }
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("fx"), timestamp_writes: None });
         for d in &job.dispatches {
-            pass.set_pipeline(if d.run { &self.run } else { &self.px });
+            pass.set_pipeline(if d.run {
+                &self.run
+            } else if d.median {
+                &self.median
+            } else {
+                &self.px
+            });
             pass.set_bind_group(0, &d.bg, &[]);
             pass.dispatch_workgroups(d.groups.0, d.groups.1, 1);
         }

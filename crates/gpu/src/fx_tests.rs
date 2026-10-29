@@ -976,8 +976,61 @@ fn lumetri_heavy_grade_timings() {
             (None, _) => "no GPU adapter".into(),
             (_, false) => "not GPU-capable (rendered on the CPU)".into(),
         };
-        eprintln!("heavy grade {w}x{h}: CPU {:.1} ms, GPU {gpu_ms}", median(cpu));
+        // what the plan and the stage do on the CPU per frame before the passes: evaluate (bake the
+        // curve tables, resolve the LUT) and prepare the passes (pack tables)
+        let prep_ms = gpu.as_ref().map(|(dev, _)| {
+            let t0 = std::time::Instant::now();
+            for _ in 0..5 {
+                let op = FxOp::eval(&e, &c, w as usize, h as usize).expect("an op");
+                let _ = fx::prepare(dev, &LayerFx { size: (w, h), decimation: 1, ops: vec![op] });
+            }
+            t0.elapsed().as_secs_f64() * 1000.0 / 5.0
+        });
+        eprintln!(
+            "heavy grade {w}x{h}: CPU {:.1} ms, GPU {gpu_ms}; per-frame evaluation + pass preparation on the CPU {:.1} ms",
+            median(cpu),
+            prep_ms.unwrap_or(0.0)
+        );
     }
+    // a 1000-point mask covering the whole 4K frame around the heavy grade: every pixel tests every
+    // edge in the mix pass, which runs in narrower bands (cost 1000 / 64)
+    let Some((dev, q)) = &gpu else { return };
+    let (w, h) = (3840u32, 2160u32);
+    let mut comp = GpuCompositor::new(dev, q);
+    let frame = VideoFrame::rgba_f32(w, h, picture(w, h));
+    let n = 1000;
+    let pts: Vec<[f32; 2]> = (0..n)
+        .map(|i| {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            [w as f32 * (0.5 + 0.49 * a.cos()), h as f32 * (0.5 + 0.49 * a.sin())]
+        })
+        .collect();
+    let mask = filmcraft_render::mask::FlatMask { pts, feather: 20.0, expansion: 0.0, opacity: 1.0, inverted: false, mode: filmcraft_project::MaskMode::Add };
+    let graded = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w as usize, h as usize).unwrap();
+    let masked = FxOp::Masked { op: Box::new(graded.clone()), masks: vec![mask] };
+    assert!(masked.gpu_ok());
+    let time = |op: &FxOp, comp: &mut GpuCompositor| {
+        let fx = LayerFx { size: (w, h), decimation: 1, ops: vec![op.clone()] };
+        let _ = comp.effect_image(&frame, &fx);
+        let mut v: Vec<f64> = (0..3)
+            .map(|_| {
+                let t0 = std::time::Instant::now();
+                let _ = comp.effect_image(&frame, &fx);
+                t0.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect();
+        v.sort_by(f64::total_cmp);
+        v[1]
+    };
+    let (plain_ms, masked_ms) = (time(&graded, &mut comp), time(&masked, &mut comp));
+    let cost = (n as u32 / 64).max(1);
+    let rows = (fx::BAND_PIXELS / cost / w).max(16).next_multiple_of(16);
+    let dispatches = h.div_ceil(rows);
+    eprintln!(
+        "heavy grade 4K with a 1000-point full-frame mask: {masked_ms:.1} ms vs {plain_ms:.1} ms unmasked: the mask pass ~{:.1} ms in {dispatches} dispatches of {rows} rows, ~{:.1} ms per dispatch",
+        masked_ms - plain_ms,
+        (masked_ms - plain_ms) / f64::from(dispatches)
+    );
 }
 
 /// Masks for the masked-effect tests on a `w`×`h` working image: a feathered ellipse (Add), an
@@ -1067,6 +1120,19 @@ fn masked_effects_gpu_boundary() {
     assert!(!masked(flat(pts.clone(), 1.0)).gpu_ok());
     assert!(masked(flat(pts[..100].to_vec(), 1.0)).gpu_ok());
     assert!(!masked(flat(pts[..100].to_vec(), f32::NAN)).gpu_ok());
+    // finite but huge coordinates (a hostile project file) stay on the CPU: the shader's squared
+    // lengths would overflow
+    let mut far = pts[..10].to_vec();
+    far[3] = [2e7, 90.0];
+    assert!(!masked(flat(far, 1.0)).gpu_ok());
+    assert!(!masked(filmcraft_render::mask::FlatMask { expansion: 5e7, ..flat(pts[..10].to_vec(), 1.0) }).gpu_ok());
+    // a curve table of another length than the shader's (a future change to the baking) goes to the CPU
+    let mut op = FxOp::eval(&effect("lumetri", &[("curve_luma", ParamValue::Curve(vec![[0.0, 0.1], [1.0, 0.9]]))]), &c1, w, h).unwrap();
+    assert!(op.gpu_ok());
+    if let FxOp::Lumetri { advanced: Some(a), .. } = &mut op {
+        a.curves[0] = Some(vec![0.5; 512]);
+    }
+    assert!(!op.gpu_ok());
     // an inner op the GPU does not take keeps the whole masked effect on the CPU
     assert!(!FxOp::Masked { op: Box::new(FxOp::Gamma { g: f32::NAN }), masks: vec![flat(pts[..10].to_vec(), 1.0)] }.gpu_ok());
 }
@@ -1089,4 +1155,166 @@ fn banded_passes_cover_every_row() {
     let (fl_diff, b8) = diff_float_and_8bit(&cpu.px, &gpu);
     eprintln!("banded heavy grade {w}x{h}: max float diff {fl_diff:.2e}, max 8-bit diff {b8}");
     assert!(fl_diff <= 1.0 / 255.0 && b8 <= 1, "{fl_diff} / {b8}");
+}
+
+/// LUTs as `.cube` files bring them: a 1D shaper (1024-entry gamma) in front of a 17³ cube, a cube
+/// over a non-unit DOMAIN (-0.1…1.5, 0…1, 0…2), and a shaper alone.
+fn file_luts() -> Vec<(&'static str, filmcraft_color::Lut)> {
+    use filmcraft_color::{Lut, Lut1d, Lut3d};
+    // a non-linear, channel-mixing cube (not affine: tetrahedral and trilinear differ on it)
+    let wild = |n: usize| {
+        Lut3d::from_fn(n, |c| [(c[0] * 0.8 + c[1] * 0.3).powf(1.3), (c[1] * c[1] + 0.1 * c[2]).min(1.2), (0.5 + 0.5 * (c[2] * 3.0 + c[0]).sin()) * 0.9])
+    };
+    let shaper = Lut1d { domain_min: [0.0; 3], domain_max: [1.0; 3], data: (0..1024).map(|i| [(i as f32 / 1023.0).powf(0.6); 3]).collect() };
+    let mut domain = wild(17);
+    domain.domain_min = [-0.1, 0.0, 0.0];
+    domain.domain_max = [1.5, 1.0, 2.0];
+    vec![
+        ("shaper + cube", Lut { title: String::new(), shaper: Some(shaper.clone()), cube: Some(wild(17)) }),
+        ("non-unit DOMAIN cube", Lut { title: String::new(), shaper: None, cube: Some(domain) }),
+        ("shaper alone", Lut { title: String::new(), shaper: Some(shaper), cube: None }),
+    ]
+}
+
+/// Imported LUTs (shaper + cube, non-unit DOMAIN, shaper alone) as Input LUT and as a look LUT at
+/// 50 %, on the GPU against the CPU, on the chart and the demo scene.
+#[test]
+fn file_luts_match_cpu() {
+    let Some((dev, q)) = gpu_or_skip("file_luts_match_cpu") else { return };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let mut failures = Vec::new();
+    for (picture_name, (w, h), px) in [("chart", (67u32, 41u32), picture(67, 41)), ("demo scene", (320, 180), demo_picture(320, 180))] {
+        let frame = VideoFrame::rgba_f32(w, h, px.clone());
+        for (lut_name, lut) in file_luts() {
+            let lut = std::sync::Arc::new(lut);
+            assert!(filmcraft_render::gpufx::gpu_lut_ok(&lut), "{lut_name}");
+            let as_input = {
+                let mut op = FxOp::eval(&effect("lumetri", &[("contrast", fl(10.0))]), &cx(Tick::ZERO, 1.0), w as usize, h as usize).unwrap();
+                let FxOp::Lumetri { input_lut, .. } = &mut op else { panic!() };
+                *input_lut = Some(lut.clone());
+                op
+            };
+            let as_look = {
+                let e = effect("lumetri", &[("look", ch(1)), ("look_intensity", fl(50.0))]);
+                let mut op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w as usize, h as usize).unwrap();
+                let FxOp::Lumetri { advanced: Some(a), .. } = &mut op else { panic!() };
+                a.look_lut = Some(lut.clone());
+                op
+            };
+            for (role, op) in [("input LUT", as_input), ("look LUT 50%", as_look)] {
+                assert!(op.gpu_ok(), "{lut_name} as {role}");
+                let mut cpu = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.clone() };
+                op.apply(&mut cpu);
+                let (_, _, gpu) = c.effect_image(&frame, &LayerFx { size: (w, h), decimation: 1, ops: vec![op] }).expect("effect image");
+                let (fl_diff, b8) = diff_float_and_8bit(&cpu.px, &gpu);
+                eprintln!("{picture_name} / {lut_name} as {role}: max float diff {fl_diff:.2e}, max 8-bit diff {b8}");
+                if fl_diff > 1.0 / 255.0 || b8 > 1 {
+                    failures.push(format!("{picture_name} / {lut_name} as {role}: float {fl_diff:.2e}, 8-bit {b8}"));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "GPU LUTs differ from the CPU:\n{}", failures.join("\n"));
+}
+
+/// The cases the first parity tests left out: an HSL key whose hue range crosses 0°/360°, playback
+/// resolutions other than full (px_scale 0.5: Denoise radius 1 and the Sharpen floor; 2: Blur radii
+/// beyond `BOX_PER_PIXEL_MAX`, run as running sums), the remaining mask modes (Intersect, Lighten,
+/// Darken) after an inverted first mask, and a 3840-wide image whose band is not a power of two.
+#[test]
+fn remaining_parity_cases() {
+    use filmcraft_project::{Mask, MaskMode, MaskPath};
+    let Some((dev, q)) = gpu_or_skip("remaining_parity_cases") else { return };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let on = ParamValue::Bool(true);
+    let mut failures = Vec::new();
+    let mut check = |name: &str, w: u32, h: u32, px: &[f32], op: FxOp, c: &mut GpuCompositor| {
+        assert!(op.gpu_ok(), "{name}: not GPU-capable");
+        let mut cpu = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.to_vec() };
+        op.apply(&mut cpu);
+        let frame = VideoFrame::rgba_f32(w, h, px.to_vec());
+        let (_, _, gpu) = c.effect_image(&frame, &LayerFx { size: (w, h), decimation: 1, ops: vec![op] }).expect("effect image");
+        let (fl_diff, b8) = diff_float_and_8bit(&cpu.px, &gpu);
+        eprintln!("{name}: max float diff {fl_diff:.2e}, max 8-bit diff {b8}");
+        if fl_diff > 1.0 / 255.0 || b8 > 1 {
+            failures.push(format!("{name}: float {fl_diff:.2e}, 8-bit {b8}"));
+        }
+    };
+    let (w, h) = (320u32, 180u32);
+    let demo = demo_picture(w, h);
+    let wrap =
+        effect("lumetri", &[("hsl_on", on.clone()), ("hsl_hue", fl(350.0)), ("hsl_hue_range", fl(40.0)), ("hsl_sat", fl(160.0)), ("hsl_hue_shift", fl(30.0))]);
+    check("HSL hue range across 0°", w, h, &demo, FxOp::eval(&wrap, &cx(Tick::ZERO, 1.0), w as usize, h as usize).unwrap(), &mut c);
+    let res = effect("lumetri", &[("hsl_on", on.clone()), ("hsl_hue", fl(30.0)), ("hsl_denoise", fl(20.0)), ("hsl_blur", fl(100.0)), ("sharpen", fl(50.0))]);
+    for px_scale in [0.5f32, 2.0] {
+        let op = FxOp::eval(&res, &cx(Tick::ZERO, px_scale), w as usize, h as usize).unwrap();
+        if px_scale == 2.0 {
+            let FxOp::Lumetri { hsl: Some(hs), .. } = &op else { panic!() };
+            assert!(hs.blur_radii().iter().any(|r| *r as u32 > fx::BOX_PER_PIXEL_MAX), "{:?}", hs.blur_radii());
+        }
+        check(&format!("HSL Denoise + Blur + Sharpen at px_scale {px_scale}"), w, h, &demo, op, &mut c);
+    }
+    // inverted first mask (its mode starts at 1), then Intersect, Lighten, Darken
+    let (fw, fh) = (f64::from(w), f64::from(h));
+    let mut a = Mask::new("a", MaskPath::ellipse(Vec2::new(fw * 0.5, fh * 0.5), Vec2::new(fw * 0.35, fh * 0.4)));
+    a.mode = MaskMode::Subtract;
+    a.inverted = true;
+    a.feather.value = ParamValue::Float(8.0);
+    let mut modes = vec![a];
+    for (i, mode) in [MaskMode::Intersect, MaskMode::Lighten, MaskMode::Darken].into_iter().enumerate() {
+        let x = fw * (0.3 + 0.2 * i as f64);
+        let mut m = Mask::new("m", MaskPath::rect(x - 40.0, fh * 0.2, x + 40.0, fh * 0.8));
+        m.mode = mode;
+        m.feather.value = ParamValue::Float(5.0);
+        m.opacity.value = ParamValue::Float(80.0);
+        modes.push(m);
+    }
+    let mut e = effect("lumetri", &[("saturation", fl(0.0)), ("exposure", fl(0.5))]);
+    e.masks = modes;
+    check(
+        "masks: inverted first, Intersect, Lighten, Darken",
+        w,
+        h,
+        &demo,
+        FxOp::eval_masked(&e, &cx(Tick::ZERO, 1.0), w as usize, h as usize).unwrap(),
+        &mut c,
+    );
+    // 3840 wide: 546 rows per band rounded to 560, then a 40-row tail
+    let (bw, bh) = (3840u32, 600u32);
+    let band_rows = (fx::BAND_PIXELS / bw).max(16).next_multiple_of(16);
+    assert!(!band_rows.is_power_of_two() && bh > band_rows && bh % band_rows != 0, "{band_rows}");
+    let wide = picture(bw, bh);
+    let blur = effect("lumetri", &[("hsl_on", on), ("hsl_hue", fl(200.0)), ("hsl_denoise", fl(60.0)), ("hsl_blur", fl(40.0)), ("sharpen", fl(30.0))]);
+    check("3840x600 bands", bw, bh, &wide, FxOp::eval(&blur, &cx(Tick::ZERO, 1.0), bw as usize, bh as usize).unwrap(), &mut c);
+    assert!(failures.is_empty(), "GPU differs from the CPU:\n{}", failures.join("\n"));
+}
+
+/// The working-texture budget: a layer whose saved images would need more than
+/// `FX_TEXTURE_BUDGET` is not prepared for the GPU (the compositor renders its effects on the
+/// CPU), one within it is; a prepared job's texture count follows its nesting.
+#[test]
+fn working_textures_stay_within_the_budget() {
+    let Some((dev, _q)) = gpu_or_skip("working_textures_stay_within_the_budget") else { return };
+    let masked = |size: (u32, u32)| {
+        let e = {
+            let mut e = heavy_grade();
+            e.masks = effect_masks(f64::from(size.0), f64::from(size.1));
+            e
+        };
+        let op = FxOp::eval_masked(&e, &cx(Tick::ZERO, 1.0), size.0 as usize, size.1 as usize).unwrap();
+        LayerFx { size, decimation: 1, ops: vec![op] }
+    };
+    // 4K masked heavy grade: 4 textures × 3840 × 2160 × 16 B ≈ 531 MB, within the budget
+    assert!(fx::prepare(&dev, &masked((3840, 2160))).is_some());
+    // 7680 × 4320 with the same nesting would need ≈ 2.1 GB: refused (CPU), or beyond the texture size
+    assert!(fx::prepare(&dev, &masked((7680, 4320))).is_none());
+    // a plain grade at 7680 × 4320 needs two: 1 061 683 200 B, just within the 1 GiB budget
+    // (where the device's texture size allows 8K at all)
+    let plain = FxOp::eval(&effect("lumetri", &[("exposure", fl(0.2))]), &cx(Tick::ZERO, 1.0), 7680, 4320).unwrap();
+    let big = fx::prepare(&dev, &LayerFx { size: (7680, 4320), decimation: 1, ops: vec![plain.clone()] });
+    assert!(big.as_ref().is_none_or(|p| p.n == 2) && (big.is_some() || dev.limits().max_texture_dimension_2d < 7680));
+    // 8K with one saved image (three textures, 1.59 GB): refused
+    let unsharp = FxOp::eval(&effect("unsharp_mask", &[("amount", fl(100.0))]), &cx(Tick::ZERO, 1.0), 7680, 4320).unwrap();
+    assert!(fx::prepare(&dev, &LayerFx { size: (7680, 4320), decimation: 1, ops: vec![unsharp] }).is_none());
+    assert!(fx::prepare(&dev, &LayerFx { size: (3840, 2160), decimation: 1, ops: vec![plain] }).is_some());
 }

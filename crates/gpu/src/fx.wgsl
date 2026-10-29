@@ -1030,9 +1030,6 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
             }
             return vec4(hsl_key(o.rgb / o.a));
         }
-        case OP_HSL_MEDIAN: {
-            return vec4(hsl_median(p));
-        }
         case OP_HSL_APPLY: {
             return hsl_apply(p);
         }
@@ -1060,6 +1057,18 @@ fn fx_px(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let p = vec2<i32>(i32(id.x), i32(y));
     textureStore(dst, p, pixel(u.i0.x, p));
+}
+
+// HSL Denoise, an entry point of its own: the median's window (a private array) stays out of
+// `fx_px`, which every other per-pixel pass runs.
+@compute @workgroup_size(16, 16)
+fn fx_median(@builtin(global_invocation_id) id: vec3<u32>) {
+    let y = id.y + u.i0.w;
+    if id.x >= u.i0.y || y >= u.i0.z {
+        return;
+    }
+    let p = vec2<i32>(i32(id.x), i32(y));
+    textureStore(dst, p, vec4(hsl_median(p)));
 }
 
 // A box pass as a running sum along one row (i1.z = 0) or column (1) per invocation: O(1) per
