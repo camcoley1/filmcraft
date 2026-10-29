@@ -6,7 +6,8 @@
 //! | `ai.connect {port=9877}` | Clip ▸ AI | connects to the helper on another port |
 //! | `ai.reframe` | Clip ▸ AI | M6a: [`reframe`] |
 //! | `ai.stems` | Clip ▸ AI | M6b: [`stems`] |
-//! | `ai.enhanceSpeech` `ai.upscale` `ai.interpolate` `ai.generativeExtend` | Clip ▸ AI | M6c to M6f |
+//! | `ai.enhanceSpeech` `ai.upscale` `ai.interpolate` | Clip ▸ AI | M6c to M6f |
+//! | `ai.generativeExtend` | Clip ▸ AI | M8f, in [`crate::ai_extend`] |
 //! | `ai.beatGrid` `ai.musicFit` | Sequence ▸ AI | M6d |
 //! | `ai.search {query}` | (Project panel search) | M6e |
 //! | `ai.echo` | (none) | the protocol test kind |
@@ -224,7 +225,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// The helper is connected, speaks our protocol and offers `feature`.
-fn helper_ready(s: &Session, feature: &str) -> std::result::Result<(), String> {
+pub(crate) fn helper_ready(s: &Session, feature: &str) -> std::result::Result<(), String> {
     if s.sidecar.is_none() {
         return Err(NOT_CONNECTED.into());
     }
@@ -330,15 +331,6 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             "M6f",
             Needs::Clips,
             r#"{"clips":[id]?,"factor":2|4=2,"wait":bool=false}"#
-        ),
-        feature!(
-            "ai.generativeExtend",
-            "Generative Extend…",
-            ["Clip", "AI"],
-            "generativeExtend",
-            "a later milestone",
-            Needs::Clips,
-            r#"{"clips":[id]?,"seconds":f?}"#
         ),
         feature!("ai.beatGrid", "Add Beat Markers", ["Sequence", "AI"], "beatGrid", "M6d", Needs::Clips, r#"{"clips":[id]?,"wait":bool=false}"#),
         feature!(
@@ -1086,6 +1078,7 @@ fn apply(s: &mut Session, pj: &PendingAi, result: &JobResult, files: &[PathBuf])
         "echo" => apply_echo(s, &pj.fingerprint, result, files),
         "reframe" => reframe::apply(s, pj, files),
         "stems" => stems::apply(s, pj, files),
+        "generativeExtend" => crate::ai_extend::apply(s, pj, result, files),
         k => Err(EngineError::Other(format!("results of `{k}` jobs cannot be applied yet"))),
     }
 }

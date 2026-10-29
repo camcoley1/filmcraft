@@ -30,6 +30,8 @@ pub enum ResultMode {
     Fail(String),
     /// These files, made from the request (a feature's result format).
     Custom(Writer),
+    /// A copy of the file `from`, named `name` in `out_dir` (a result that is a real media file).
+    Copy { name: String, from: std::path::PathBuf },
 }
 
 /// Which reply is not JSON, or how the helper misbehaves on the wire.
@@ -256,6 +258,10 @@ fn finish(job: &JobRequest, id: &Value, mode: &ResultMode) -> Value {
             let path = dir.join("echo.json");
             let _ = std::fs::write(&path, serde_json::to_vec(job).unwrap_or_default());
             "echo.json".to_string()
+        }
+        ResultMode::Copy { name, from } => {
+            let _ = std::fs::copy(from, dir.join(name));
+            name.clone()
         }
         ResultMode::Missing => "missing.bin".to_string(),
         ResultMode::Oversize(n) => {

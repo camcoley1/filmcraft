@@ -13,6 +13,8 @@
 pub mod aaf_omf;
 #[cfg(feature = "sidecar")]
 pub mod ai;
+#[cfg(feature = "sidecar")]
+pub mod ai_extend;
 pub mod autosave;
 pub mod captions;
 pub mod clip_ops;
