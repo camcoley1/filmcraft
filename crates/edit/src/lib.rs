@@ -20,6 +20,7 @@
 pub mod captions;
 pub mod frame_size;
 pub mod multicam;
+pub mod multicam_auto;
 pub mod through;
 pub mod transcript;
 pub mod transitions;
