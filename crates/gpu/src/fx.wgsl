@@ -52,6 +52,17 @@ const OP_MIRROR: u32 = 28u;
 const OP_OFFSET: u32 = 29u;
 const OP_VIDEO_LIMITER: u32 = 30u;
 const OP_LUMETRI: u32 = 31u;
+const OP_LUMETRI_ADVANCED: u32 = 32u;
+const OP_HSL_KEY: u32 = 33u;
+const OP_HSL_MEDIAN: u32 = 34u;
+const OP_HSL_APPLY: u32 = 35u;
+
+// Samples per Lumetri curve table (`effects::CURVE_SAMPLES`); the advanced pass's tables hold nine
+// of them, then the look LUT.
+const CURVE_N: u32 = 1024u;
+const LOOK_LUT_BASE: u32 = 9216u;
+// Largest HSL Denoise window: (2 * 3 + 1)².
+const MEDIAN_MAX: u32 = 49u;
 
 fn size() -> vec2<i32> {
     return vec2<i32>(i32(u.i0.y), i32(u.i0.z));
@@ -443,10 +454,72 @@ fn color_op(op: u32, c: vec3<f32>) -> vec3<f32> {
     }
 }
 
-fn lumetri_op(c: vec3<f32>, p: vec2<i32>) -> vec3<f32> {
+// A LUT packed by `fx::lut_data` at `base` in `data`: a 1D shaper (linear per channel, as
+// `Lut1d::apply`) then a 3D cube (tetrahedral, as `Lut3d::apply`), either optional.
+fn lut_apply(base: u32, c0: vec3<f32>) -> vec3<f32> {
+    var c = c0;
+    let sn = u32(data[base]);
+    let cn = u32(data[base + 1u]);
+    if sn >= 2u {
+        let dmin = vec3(data[base + 4u], data[base + 5u], data[base + 6u]);
+        let dmax = vec3(data[base + 8u], data[base + 9u], data[base + 10u]);
+        let n = sn - 1u;
+        var o = vec3(0.0);
+        for (var k = 0u; k < 3u; k++) {
+            let t = clamp((c[k] - dmin[k]) / (dmax[k] - dmin[k]), 0.0, 1.0) * f32(n);
+            let i = min(u32(t), n - 1u);
+            let f = t - f32(i);
+            let a = data[base + 20u + i * 3u + k];
+            let b = data[base + 20u + min(i + 1u, n) * 3u + k];
+            o[k] = a + (b - a) * f;
+        }
+        c = o;
+    }
+    if cn >= 2u {
+        let cube = base + 20u + sn * 3u;
+        let dmin = vec3(data[base + 12u], data[base + 13u], data[base + 14u]);
+        let dmax = vec3(data[base + 16u], data[base + 17u], data[base + 18u]);
+        let t = clamp((c - dmin) / (dmax - dmin), vec3(0.0), vec3(1.0)) * f32(cn - 1u);
+        let i = min(vec3<u32>(t), vec3(cn - 2u));
+        let f = t - vec3<f32>(i);
+        let fr = f.x; let fg = f.y; let fb = f.z;
+        let c000 = lut_at(cube, cn, i);
+        let c111 = lut_at(cube, cn, i + vec3(1u, 1u, 1u));
+        var ca: vec3<f32>; var cb: vec3<f32>; var w: vec4<f32>;
+        if fr > fg {
+            if fg > fb {
+                ca = lut_at(cube, cn, i + vec3(1u, 0u, 0u)); cb = lut_at(cube, cn, i + vec3(1u, 1u, 0u)); w = vec4(1.0 - fr, fr - fg, fg - fb, fb);
+            } else if fr > fb {
+                ca = lut_at(cube, cn, i + vec3(1u, 0u, 0u)); cb = lut_at(cube, cn, i + vec3(1u, 0u, 1u)); w = vec4(1.0 - fr, fr - fb, fb - fg, fg);
+            } else {
+                ca = lut_at(cube, cn, i + vec3(0u, 0u, 1u)); cb = lut_at(cube, cn, i + vec3(1u, 0u, 1u)); w = vec4(1.0 - fb, fb - fr, fr - fg, fg);
+            }
+        } else if fb > fg {
+            ca = lut_at(cube, cn, i + vec3(0u, 0u, 1u)); cb = lut_at(cube, cn, i + vec3(0u, 1u, 1u)); w = vec4(1.0 - fb, fb - fg, fg - fr, fr);
+        } else if fb > fr {
+            ca = lut_at(cube, cn, i + vec3(0u, 1u, 0u)); cb = lut_at(cube, cn, i + vec3(0u, 1u, 1u)); w = vec4(1.0 - fg, fg - fb, fb - fr, fr);
+        } else {
+            ca = lut_at(cube, cn, i + vec3(0u, 1u, 0u)); cb = lut_at(cube, cn, i + vec3(1u, 1u, 0u)); w = vec4(1.0 - fg, fg - fr, fr - fb, fb);
+        }
+        c = w.x * c000 + w.y * ca + w.z * cb + w.w * c111;
+    }
+    return c;
+}
+
+fn lut_at(cube: u32, n: u32, i: vec3<u32>) -> vec3<f32> {
+    let k = cube + (i.x + i.y * n + i.z * n * n) * 3u;
+    return vec3(data[k], data[k + 1u], data[k + 2u]);
+}
+
+fn lumetri_op(c0: vec3<f32>, p: vec2<i32>) -> vec3<f32> {
     let s = size();
     let creative_on = u.i1.x != 0u;
     let vignette_on = u.i1.y != 0u;
+    // Basic ▸ Input LUT on the display-encoded signal (0…1)
+    var c = c0;
+    if u.i1.z != 0u {
+        c = dec(lut_apply(0u, clamp(enc(c), vec3(0.0), vec3(1.0))));
+    }
 
     // white balance + exposure in linear light
     let ge = u.p0.xyz;
@@ -533,6 +606,201 @@ fn lumetri_op(c: vec3<f32>, p: vec2<i32>) -> vec3<f32> {
 }
 
 // One output pixel of every op but the running-sum box blur.
+// `effects::apply_look`: the procedural looks, on display-encoded colour.
+fn look_s_curve(v: f32, k: f32) -> f32 {
+    let x = clamp(v, 0.0, 1.0);
+    return x + (x * x * (3.0 - 2.0 * x) - x) * k;
+}
+
+fn apply_look(look: u32, c: vec3<f32>) -> vec3<f32> {
+    let l = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+    let grey = vec3(l);
+    switch look {
+        case 1u: {
+            let sh = vec3(0.0, 0.08, 0.1);
+            let hi = vec3(0.1, 0.04, -0.06);
+            let d = c + sh * (1.0 - l) + hi * l;
+            return vec3(look_s_curve(d.x, 0.35), look_s_curve(d.y, 0.35), look_s_curve(d.z, 0.35));
+        }
+        case 2u: {
+            let d = vec3(c.x * 1.06 + 0.02, c.y * 1.0 + 0.01, c.z * 0.9);
+            return (d + (grey - d) * 0.15) * 0.94 + 0.04;
+        }
+        case 3u: {
+            let d = vec3(c.x * 0.9, c.y * 0.98, c.z * 1.1 + 0.02);
+            return vec3(look_s_curve(d.x, 0.2), look_s_curve(d.y, 0.2), look_s_curve(d.z, 0.2));
+        }
+        case 4u: {
+            let d = c + (grey - c) * 0.55;
+            return vec3(look_s_curve(d.x, 0.6), look_s_curve(d.y, 0.6), look_s_curve(d.z, 0.6));
+        }
+        case 5u: {
+            return 0.08 + (c + (grey - c) * 0.25) * 0.84;
+        }
+        case 6u: {
+            return vec3(look_s_curve(l, 0.3));
+        }
+        case 7u: {
+            let d = vec3(c.x * 1.1 + 0.03, c.y * 1.02 + 0.01, c.z * 0.82);
+            return vec3(look_s_curve(d.x, 0.15), look_s_curve(d.y, 0.15), look_s_curve(d.z, 0.15));
+        }
+        case 8u: {
+            return vec3(c.x * 0.75, c.y * 0.85, c.z * 1.15) * 0.8;
+        }
+        default: {
+            return c;
+        }
+    }
+}
+
+// A baked curve (`LumetriAdvanced::apply`'s `sample`, SDR): linear between table entries.
+fn curve(slot: u32, x: f32) -> f32 {
+    let q = clamp(x, 0.0, 1.0) * f32(CURVE_N - 1u);
+    let i = u32(q);
+    let j = min(i + 1u, CURVE_N - 1u);
+    let a = data[slot * CURVE_N + i];
+    return a + (data[slot * CURVE_N + j] - a) * (q - f32(i));
+}
+
+fn has_curve(slot: u32) -> bool {
+    return (u.i1.x & (1u << slot)) != 0u;
+}
+
+// `LumetriAdvanced::apply` (SDR): look, Color Wheels, RGB curves, hue / saturation curves.
+fn lumetri_advanced(c: vec3<f32>) -> vec3<f32> {
+    var v = enc(c);
+    let look_k = u.p0.x;
+    if u.i1.z != 0u {
+        let lk = lut_apply(LOOK_LUT_BASE, clamp(v, vec3(0.0), vec3(1.0)));
+        v = v + (lk - v) * look_k;
+    } else if u.i1.y > 0u {
+        let lk = apply_look(u.i1.y, v);
+        v = v + (lk - v) * look_k;
+    }
+    if u.i1.w != 0u {
+        let ws = u.p0.yzw; let wm = u.p1.xyz; let wh = vec3(u.p1.w, u.p2.x, u.p2.y);
+        let ls = u.p2.z; let lm = u.p2.w; let lh = u.p3.x;
+        let l = clamp(0.2126 * v.x + 0.7152 * v.y + 0.0722 * v.z, 0.0, 1.0);
+        let wsh = (1.0 - l) * (1.0 - l);
+        let whi = l * l;
+        let wmid = max(1.0 - wsh - whi, 0.0);
+        for (var k = 0; k < 3; k++) {
+            v[k] += (ws[k] * 0.3 + ls * 0.3) * wsh;
+            v[k] += (wm[k] * 0.3 + lm * 0.3) * wmid;
+            v[k] *= 1.0 + (wh[k] * 0.5 + lh * 0.5) * whi;
+        }
+    }
+    if has_curve(0u) {
+        v = vec3(curve(0u, v.x), curve(0u, v.y), curve(0u, v.z));
+    }
+    if has_curve(1u) {
+        v.x = curve(1u, v.x);
+    }
+    if has_curve(2u) {
+        v.y = curve(2u, v.y);
+    }
+    if has_curve(3u) {
+        v.z = curve(3u, v.z);
+    }
+    if (u.i1.x & 0x1f0u) != 0u {
+        let uu = clamp(v, vec3(0.0), vec3(1.0));
+        var h = rgb_to_hsl(uu);
+        let h0 = h.x; let s0 = h.y; let l0 = h.z;
+        if has_curve(5u) {
+            h.x = fract_euclid(h.x + (curve(5u, h0) - 0.5));
+        }
+        var sm = 1.0;
+        if has_curve(4u) {
+            sm *= curve(4u, h0) * 2.0;
+        }
+        if has_curve(7u) {
+            sm *= curve(7u, l0) * 2.0;
+        }
+        if has_curve(8u) {
+            sm *= curve(8u, s0) * 2.0;
+        }
+        h.y = clamp(h.y * sm, 0.0, 1.0);
+        if has_curve(6u) {
+            h.z = clamp(h.z + (curve(6u, h0) - 0.5) * 0.5, 0.0, 1.0);
+        }
+        v = hsl_to_rgb(h.x, h.y, h.z);
+    }
+    return dec(v);
+}
+
+// `effects::hsl_key` on the display-encoded signal clamped to 0…1.
+fn hsl_key(c: vec3<f32>) -> f32 {
+    let h = rgb_to_hsl(clamp(enc(c), vec3(0.0), vec3(1.0)));
+    let hc = u.p0.x; let hr = u.p0.y; let smin = u.p0.z; let lmin = u.p0.w; let lmax = u.p1.x; let soft = u.p1.y;
+    let dh0 = abs(h.x - hc);
+    let dh = min(dh0, 1.0 - dh0);
+    let mh = 1.0 - clamp((dh - hr / 2.0) / soft, 0.0, 1.0);
+    let ms = clamp((h.y - smin) / soft, 0.0, 1.0);
+    let ml = min(clamp((h.z - lmin) / soft, 0.0, 1.0), clamp((lmax - h.z) / soft, 0.0, 1.0));
+    return mh * ms * ml;
+}
+
+// HSL Denoise: the median of the key over the (2r+1)² window that fits in the picture (as
+// `effects::median_filter`, whose window shrinks at the edges), mixed in by the amount.
+fn hsl_median(p: vec2<i32>) -> f32 {
+    let s = size();
+    let r = i32(u.i1.x);
+    var win: array<f32, MEDIAN_MAX>;
+    var n = 0u;
+    for (var y = max(p.y - r, 0); y <= min(p.y + r, s.y - 1); y++) {
+        for (var x = max(p.x - r, 0); x <= min(p.x + r, s.x - 1); x++) {
+            if n < MEDIAN_MAX {
+                // insertion into the sorted run
+                let v = ld(vec2(x, y)).x;
+                var j = n;
+                while j > 0u && win[j - 1u] > v {
+                    win[j] = win[j - 1u];
+                    j--;
+                }
+                win[j] = v;
+                n++;
+            }
+        }
+    }
+    let m = ld(p).x;
+    return m + (win[n / 2u] - m) * u.p0.x;
+}
+
+// `HslSecondary::apply` (SDR): src is the refined key, aux the image.
+fn hsl_apply(p: vec2<i32>) -> vec4<f32> {
+    let o = textureLoad(aux, p, 0);
+    let a = o.a;
+    if a <= 1e-6 {
+        return o;
+    }
+    let m = ld(p).x;
+    let uu = clamp(enc(o.rgb / a), vec3(0.0), vec3(1.0));
+    var out: vec3<f32>;
+    switch u.i1.x {
+        case 1u: {
+            let g = rgb_to_hsl(uu).z;
+            out = vec3(g) + (uu - vec3(g)) * m;
+        }
+        case 2u: {
+            out = uu * m;
+        }
+        case 3u: {
+            out = vec3(m);
+        }
+        default: {
+            var hh = rgb_to_hsl(uu);
+            hh.x = fract_euclid(hh.x + u.p1.w);
+            hh.y = clamp(hh.y * u.p1.z, 0.0, 1.0);
+            var c2 = hsl_to_rgb(hh.x, hh.y, hh.z);
+            c2.x *= 1.0 + 0.25 * u.p1.x;
+            c2.z *= 1.0 - 0.25 * u.p1.x;
+            c2.y *= 1.0 - 0.2 * u.p1.y;
+            out = uu + (c2 - uu) * m;
+        }
+    }
+    return vec4(dec(out) * a, a);
+}
+
 fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
     let s = size();
     let pc = vec2<f32>(p) + 0.5;
@@ -716,6 +984,27 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
             let c = o.rgb / a;
             let res = lumetri_op(c, p);
             return vec4(res * a, a);
+        }
+        case OP_LUMETRI_ADVANCED: {
+            let o = ld(p);
+            let a = o.a;
+            if a <= 1e-6 {
+                return o;
+            }
+            return vec4(lumetri_advanced(o.rgb / a) * a, a);
+        }
+        case OP_HSL_KEY: {
+            let o = ld(p);
+            if o.a <= 1e-6 {
+                return vec4(0.0);
+            }
+            return vec4(hsl_key(o.rgb / o.a));
+        }
+        case OP_HSL_MEDIAN: {
+            return vec4(hsl_median(p));
+        }
+        case OP_HSL_APPLY: {
+            return hsl_apply(p);
         }
         default: {
             let o = ld(p);

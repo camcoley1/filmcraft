@@ -52,6 +52,36 @@ const OP_MIRROR: u32 = 28;
 const OP_OFFSET: u32 = 29;
 const OP_VIDEO_LIMITER: u32 = 30;
 const OP_LUMETRI: u32 = 31;
+const OP_LUMETRI_ADVANCED: u32 = 32;
+const OP_HSL_KEY: u32 = 33;
+const OP_HSL_MEDIAN: u32 = 34;
+const OP_HSL_APPLY: u32 = 35;
+
+/// Where the advanced pass's look LUT starts in its tables (after nine curves; `fx.wgsl`'s
+/// `LOOK_LUT_BASE`).
+const LOOK_LUT_BASE: usize = 9 * filmcraft_render::effects::CURVE_SAMPLES;
+
+/// A LUT as `fx.wgsl`'s `lut_apply` reads it: a header (shaper size, cube size, then the shaper's
+/// and the cube's domain min / max, each padded to four), the shaper's entries, the cube's entries
+/// (red fastest), three floats each.
+fn lut_data(lut: &filmcraft_color::Lut) -> Vec<f32> {
+    let sn = lut.shaper.as_ref().map_or(0, |s| s.data.len());
+    let cn = lut.cube.as_ref().map_or(0, |c| c.size);
+    let pad = |v: [f32; 3]| [v[0], v[1], v[2], 0.0];
+    let mut d = vec![sn as f32, cn as f32, 0.0, 0.0];
+    let (smin, smax) = lut.shaper.as_ref().map_or(([0.0; 3], [1.0; 3]), |s| (s.domain_min, s.domain_max));
+    let (cmin, cmax) = lut.cube.as_ref().map_or(([0.0; 3], [1.0; 3]), |c| (c.domain_min, c.domain_max));
+    for v in [smin, smax, cmin, cmax] {
+        d.extend(pad(v));
+    }
+    if let Some(s) = &lut.shaper {
+        d.extend(s.data.iter().flatten());
+    }
+    if let Some(c) = &lut.cube {
+        d.extend(c.data.iter().flatten());
+    }
+    d
+}
 
 type Target = (wgpu::Texture, wgpu::TextureView);
 
@@ -142,6 +172,46 @@ fn unsharp(rx: &[u32], ry: &[u32], amount: f32, threshold: f32) -> Vec<Step> {
     saving(g)
 }
 
+/// Lumetri's look, Color Wheels and Curves in one pass: the curves' tables (unused slots stay 0)
+/// and the look LUT in `data`, which curves are on as bits of `i1.x`.
+fn advanced_step(a: &filmcraft_render::effects::LumetriAdvanced) -> Step {
+    let n = filmcraft_render::effects::CURVE_SAMPLES;
+    let mut data = vec![0.0f32; LOOK_LUT_BASE];
+    let mut bits = 0u32;
+    for (k, c) in a.curves.iter().enumerate() {
+        if let Some(c) = c.as_ref().filter(|c| c.len() == n) {
+            bits |= 1 << k;
+            data[k * n..(k + 1) * n].copy_from_slice(c);
+        }
+    }
+    if let Some(l) = &a.look_lut {
+        data.extend(lut_data(l));
+    }
+    let (w, on) = match &a.wheels {
+        Some(w) => (w.clone(), 1),
+        None => (filmcraft_render::effects::Wheels { rgb: [[0.0; 3]; 3], light: [0.0; 3] }, 0),
+    };
+    let [ws, wm, wh] = w.rgb;
+    let p = [a.look_k, ws[0], ws[1], ws[2], wm[0], wm[1], wm[2], wh[0], wh[1], wh[2], w.light[0], w.light[1], w.light[2]];
+    let mut s = step(OP_LUMETRI_ADVANCED, [bits, a.look, a.look_lut.is_some() as u32, on], &p);
+    s.data = data;
+    s
+}
+
+/// HSL Secondary on a saved copy of the image: the key, Denoise (median), Blur (box passes along
+/// rows, then columns, edges repeated) on the key, then the correction (key as `src`, image as `aux`).
+fn hsl_steps(h: &filmcraft_render::effects::HslSecondary) -> Vec<Step> {
+    let mut g = vec![step(OP_HSL_KEY, [0; 4], &[h.hc, h.hr, h.smin, h.lmin, h.lmax, h.soft])];
+    if let Some(r) = h.median_radius() {
+        g.push(step(OP_HSL_MEDIAN, [r as u32, 0, 0, 0], &[h.denoise.min(1.0)]));
+    }
+    let radii: Vec<u32> = h.blur_radii().into_iter().map(|r| r.min(u32::MAX as usize) as u32).collect();
+    boxes(&radii, false, true, &mut g);
+    boxes(&radii, true, true, &mut g);
+    g.push(step(OP_HSL_APPLY, [h.show_mask, 0, 0, 0], &[0.0, 0.0, 0.0, 0.0, h.htemp, h.htint, h.hsat, h.hshift]));
+    saving(g)
+}
+
 /// The passes of an op (empty: no-op). Unsharp's blur passes come first, then the combine.
 fn steps(op: &FxOp) -> Vec<Step> {
     let mut out = Vec::new();
@@ -227,6 +297,10 @@ fn steps(op: &FxOp) -> Vec<Step> {
             vround,
             vfeather,
             aspect,
+            input_lut,
+            advanced,
+            hsl,
+            sharpen,
             ..
         } => {
             let ge = [gains[0] * exposure, gains[1] * exposure, gains[2] * exposure];
@@ -264,7 +338,20 @@ fn steps(op: &FxOp) -> Vec<Step> {
                 ht_k[2],
                 0.0,
             ];
-            out.push(step(OP_LUMETRI, [*creative_on as u32, *vignette_on as u32, 0, 0], &p));
+            let mut basic = step(OP_LUMETRI, [*creative_on as u32, *vignette_on as u32, input_lut.is_some() as u32, 0], &p);
+            if let Some(l) = input_lut {
+                basic.data = lut_data(l);
+            }
+            out.push(basic);
+            if let Some(a) = advanced {
+                out.push(advanced_step(a));
+            }
+            if let Some(h) = hsl {
+                out.extend(hsl_steps(h));
+            }
+            if let Some((rx, ry, amount)) = sharpen {
+                out.extend(unsharp(rx, ry, *amount, 0.0));
+            }
         }
     }
     out

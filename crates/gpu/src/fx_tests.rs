@@ -513,65 +513,181 @@ fn hostile_parameters_are_bounded() {
     assert!(c.effect_image(&frame, &LayerFx { size: (1 << 20, 4), decimation: 1, ops: vec![FxOp::BlackWhite] }).is_none());
 }
 
+/// Where the GPU stage takes Lumetri: every SDR section (Basic, Input LUT, Creative incl. looks,
+/// look LUTs and Sharpen, Curves, Color Wheels, HSL Secondary, Vignette); not HDR grades, LUTs
+/// beyond its size limits, a Denoise radius beyond its window, or non-finite numbers.
 #[test]
-fn lumetri_unsupported_sections_fall_back() {
+fn lumetri_gpu_boundary() {
     let (w, h) = (40usize, 24usize);
-    // sharpen > 0 and input LUT (explicitly required by brief)
-    let e = effect("lumetri", &[("sharpen", fl(10.0)), ("input_lut", ParamValue::Text("custom.cube".into()))]);
-    let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()), "sharpen > 0 and input_lut must fall back to CPU");
+    let gpu = |e: &EffectInstance, c: &FxCtx| FxOp::eval(e, c, w, h).is_some_and(|o| o.gpu_ok());
+    let c1 = cx(Tick::ZERO, 1.0);
+    for (what, e) in [
+        ("sharpen", effect("lumetri", &[("sharpen", fl(20.0))])),
+        ("input LUT", effect("lumetri", &[("input_lut", ParamValue::Text("builtin:slog3-sgamut3cine-to-rec709".into()))])),
+        ("unresolvable input LUT (none applied)", effect("lumetri", &[("input_lut", ParamValue::Text("custom.cube".into()))])),
+        ("look LUT", effect("lumetri", &[("look_lut", ParamValue::Text("builtin:look-teal-orange".into()))])),
+        ("procedural look", effect("lumetri", &[("look", ch(1))])),
+        ("luma curve", effect("lumetri", &[("curve_luma", ParamValue::Curve(vec![[0.0, 0.1], [1.0, 0.9]]))])),
+        ("hue vs sat", effect("lumetri", &[("hue_vs_sat", ParamValue::Curve(vec![[0.5, 0.5]]))])),
+        ("wheel", effect("lumetri", &[("wheel_shadows", pt(0.5, 0.0))])),
+        ("wheel lightness", effect("lumetri", &[("wheel_midtones_l", fl(20.0))])),
+        ("HSL Secondary", effect("lumetri", &[("hsl_on", ParamValue::Bool(true)), ("hsl_denoise", fl(100.0)), ("hsl_blur", fl(100.0))])),
+        ("heavy grade", heavy_grade()),
+    ] {
+        assert!(gpu(&e, &c1), "{what} must run on the GPU");
+    }
+    // HDR grades stay on the CPU
+    let mut hdr = cx(Tick::ZERO, 1.0);
+    hdr.working = filmcraft_color::WorkingSpace::Rec2100Pq;
+    assert!(!gpu(&effect("lumetri", &[]), &hdr));
+    // a Denoise window larger than the shader's (px_scale 2: radius 6)
+    let denoise = effect("lumetri", &[("hsl_on", ParamValue::Bool(true)), ("hsl_denoise", fl(100.0))]);
+    assert!(gpu(&denoise, &cx(Tick::ZERO, 1.0)));
+    assert!(!gpu(&denoise, &cx(Tick::ZERO, 2.0)));
+    // LUT size limits
+    let lut = |n: usize| filmcraft_color::Lut { title: String::new(), shaper: None, cube: Some(filmcraft_color::Lut3d::identity(n)) };
+    assert!(filmcraft_render::gpufx::gpu_lut_ok(&lut(filmcraft_render::gpufx::GPU_LUT_MAX_CUBE)));
+    assert!(!filmcraft_render::gpufx::gpu_lut_ok(&lut(filmcraft_render::gpufx::GPU_LUT_MAX_CUBE + 1)));
+    // non-finite numbers in the new sections are left to the CPU
+    for e in [
+        effect("lumetri", &[("hsl_on", ParamValue::Bool(true)), ("hsl_hue", fl(f64::NAN))]),
+        effect("lumetri", &[("wheel_midtones_l", fl(f64::INFINITY))]),
+        effect("lumetri", &[("look", ch(2)), ("look_intensity", fl(f64::NAN))]),
+    ] {
+        assert!(!gpu(&e, &c1), "{e:?}");
+    }
+}
 
-    // sharpen alone
-    let e = effect("lumetri", &[("sharpen", fl(20.0))]);
-    let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
+/// The GPU, or None (skip) without an adapter; with `FILMCRAFT_REQUIRE_GPU=1` (a machine that has
+/// one) a missing adapter fails the test instead.
+fn gpu_or_skip(what: &str) -> Option<(wgpu::Device, wgpu::Queue)> {
+    let d = device();
+    if d.is_none() {
+        assert!(std::env::var("FILMCRAFT_REQUIRE_GPU").as_deref() != Ok("1"), "FILMCRAFT_REQUIRE_GPU=1 but no GPU adapter for {what}");
+        eprintln!("SKIPPED {what}: no GPU adapter");
+    }
+    d
+}
 
-    // input_lut alone
-    let e = effect("lumetri", &[("input_lut", ParamValue::Text("test.cube".into()))]);
-    let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
+/// The demo scene (a rendered landscape: sky gradients, sun, water, foliage) as linear
+/// premultiplied RGBA in half-float-representable values: the real-picture test image.
+fn demo_picture(w: u32, h: u32) -> Vec<f32> {
+    let rgba = filmcraft_media::generators::render(
+        &filmcraft_media::Generator::Demo(filmcraft_media::DemoScene::OceanSunset),
+        w,
+        h,
+        1.0,
+        24,
+        filmcraft_time::FrameRate::FPS_24,
+    );
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|p| {
+            let a = f32::from(p[3]) / 255.0;
+            [0, 1, 2].map(|k| filmcraft_color::srgb_to_linear(f32::from(p[k]) / 255.0) * a).into_iter().chain([a])
+        })
+        .map(half)
+        .collect()
+}
 
-    // look_lut
-    let e = effect("lumetri", &[("look_lut", ParamValue::Text("look.cube".into()))]);
-    let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
+/// (max |cpu − gpu| over the linear premultiplied values, max difference of the 8-bit sRGB codes
+/// of the straight colour).
+fn diff_float_and_8bit(cpu: &[f32], gpu: &[f32]) -> (f32, u8) {
+    assert_eq!(cpu.len(), gpu.len());
+    let code = |p: &[f32; 4], k: usize| {
+        let v = if p[3] > 1e-6 { p[k] / p[3] } else { 0.0 };
+        (filmcraft_color::linear_to_srgb(v.clamp(0.0, 1.0)) * 255.0).round() as i32
+    };
+    let (mut fl, mut b8) = (0f32, 0i32);
+    for (a, b) in cpu.as_chunks::<4>().0.iter().zip(gpu.as_chunks::<4>().0.iter()) {
+        for k in 0..4 {
+            assert!(b[k].is_finite(), "GPU value not finite: {b:?}");
+            fl = fl.max((a[k] - b[k]).abs());
+        }
+        for k in 0..3 {
+            b8 = b8.max((code(a, k) - code(b, k)).abs());
+        }
+    }
+    (fl, b8.min(255) as u8)
+}
 
-    // look > 0
-    let e = effect("lumetri", &[("look", ch(1))]);
-    let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
-
-    // curve_luma modified
-    let e = effect("lumetri", &[("curve_luma", ParamValue::Curve(vec![[0.0, 0.1], [1.0, 0.9]]))]);
-    let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
-
-    // hue_vs_sat non-empty
-    let e = effect("lumetri", &[("hue_vs_sat", ParamValue::Curve(vec![[0.5, 0.5]]))]);
-    let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
-
-    // wheel offset
-    let e = effect("lumetri", &[("wheel_shadows", pt(0.5, 0.0))]);
-    let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
-
-    // wheel lightness
-    let e = effect("lumetri", &[("wheel_midtones_l", fl(20.0))]);
-    let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
-
-    // HSL secondary on
-    let e = effect("lumetri", &[("hsl_on", ParamValue::Bool(true))]);
-    let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
-
-    // HDR working space
-    let e = effect("lumetri", &[]);
-    let mut cx_hdr = cx(Tick::ZERO, 1.0);
-    cx_hdr.working = filmcraft_color::WorkingSpace::Rec2100Pq;
-    let op = FxOp::eval(&e, &cx_hdr, w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
+/// Each Lumetri section (and the heavy grade) on the GPU against its CPU reference
+/// (`FxOp::apply`), on the synthetic chart (hue / lightness sweeps, super-whites, partial
+/// alpha) and on the demo scene: max |difference| ≤ 1/255 on the linear float values and ≤ 1
+/// code on the 8-bit sRGB values.
+#[test]
+fn lumetri_sections_match_cpu() {
+    let Some((dev, q)) = gpu_or_skip("lumetri_sections_match_cpu") else { return };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let curve = |v: &[[f32; 2]]| ParamValue::Curve(v.to_vec());
+    let on = ParamValue::Bool(true);
+    let cases: Vec<(&str, Vec<(&str, ParamValue)>)> = vec![
+        ("luma curve", vec![("curve_luma", curve(&[[0.0, 0.05], [0.3, 0.2], [0.7, 0.85], [1.0, 0.95]]))]),
+        (
+            "RGB curves",
+            vec![
+                ("curve_red", curve(&[[0.0, 0.1], [1.0, 0.9]])),
+                ("curve_green", curve(&[[0.0, 0.0], [0.5, 0.6], [1.0, 1.0]])),
+                ("curve_blue", curve(&[[0.2, 0.0], [1.0, 1.0]])),
+            ],
+        ),
+        ("hue vs sat", vec![("hue_vs_sat", curve(&[[0.0, 0.8], [0.33, 0.2], [0.66, 0.6]]))]),
+        ("hue vs hue", vec![("hue_vs_hue", curve(&[[0.1, 0.6], [0.5, 0.4], [0.9, 0.55]]))]),
+        ("hue vs luma", vec![("hue_vs_luma", curve(&[[0.0, 0.7], [0.5, 0.3]]))]),
+        ("luma vs sat", vec![("luma_vs_sat", curve(&[[0.2, 0.2], [0.8, 0.8]]))]),
+        ("sat vs sat", vec![("sat_vs_sat", curve(&[[0.1, 0.7], [0.9, 0.3]]))]),
+        ("wheels", vec![("wheel_shadows", pt(0.4, -0.3)), ("wheel_midtones", pt(-0.2, 0.5)), ("wheel_highlights", pt(0.3, 0.3))]),
+        ("wheel lightness", vec![("wheel_shadows_l", fl(-30.0)), ("wheel_midtones_l", fl(25.0)), ("wheel_highlights_l", fl(40.0))]),
+        ("look 1", vec![("look", ch(1)), ("look_intensity", fl(100.0))]),
+        ("look 2", vec![("look", ch(2)), ("look_intensity", fl(70.0))]),
+        ("look 3", vec![("look", ch(3))]),
+        ("look 4", vec![("look", ch(4))]),
+        ("look 5", vec![("look", ch(5))]),
+        ("look 6", vec![("look", ch(6))]),
+        ("look 7", vec![("look", ch(7))]),
+        ("look 8", vec![("look", ch(8))]),
+        ("look LUT", vec![("look_lut", ParamValue::Text("builtin:look-teal-orange".into())), ("look_intensity", fl(85.0))]),
+        ("input LUT", vec![("input_lut", ParamValue::Text("builtin:slog3-sgamut3cine-to-rec709".into())), ("contrast", fl(10.0))]),
+        ("sharpen", vec![("sharpen", fl(60.0))]),
+        ("negative sharpen", vec![("sharpen", fl(-50.0))]),
+        (
+            "HSL correct",
+            vec![
+                ("hsl_on", on.clone()),
+                ("hsl_hue", fl(200.0)),
+                ("hsl_hue_range", fl(90.0)),
+                ("hsl_sat", fl(150.0)),
+                ("hsl_temp", fl(30.0)),
+                ("hsl_tint", fl(-20.0)),
+                ("hsl_hue_shift", fl(20.0)),
+            ],
+        ),
+        ("HSL denoise + blur", vec![("hsl_on", on.clone()), ("hsl_hue", fl(30.0)), ("hsl_denoise", fl(100.0)), ("hsl_blur", fl(40.0)), ("hsl_sat", fl(40.0))]),
+        ("HSL denoise only", vec![("hsl_on", on.clone()), ("hsl_hue", fl(120.0)), ("hsl_denoise", fl(30.0))]),
+        ("HSL show mask grey", vec![("hsl_on", on.clone()), ("hsl_show_mask", ch(1)), ("hsl_blur", fl(20.0))]),
+        ("HSL show mask black", vec![("hsl_on", on.clone()), ("hsl_show_mask", ch(2))]),
+        ("HSL show mask white", vec![("hsl_on", on.clone()), ("hsl_show_mask", ch(3)), ("hsl_denoise", fl(60.0))]),
+    ];
+    let mut failures = Vec::new();
+    for (picture_name, (w, h), px) in [("chart", (67u32, 41u32), picture(67, 41)), ("demo scene", (320, 180), demo_picture(320, 180))] {
+        let frame = VideoFrame::rgba_f32(w, h, px.clone());
+        let mut all: Vec<(String, EffectInstance)> = cases.iter().map(|(n, p)| (n.to_string(), effect("lumetri", p))).collect();
+        all.push(("heavy grade".into(), heavy_grade()));
+        for (name, e) in all {
+            let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w as usize, h as usize).expect("a Lumetri op");
+            assert!(op.gpu_ok(), "{name}: not GPU-capable");
+            let mut cpu = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.clone() };
+            op.apply(&mut cpu);
+            let (_, _, gpu) = c.effect_image(&frame, &LayerFx { size: (w, h), decimation: 1, ops: vec![op] }).expect("effect image");
+            let (fl_diff, b8) = diff_float_and_8bit(&cpu.px, &gpu);
+            eprintln!("{picture_name} / {name}: max float diff {fl_diff:.2e}, max 8-bit diff {b8}");
+            if fl_diff > 1.0 / 255.0 || b8 > 1 {
+                failures.push(format!("{picture_name} / {name}: float {fl_diff:.2e}, 8-bit {b8}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "GPU Lumetri differs from the CPU:\n{}", failures.join("\n"));
 }
 
 /// Layers with effect chains in a composited plan — YUV and RGBA sources, a decimated working
@@ -778,5 +894,80 @@ fn effect_source_integer_decimation_preserves_cpu_box_oracle() {
             let (worst, flips) = compare(&cpu, &gpu);
             assert!(worst <= EXACT && flips == 0.0, "{w}x{h} n{n} source box: {worst}, {flips}");
         }
+    }
+}
+
+/// A heavy Lumetri grade (Basic, Curves, Hue vs Sat, Color Wheels, HSL Secondary with Denoise and
+/// Blur, a look LUT, Sharpen): what the timings in the M8c report measure.
+fn heavy_grade() -> EffectInstance {
+    effect(
+        "lumetri",
+        &[
+            ("exposure", fl(0.3)),
+            ("contrast", fl(25.0)),
+            ("saturation", fl(110.0)),
+            ("curve_luma", ParamValue::Curve(vec![[0.0, 0.0], [0.25, 0.18], [0.75, 0.85], [1.0, 1.0]])),
+            ("curve_red", ParamValue::Curve(vec![[0.0, 0.02], [0.5, 0.55], [1.0, 1.0]])),
+            ("hue_vs_sat", ParamValue::Curve(vec![[0.0, 0.5], [0.33, 0.7], [0.66, 0.4]])),
+            ("wheel_shadows", pt(0.3, -0.2)),
+            ("wheel_midtones", pt(-0.1, 0.2)),
+            ("wheel_highlights", pt(0.2, 0.1)),
+            ("wheel_midtones_l", fl(10.0)),
+            ("hsl_on", ParamValue::Bool(true)),
+            ("hsl_hue", fl(30.0)),
+            ("hsl_hue_range", fl(60.0)),
+            ("hsl_denoise", fl(50.0)),
+            ("hsl_blur", fl(30.0)),
+            ("hsl_sat", fl(130.0)),
+            ("look_lut", ParamValue::Text("builtin:look-teal-orange".into())),
+            ("look_intensity", fl(80.0)),
+            ("sharpen", fl(30.0)),
+        ],
+    )
+}
+
+/// Milliseconds per frame of [`heavy_grade`] at 1080p and 4K: the CPU render (`effects::apply`)
+/// and, where the plan hands the grade to the GPU, the effect stage (upload, passes, read-back).
+/// `cargo test -p filmcraft-gpu --release -- --ignored lumetri_heavy_grade_timings --nocapture`
+#[test]
+#[ignore = "timing run for the report, not a check"]
+fn lumetri_heavy_grade_timings() {
+    let e = heavy_grade();
+    let gpu = device();
+    for (w, h) in [(1920u32, 1080u32), (3840, 2160)] {
+        let px = picture(w, h);
+        let c = cx(Tick::ZERO, 1.0);
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let cpu: Vec<f64> = (0..3)
+            .map(|_| {
+                let mut img = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.clone() };
+                let t0 = std::time::Instant::now();
+                filmcraft_render::effects::apply(&mut img, &e, &c);
+                t0.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect();
+        let op = FxOp::eval(&e, &c, w as usize, h as usize).expect("a Lumetri op");
+        let gpu_ms = match (&gpu, op.gpu_ok()) {
+            (Some((dev, q)), true) => {
+                let mut comp = GpuCompositor::new(dev, q);
+                let frame = VideoFrame::rgba_f32(w, h, px.clone());
+                let fx = LayerFx { size: (w, h), decimation: 1, ops: vec![op.clone()] };
+                let _ = comp.effect_image(&frame, &fx);
+                let runs: Vec<f64> = (0..5)
+                    .map(|_| {
+                        let t0 = std::time::Instant::now();
+                        let _ = comp.effect_image(&frame, &fx);
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    })
+                    .collect();
+                format!("{:.1} ms", median(runs))
+            }
+            (None, _) => "no GPU adapter".into(),
+            (_, false) => "not GPU-capable (rendered on the CPU)".into(),
+        };
+        eprintln!("heavy grade {w}x{h}: CPU {:.1} ms, GPU {gpu_ms}", median(cpu));
     }
 }

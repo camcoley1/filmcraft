@@ -195,8 +195,31 @@ pub enum FxOp {
         vround: f32,
         vfeather: f32,
         aspect: f32,
+        /// Basic ▸ Input LUT, applied first.
+        input_lut: Option<std::sync::Arc<filmcraft_color::Lut>>,
+        /// Creative look, Color Wheels and Curves (after Basic and the vignette).
+        advanced: Option<Box<crate::effects::LumetriAdvanced>>,
+        /// HSL Secondary (after the curves).
+        hsl: Option<Box<crate::effects::HslSecondary>>,
+        /// Creative ▸ Sharpen, last: an Unsharp Mask (box radii along x and y, amount).
+        sharpen: Option<(Vec<u32>, Vec<u32>, f32)>,
+        /// The GPU stage covers this grade: SDR, and LUTs / a Denoise radius within its limits.
         gpu_capable: bool,
     },
+}
+
+/// Largest 3D LUT cube (entries per side) the GPU stage takes; larger cubes render on the CPU.
+pub const GPU_LUT_MAX_CUBE: usize = 65;
+/// Largest 1D LUT (shaper) the GPU stage takes.
+pub const GPU_LUT_MAX_SHAPER: usize = 4096;
+/// Largest HSL Secondary Denoise (median) radius the GPU stage takes: a `(2r+1)²` window sorted
+/// per pixel, so the work per pass stays bounded.
+pub const GPU_MEDIAN_MAX_RADIUS: usize = 3;
+
+/// Whether the GPU stage takes `lut` (sizes within its limits, a usable cube).
+pub fn gpu_lut_ok(lut: &filmcraft_color::Lut) -> bool {
+    lut.cube.as_ref().is_none_or(|c| (2..=GPU_LUT_MAX_CUBE).contains(&c.size) && c.data.len() == c.size * c.size * c.size)
+        && lut.shaper.as_ref().is_none_or(|s| (2..=GPU_LUT_MAX_SHAPER).contains(&s.data.len()))
 }
 
 /// Effect ids [`FxOp::eval`] understands (the GPU-capable standard effects).
@@ -502,34 +525,23 @@ impl FxOp {
                 FxOp::VideoLimiter { max: 1.0 + clip_level / 100.0, comp: comp_val, axis, warn, warning_color: wc }
             }
             "lumetri" => {
-                use crate::effects::{curve_param, is_identity_curve, wheel_rgb};
                 let (basic_on, creative_on, vignette_on) = (on(e, "basic_on"), on(e, "creative_on"), on(e, "vignette_on"));
                 let gs = grade_space(e, cx, "hdr_white");
                 let is_hdr = gs.is_hdr();
-                let has_input_lut = basic_on && !text(e, "input_lut").is_empty();
-                let has_look_lut = creative_on && !text(e, "look_lut").is_empty();
-                let look = if creative_on && !has_look_lut { choice(e, "look") } else { 0 };
+                let input_lut = if basic_on { crate::luts::resolve(cx.project, text(e, "input_lut")) } else { None };
+                let advanced = crate::effects::LumetriAdvanced::eval(e, cx).map(Box::new);
+                let hsl = crate::effects::HslSecondary::eval(e, cx).map(Box::new);
                 let sharpen = if creative_on { f(e, "sharpen", cx) / 100.0 } else { 0.0 };
-
-                let curves_on = on(e, "curves_on");
-                let has_curves = curves_on && {
-                    ["curve_luma", "curve_red", "curve_green", "curve_blue"].iter().any(|id| curve_param(e, id).is_some_and(|c| !is_identity_curve(&c)))
-                        || ["hue_vs_sat", "hue_vs_hue", "hue_vs_luma", "luma_vs_sat", "sat_vs_sat"]
-                            .iter()
-                            .any(|id| curve_param(e, id).is_some_and(|c| !c.is_empty()))
-                };
-
-                let wheels_on = on(e, "wheels_on");
-                let has_wheels = wheels_on && {
-                    let v2 = |id: &str| e.param(id).map(|p| p.vec2_at(cx.t)).unwrap_or_default();
-                    let (ws, wm, wh) = (wheel_rgb(v2("wheel_shadows")), wheel_rgb(v2("wheel_midtones")), wheel_rgb(v2("wheel_highlights")));
-                    let (ls, lm, lh) = (f(e, "wheel_shadows_l", cx) / 100.0, f(e, "wheel_midtones_l", cx) / 100.0, f(e, "wheel_highlights_l", cx) / 100.0);
-                    ws.iter().chain(&wm).chain(&wh).any(|v| v.abs() > 1e-5) || (ls.abs() + lm.abs() + lh.abs() > 1e-5)
-                };
-
-                let hsl_on = b(e, "hsl_on");
-
-                let gpu_capable = !is_hdr && !has_input_lut && !has_look_lut && look == 0 && sharpen.abs() <= 1e-3 && !has_curves && !has_wheels && !hsl_on;
+                let sharpen = (sharpen.abs() > 1e-3).then(|| {
+                    let r = 1.2 * cx.px_scale.max(0.35);
+                    let (rx, ry) = gaussian_boxes(w, h, r, r);
+                    (rx, ry, sharpen.max(-1.0))
+                });
+                // HDR stays on the CPU (its grading signals need the PQ / HLG transfer per pixel)
+                let gpu_capable = !is_hdr
+                    && input_lut.as_deref().is_none_or(gpu_lut_ok)
+                    && advanced.as_ref().and_then(|a| a.look_lut.as_deref()).is_none_or(gpu_lut_ok)
+                    && hsl.as_ref().and_then(|h| h.median_radius()).is_none_or(|r| r <= GPU_MEDIAN_MAX_RADIUS);
 
                 let bf = |id: &str| if basic_on { f(e, id, cx) } else { 0.0 };
                 let temp = bf("temperature") / 100.0;
@@ -572,6 +584,10 @@ impl FxOp {
                     vround,
                     vfeather,
                     aspect,
+                    input_lut,
+                    advanced,
+                    hsl,
+                    sharpen,
                     gpu_capable,
                 }
             }
@@ -620,13 +636,47 @@ impl FxOp {
             FxOp::AlphaAdjust { opacity, .. } => opacity.is_finite(),
             FxOp::Vignette { amount, midpoint, roundness, feather, target } => fin(&[*amount, *midpoint, *roundness, *feather]) && fin(target),
             FxOp::VideoLimiter { max, comp, axis, warning_color, .. } => *axis <= 3 && max.is_finite() && comp.is_finite() && fin(warning_color),
-            FxOp::Lumetri { gains, exposure, contrast, hl, sh, wh, bl, sat, faded, vib, st, ht, va, vmid, vround, vfeather, aspect, gpu_capable, .. } => {
+            FxOp::Lumetri {
+                gains,
+                exposure,
+                contrast,
+                hl,
+                sh,
+                wh,
+                bl,
+                sat,
+                faded,
+                vib,
+                st,
+                ht,
+                va,
+                vmid,
+                vround,
+                vfeather,
+                aspect,
+                advanced,
+                hsl,
+                sharpen,
+                gpu_capable,
+                ..
+            } => {
+                let advanced_ok = advanced.as_deref().is_none_or(|a| {
+                    a.look_k.is_finite()
+                        && a.wheels.as_ref().is_none_or(|w| w.rgb.iter().all(|c| fin(c)) && fin(&w.light))
+                        && a.curves.iter().flatten().all(|c| fin(c))
+                });
+                let hsl_ok = hsl
+                    .as_deref()
+                    .is_none_or(|h| fin(&[h.hc, h.hr, h.smin, h.lmin, h.lmax, h.soft, h.htemp, h.htint, h.hsat, h.hshift, h.denoise, h.blur, h.px_scale]));
                 *gpu_capable
                     && fin(gains)
                     && fin(&[*exposure, *contrast, *hl, *sh, *wh, *bl, *sat, *faded, *vib])
                     && fin(st)
                     && fin(ht)
                     && fin(&[*va, *vmid, *vround, *vfeather, *aspect])
+                    && advanced_ok
+                    && hsl_ok
+                    && sharpen.as_ref().is_none_or(|s| s.2.is_finite())
             }
         }
     }
@@ -942,6 +992,10 @@ impl FxOp {
                 vround,
                 vfeather,
                 aspect,
+                input_lut,
+                advanced,
+                hsl,
+                sharpen,
                 ..
             } => {
                 let gains = *gains;
@@ -950,6 +1004,11 @@ impl FxOp {
                 let (vignette_on, va, vmid, vround, vfeather, aspect) = (*vignette_on, *va, *vmid, *vround, *vfeather, *aspect);
                 let (w, h) = (img.w as f32, img.h as f32);
                 img.map_rgb(|c, x, y| {
+                    // Basic ▸ Input LUT on the display-encoded signal (0…1)
+                    let c = match input_lut {
+                        Some(l) => dec(l.apply(enc(c).map(|q| q.clamp(0.0, 1.0)))),
+                        None => c,
+                    };
                     // white balance + exposure in linear light
                     let lin = [c[0] * gains[0] * exposure, c[1] * gains[1] * exposure, c[2] * gains[2] * exposure];
                     let mut v = enc(lin);
@@ -1003,6 +1062,15 @@ impl FxOp {
                     }
                     dec(v)
                 });
+                if let Some(a) = advanced {
+                    a.apply(img);
+                }
+                if let Some(h) = hsl {
+                    h.apply(img);
+                }
+                if let Some((rx, ry, amount)) = sharpen {
+                    crate::effects::unsharp_boxes(img, rx, ry, *amount, 0.0);
+                }
             }
         }
     }
