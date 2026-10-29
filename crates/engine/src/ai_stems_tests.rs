@@ -326,11 +326,22 @@ fn a_linked_pair_is_split_once_and_stems_outlive_the_cache() {
     }
 }
 
+/// The channel counts of the `source.wav` each [`per_channel`] job received (its own record: tests
+/// run in parallel).
+static CHANNELS: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+
+fn per_channel(req: &JobRequest) -> Vec<(String, Vec<u8>)> {
+    if let Ok(b) = std::fs::read(&req.inputs[0]) {
+        CHANNELS.lock().unwrap_or_else(|e| e.into_inner()).push(u16::from_le_bytes(b[22..24].try_into().unwrap()));
+    }
+    stems(req)
+}
+
 /// Dual mono split to two tracks (channel 1 on one clip, channel 2 on another, same range): each
 /// clip gets its stems; a video clip linked to one of them adds no job.
 #[test]
 fn clips_playing_other_channels_of_the_same_range_each_get_stems() {
-    let mut f = helper("st-dual", stems);
+    let mut f = helper("st-dual", per_channel);
     f.s.ai.media_root = Some(f.cache.join("media"));
     let seq = f.s.state.active_sequence.unwrap();
     let (v, item) = (f.clip, f.item);
@@ -355,7 +366,7 @@ fn clips_playing_other_channels_of_the_same_range_each_get_stems() {
     assert_eq!(f.helper.started().len(), 2, "one job per channel, none for the linked video");
     assert_eq!(f.s.project.items.values().filter(|i| i.name.ends_with(".wav")).count(), 8);
     // each job decoded one channel
-    assert_eq!(*SOURCE.lock().unwrap(), Some((44_100, 1, 2 * 44_100 * 4)));
+    assert_eq!(*CHANNELS.lock().unwrap(), [1, 1]);
 }
 
 /// The job report points at the stems where they now live.
