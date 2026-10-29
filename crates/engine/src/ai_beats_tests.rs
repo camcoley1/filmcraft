@@ -1,14 +1,14 @@
 //! `ai.beatGrid` and `ai.musicFit` against the fake helper (a fixed 120 BPM grid: beats every
 //! 0.5 s from 0.25 s of the decoded input, a downbeat every fourth), and `fit_plan` itself.
 
-use filmcraft_project::{ClipId, Label};
+use filmcraft_project::{ClipId, ItemId, Label, TrackKind};
 use filmcraft_sidecar::JobRequest;
 use filmcraft_sidecar::fake::{ResultMode, Script};
-use filmcraft_time::{TICKS_PER_SECOND, Tick};
+use filmcraft_time::{TICKS_PER_SECOND, Tick, TimeRange};
 use serde_json::json;
 
 use super::super::enhance::tests::with_audio;
-use super::super::tests::{Fixture, snapshot};
+use super::super::tests::{Fixture, fixture, snapshot};
 use super::fit_plan;
 
 const S: i64 = TICKS_PER_SECOND;
@@ -157,4 +157,104 @@ fn music_fit_refuses_what_it_cannot_fit() {
     let e = g.s.execute("ai.musicFit", json!({"seconds": 12.0, "wait": true})).unwrap_err().to_string();
     assert!(e.contains("not free"), "{e}");
     assert_eq!(snapshot(&g.s), before);
+}
+
+/// Beats every 0.51 s from 0.25 s of the decoded input, a downbeat every fourth: a bar is 2.04 s.
+fn odd_grid(req: &JobRequest) -> Vec<(String, Vec<u8>)> {
+    let len = std::fs::metadata(&req.inputs[0]).map(|m| (m.len().saturating_sub(44)) as f64 / 4.0 / 22_050.0).unwrap_or(10.0);
+    let beats: Vec<f64> = (0..).map(|k| 0.25 + 0.51 * k as f64).take_while(|t| *t < len).collect();
+    let downbeats: Vec<f64> = beats.iter().copied().step_by(4).collect();
+    let v = json!({"tempo": 60.0 / 0.51, "beats": beats, "downbeats": downbeats, "beatsPerBar": 4, "downbeatsEstimated": true});
+    vec![("beats.json".into(), serde_json::to_vec(&v).unwrap())]
+}
+
+/// The loops below jump back four bars (8.16 s): this tone is half a cycle off after that, so a
+/// hard cut flips its phase.
+const TONE: f64 = 3570.5 / 8.16;
+
+/// `seconds` of a 48 kHz stereo 16-bit sine at [`TONE`] Hz, half scale.
+fn sine_wav(path: &std::path::Path, seconds: u32) {
+    let n = 48_000 * seconds as usize;
+    let data = (n * 4) as u32;
+    let mut b = Vec::new();
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&(36 + data).to_le_bytes());
+    b.extend_from_slice(b"WAVEfmt ");
+    for v in [
+        16u32.to_le_bytes().as_slice(),
+        &1u16.to_le_bytes(),
+        &2u16.to_le_bytes(),
+        &48_000u32.to_le_bytes(),
+        &(192_000u32).to_le_bytes(),
+        &4u16.to_le_bytes(),
+        &16u16.to_le_bytes(),
+    ] {
+        b.extend_from_slice(v);
+    }
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&data.to_le_bytes());
+    for i in 0..n {
+        let v = ((2.0 * std::f64::consts::PI * TONE * i as f64 / 48_000.0).sin() * 16_000.0) as i16;
+        b.extend_from_slice(&v.to_le_bytes());
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(path, b).unwrap();
+}
+
+/// The largest sample-to-sample step of the sequence's mix (left) in 10 ms around `t`.
+fn largest_step(f: &Fixture, t: Tick) -> f32 {
+    let seq = f.s.state.active_sequence.unwrap();
+    let q = f.s.project.sequence(seq).unwrap();
+    let provider = f.s.media.provider(f.s.project.clone(), f.s.services.clone());
+    let at = t.0 / (TICKS_PER_SECOND / 48_000);
+    let b = filmcraft_render::audio::mix_sequence(&f.s.project, q, at - 240, 480, &provider);
+    b.channels[0].windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max)
+}
+
+/// The loop joins of a music fit are crossfaded: a sine whose bars are not whole cycles plays
+/// across every join with no larger step than anywhere else (without the crossfades it jumps).
+#[test]
+fn music_fit_loop_joins_do_not_click() {
+    let mut f = fixture("bt-click", Script { features: vec!["beats".into()], result: ResultMode::Custom(odd_grid), ..Default::default() });
+    f.s.ai.media_root = Some(f.cache.join("media"));
+    std::fs::create_dir_all(&f.cache).unwrap();
+    let wav = f.cache.join("tone.wav");
+    sine_wav(&wav, 10);
+    let item = ItemId(f.s.execute("file.import", json!({"paths": [wav.to_string_lossy()]})).unwrap()["items"][0].as_u64().unwrap());
+    let seq = f.s.state.active_sequence.unwrap();
+    let clip =
+        f.s.edit("Place", |pr, _| {
+            let r = pr.sequence(seq).unwrap().settings.frame_rate;
+            let it = pr.make_track_item(item, TrackKind::Audio, Tick::ZERO, TimeRange::new(Tick(S), Tick(4 * S)), r).unwrap();
+            let id = it.id;
+            pr.sequence_mut(seq).unwrap().audio_tracks[0].items.push(it);
+            Ok(id)
+        })
+        .unwrap();
+    f.s.state.selection = vec![clip];
+    f.s.execute("ai.musicFit", json!({"seconds": 20.0, "wait": true})).unwrap();
+    let q = f.s.project.sequence(seq).unwrap().clone();
+    let (track, _) = q.find_item(clip).unwrap();
+    let t = q.track(track).unwrap();
+    let joins: Vec<Tick> = t.items.iter().skip(1).map(|p| p.start).collect();
+    assert!(joins.len() >= 2, "looped: {}", t.items.len());
+    assert_eq!(t.transitions.len(), joins.len(), "one crossfade per join");
+    let frame = q.settings.frame_rate.tick_of(1);
+    for x in &t.transitions {
+        assert_eq!((x.effect.effect.as_str(), x.duration), ("constant_power", frame));
+    }
+    // a steady sine steps by at most 2 pi f / rate of its amplitude
+    let normal = largest_step(&f, t.items[0].start + Tick(S));
+    for j in &joins {
+        let step = largest_step(&f, *j);
+        assert!(step <= normal * 1.5, "join at {} s steps by {step}, elsewhere {normal}", j.0 as f64 / S as f64);
+    }
+    // the same cuts without the crossfades click
+    f.s.edit("Hard cuts", |pr, _| {
+        pr.sequence_mut(seq).unwrap().audio_tracks[0].transitions.clear();
+        Ok(())
+    })
+    .unwrap();
+    let worst = joins.iter().map(|j| largest_step(&f, *j)).fold(0.0, f32::max);
+    assert!(worst > normal * 5.0, "hard cuts jump by {worst} (normal {normal})");
 }

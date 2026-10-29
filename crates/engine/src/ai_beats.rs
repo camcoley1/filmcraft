@@ -8,10 +8,12 @@
 //!   last `seconds`, ending on a bar line, as timeline edits only: it is trimmed, or looped by
 //!   putting further pieces of the same media after it (each from a downbeat to a downbeat), and
 //!   it may start on a later beat of its first bar so the length lands within half a beat of the
-//!   target. No new audio file is written. With `duck`, the pieces become Music with ducking
-//!   against Dialogue and `essentialSound.generateDucking` writes the ducking keyframes, all in the
-//!   same undo step ("Fit Music"). The clip must play forward at 100 %, without a frame hold, and
-//!   not be linked to video; the track after it must be free for the fitted length.
+//!   target. Each loop join gets a one-frame Constant Power crossfade
+//!   (`sequence.applyAudioTransition`) so it does not click. No new audio file is written. With
+//!   `duck`, the pieces become Music with ducking against Dialogue and
+//!   `essentialSound.generateDucking` writes the ducking keyframes, all in the same undo step
+//!   ("Fit Music"). The clip must play forward at 100 %, without a frame hold, and not be linked to
+//!   video; the track after it must be free for the fitted length.
 //!
 //! Beats are found in the clip's used range (`beatGrid`) or from its first source frame to the end
 //! of the media (`musicFit`, which may need what follows), decoded mono at 22.05 kHz on that
@@ -36,6 +38,9 @@ pub const RATE: u32 = 22_050;
 pub const MAX_SECONDS: f64 = 1200.0;
 const MAX_RESULT_BYTES: u64 = 16 << 20;
 const MAX_BEATS: usize = 20_000;
+/// Length of the crossfade on a music fit's loop joins: one frame (the shortest transition), so
+/// about 17 to 21 ms on each side of the cut at 24 to 30 fps.
+const JOIN_FRAMES: i64 = 1;
 
 fn target(s: &Session, c: ClipId, to_end: bool) -> std::result::Result<AudioTarget, Refused> {
     audio_target(s, c, RATE, 0.0, MAX_SECONDS, to_end)
@@ -301,6 +306,17 @@ fn apply_fit(s: &mut Session, pj: &super::PendingAi, beats: &[Tick], downbeats: 
             tr.items.sort_by_key(|o| o.start);
             Ok(ids)
         })?;
+        // a one-frame constant-power crossfade on each loop join, so the cut never clicks; the
+        // joins fall between frames (bar lengths are not whole frames), so the transition is put
+        // on the frame that holds the cut
+        let frame = s.project.sequence(seq).map(|q| q.settings.frame_rate.sane().tick_of(JOIN_FRAMES)).ok_or(EngineError::NoSequence)?;
+        for c in ids.iter().skip(1) {
+            let cut =
+                s.project.sequence(seq).and_then(|q| q.find_item(*c)).map(|(_, it)| it.start).ok_or_else(|| EngineError::Other("a piece is gone".into()))?;
+            let r = s.execute("sequence.applyAudioTransition", json!({"clip": c.0, "edge": "in", "effect": "constant_power", "frames": JOIN_FRAMES}))?;
+            let id = r.get("transition").and_then(Value::as_u64).ok_or_else(|| EngineError::Other("no crossfade was made".into()))?;
+            s.execute("sequence.setTransition", json!({"transition": id, "start": cut.0 - frame.0 / 2}))?;
+        }
         if duck {
             s.execute("essentialSound.generateDucking", json!({"clips": ids.iter().map(|c| c.0).collect::<Vec<_>>()}))?;
         }
