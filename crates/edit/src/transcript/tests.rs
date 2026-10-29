@@ -530,3 +530,96 @@ fn nested_sequence_words_are_mapped_through_both_offsets() {
     p2.sequence_mut(id).unwrap().audio_tracks[0].items.push(c);
     assert!(sequence_words_nested(p2.sequence(id).unwrap(), &tr, &|i| p2.sequence(i)).is_empty());
 }
+
+/// A project with an inner sequence holding the interview, and one outer sequence.
+fn nest(inner_start: f64, inner_src: f64, inner_dur: f64) -> (Project, ItemId, ItemId) {
+    let mut p = Project::new("t");
+    let settings = SequenceSettings { frame_rate: R, ..Default::default() };
+    let inner = p.new_sequence("inner", settings.clone(), 1, 1, None);
+    let outer = p.new_sequence("outer", settings, 1, 3, None);
+    p.sequence_mut(inner).unwrap().audio_tracks[0].items.push(clip(1, inner_start, inner_dur, inner_src));
+    (p, inner, outer)
+}
+
+fn nested_clip(id: u64, inner: ItemId, start: f64, dur: f64, src_in: f64) -> TrackItem {
+    let mut c = clip(id, start, dur, src_in);
+    c.item = inner;
+    c
+}
+
+#[test]
+fn duplicate_nested_tracks_add_no_words_and_upper_tracks_win() {
+    let (mut p, inner, outer) = nest(0.0, 0.0, 10.0);
+    // the same nested audio on A1 and A2: read once
+    for (t, id) in [(0, 10), (1, 11)] {
+        p.sequence_mut(outer).unwrap().audio_tracks[t].items.push(nested_clip(id, inner, 0.0, 10.0, 0.0));
+    }
+    let tr = transcripts();
+    let once = sequence_words_nested(p.sequence(outer).unwrap(), &tr, &|id| p.sequence(id));
+    let single = sequence_words(p.sequence(inner).unwrap(), &tr);
+    assert_eq!(once.len(), single.len());
+    assert!(once.iter().all(|w| w.track == 0));
+    // a transcribed direct clip above a nested one claims its range: the nested words under it go
+    let (mut p, inner, outer) = nest(0.0, 0.0, 10.0);
+    p.sequence_mut(outer).unwrap().audio_tracks[0].items.push(clip(10, 0.0, 10.0, 0.0));
+    p.sequence_mut(outer).unwrap().audio_tracks[1].items.push(nested_clip(11, inner, 0.0, 10.0, 0.0));
+    let words = sequence_words_nested(p.sequence(outer).unwrap(), &tr, &|id| p.sequence(id));
+    assert_eq!(words.len(), single.len());
+    assert!(words.iter().all(|w| w.track == 0), "only the upper track speaks");
+}
+
+#[test]
+fn nested_speed_maps_start_and_end_exactly() {
+    // inner is the interview at inner 0; the nest plays inner 2 s..6 s at double speed from outer 5 s
+    let (mut p, inner, outer) = nest(0.0, 0.0, 10.0);
+    let mut c = nested_clip(10, inner, 5.0, 2.0, 2.0);
+    c.speed = 2.0;
+    p.sequence_mut(outer).unwrap().audio_tracks[0].items.push(c);
+    let tr = transcripts();
+    let direct = sequence_words(p.sequence(inner).unwrap(), &tr);
+    let words = sequence_words_nested(p.sequence(outer).unwrap(), &tr, &|id| p.sequence(id));
+    assert!(!words.is_empty());
+    for w in &words {
+        let src = direct.iter().find(|d| d.index == w.index).unwrap();
+        let want_a = s(5.0) + Tick(((src.start.max(s(2.0)) - s(2.0)).0 as f64 / 2.0).round() as i64);
+        let want_b = s(5.0) + Tick(((src.end.min(s(6.0)) - s(2.0)).0 as f64 / 2.0).round() as i64);
+        assert_eq!((w.start, w.end), (want_a, want_b.max(want_a)), "word {}", w.index);
+        assert!(w.start >= s(5.0) && w.end <= s(7.0));
+    }
+}
+
+#[test]
+fn the_word_budget_is_counted_before_words_are_collected() {
+    let tr = transcripts();
+    let (mut p, inner, outer) = nest(0.0, 0.0, 10.0);
+    p.sequence_mut(outer).unwrap().audio_tracks[0].items.push(nested_clip(10, inner, 0.0, 10.0, 0.0));
+    p.sequence_mut(outer).unwrap().audio_tracks[1].items.push(clip(11, 0.0, 10.0, 0.0));
+    let all = sequence_words(p.sequence(inner).unwrap(), &tr).len();
+    assert!(all > 5);
+    for cap in [0, 1, 5, all - 1] {
+        let direct = sequence_words_budget(p.sequence(inner).unwrap(), &tr, None, cap);
+        assert_eq!(direct.len(), cap, "direct words stop at the cap");
+        let find = |id: ItemId| p.sequence(id);
+        let words = sequence_words_budget(p.sequence(outer).unwrap(), &tr, Some(&find), cap);
+        assert!(words.len() <= cap, "nested words stop at the cap too: {} > {cap}", words.len());
+    }
+}
+
+#[test]
+fn fan_out_of_nested_sequences_is_bounded() {
+    // four levels, 12 references to the next level in each: 12^4 reads without a bound
+    let mut p = Project::new("fan");
+    let settings = SequenceSettings { frame_rate: R, ..Default::default() };
+    let ids: Vec<ItemId> = (0..5).map(|i| p.new_sequence(&format!("s{i}"), settings.clone(), 1, 12, None)).collect();
+    p.sequence_mut(ids[4]).unwrap().audio_tracks[0].items.push(clip(1000, 0.0, 10.0, 0.0));
+    for level in 0..4 {
+        for t in 0..12 {
+            p.sequence_mut(ids[level]).unwrap().audio_tracks[t].items.push(nested_clip(100 * level as u64 + t as u64 + 1, ids[level + 1], 0.0, 10.0, 0.0));
+        }
+    }
+    let tr = transcripts();
+    let start = std::time::Instant::now();
+    let words = sequence_words_nested(p.sequence(ids[0]).unwrap(), &tr, &|id| p.sequence(id));
+    assert!(start.elapsed().as_secs() < 20, "{:?}", start.elapsed());
+    assert!(!words.is_empty());
+}

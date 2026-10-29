@@ -57,88 +57,116 @@ fn ticks(t: f64) -> Tick {
     Tick(t.round() as i64)
 }
 
+/// Most words one sequence transcript holds (more are left out).
+pub const MAX_SEQ_WORDS: usize = 2_000_000;
+/// Most nested sequences read for one sequence transcript.
+const MAX_NEST_READS: usize = 10_000;
+/// Deepest chain of nested sequences followed for speech.
+const MAX_NEST_DEPTH: usize = 4;
+
+/// What is left to collect: words (counted as they are taken) and nested-sequence reads.
+struct Budget {
+    words: usize,
+    reads: usize,
+}
+
+type Nested<'a> = &'a dyn Fn(ItemId) -> Option<&'a Sequence>;
+
 /// The sequence transcript: words of every transcribed clip on the audio tracks, in sequence
-/// time order (see the module docs for the rules).
+/// time order (see the module docs for the rules). At most [`MAX_SEQ_WORDS`] words.
 pub fn sequence_words(seq: &Sequence, transcripts: &Transcripts) -> Vec<SeqWord> {
+    sequence_words_budget(seq, transcripts, None, MAX_SEQ_WORDS)
+}
+
+/// [`sequence_words`], also reading audio clips that show a nested sequence (`nested` finds a
+/// sequence by item id): the nested sequence's words (by the same rules, recursively) are mapped
+/// through the clip's source in point, start and speed, so they sit where the nested audio plays,
+/// and follow the same track precedence as any clip: a range already served by a track above is
+/// not read again, so duplicate or lower nested tracks add no words. Follows at most four levels
+/// (a sequence that contains itself ends there) and 10 000 nested reads, and returns at most
+/// [`MAX_SEQ_WORDS`] words in all, counted before they are collected.
+pub fn sequence_words_nested<'a>(seq: &'a Sequence, transcripts: &Transcripts, nested: &'a dyn Fn(ItemId) -> Option<&'a Sequence>) -> Vec<SeqWord> {
+    sequence_words_budget(seq, transcripts, Some(nested), MAX_SEQ_WORDS)
+}
+
+fn sequence_words_budget<'a>(seq: &'a Sequence, transcripts: &Transcripts, nested: Option<Nested<'a>>, max_words: usize) -> Vec<SeqWord> {
+    let mut budget = Budget { words: max_words, reads: MAX_NEST_READS };
+    let mut out = collect_words(seq, transcripts, nested, 0, &mut budget, None);
+    out.sort_by_key(|w| (w.start, w.track));
+    out
+}
+
+/// The words of `seq` whose time overlaps `window` (all, with `None`).
+fn collect_words<'a>(
+    seq: &'a Sequence,
+    transcripts: &Transcripts,
+    nested: Option<Nested<'a>>,
+    depth: usize,
+    budget: &mut Budget,
+    window: Option<(Tick, Tick)>,
+) -> Vec<SeqWord> {
     let mut out: Vec<SeqWord> = Vec::new();
     // timeline ranges already served by a higher track's transcribed clips
     let mut claimed: Vec<TimeRange> = Vec::new();
+    let outside = |a: Tick, b: Tick| window.is_some_and(|(w0, w1)| b <= w0 || a >= w1);
     for (ti, track) in seq.audio_tracks.iter().enumerate() {
         let mut mine = Vec::new();
         for it in &track.items {
             if !it.enabled || it.reverse || it.frame_hold.is_some() || it.speed <= 0.0 {
                 continue;
             }
-            let Some(tr) = transcripts.get(&it.item) else { continue };
-            mine.push(it.range());
             let speed = it.speed;
             let media_end = it.source_in + ticks(it.duration.0 as f64 * speed);
             let to_tl = |m: Tick| it.start + ticks((m - it.source_in).0 as f64 / speed);
-            for wi in tr.words_in(TimeRange::from_bounds(it.source_in, media_end.max(it.source_in))) {
-                let w = &tr.words[wi];
-                let (a, b) = (to_tl(w.start), to_tl(w.end.max(w.start)));
-                let mid = Tick(a.0 + (b.0 - a.0) / 2);
-                if mid < it.start || mid >= it.end() || claimed.iter().any(|r| r.contains(mid)) {
-                    continue;
+            if let Some(tr) = transcripts.get(&it.item) {
+                mine.push(it.range());
+                for wi in tr.words_in(TimeRange::from_bounds(it.source_in, media_end.max(it.source_in))) {
+                    let w = &tr.words[wi];
+                    let (a, b) = (to_tl(w.start), to_tl(w.end.max(w.start)));
+                    let mid = Tick(a.0 + (b.0 - a.0) / 2);
+                    if mid < it.start || mid >= it.end() || claimed.iter().any(|r| r.contains(mid)) || outside(a, b) {
+                        continue;
+                    }
+                    if budget.words == 0 {
+                        return out;
+                    }
+                    budget.words -= 1;
+                    out.push(SeqWord {
+                        text: w.text.clone(),
+                        start: a.max(it.start),
+                        end: b.min(it.end()).max(a.max(it.start)),
+                        clip: it.id,
+                        item: it.item,
+                        index: wi,
+                        track: ti,
+                        speaker: tr.speaker_name(w),
+                        confidence: w.confidence,
+                    });
                 }
-                out.push(SeqWord {
-                    text: w.text.clone(),
-                    start: a.max(it.start),
-                    end: b.min(it.end()).max(a.max(it.start)),
-                    clip: it.id,
-                    item: it.item,
-                    index: wi,
-                    track: ti,
-                    speaker: tr.speaker_name(w),
-                    confidence: w.confidence,
-                });
+            } else if let Some(find) = nested
+                && depth < MAX_NEST_DEPTH
+                && budget.reads > 0
+                && !outside(it.start, it.end())
+                && let Some(inner) = find(it.item)
+            {
+                budget.reads -= 1;
+                let inner_words = collect_words(inner, transcripts, nested, depth + 1, budget, Some((it.source_in, media_end)));
+                let mut served = false;
+                for w in inner_words {
+                    let (a, b) = (to_tl(w.start.max(it.source_in)), to_tl(w.end.min(media_end)));
+                    let mid = Tick(a.0 + (b.0 - a.0) / 2);
+                    if mid < it.start || mid >= it.end() || claimed.iter().any(|r| r.contains(mid)) || outside(a, b) {
+                        continue;
+                    }
+                    served = true;
+                    out.push(SeqWord { start: a, end: b.max(a), clip: it.id, track: ti, ..w });
+                }
+                if served {
+                    mine.push(it.range());
+                }
             }
         }
         claimed.extend(mine);
-    }
-    out.sort_by_key(|w| (w.start, w.track));
-    out
-}
-
-/// Deepest chain of nested sequences followed for speech.
-const MAX_NEST_DEPTH: usize = 4;
-/// Most words [`sequence_words_nested`] returns.
-const MAX_NESTED_WORDS: usize = 2_000_000;
-
-/// [`sequence_words`], also reading audio clips that show a nested sequence (`nested` finds a
-/// sequence by item id): the nested sequence's words are mapped through the clip's source in point,
-/// start and speed, so they sit where the nested audio plays. Follows at most four levels (a
-/// sequence that contains itself ends there) and returns at most two million words.
-pub fn sequence_words_nested<'a>(seq: &'a Sequence, transcripts: &Transcripts, nested: &dyn Fn(ItemId) -> Option<&'a Sequence>) -> Vec<SeqWord> {
-    let mut out = collect_nested(seq, transcripts, nested, 0);
-    out.sort_by_key(|w| (w.start, w.track));
-    out
-}
-
-fn collect_nested<'a>(seq: &'a Sequence, transcripts: &Transcripts, nested: &dyn Fn(ItemId) -> Option<&'a Sequence>, depth: usize) -> Vec<SeqWord> {
-    let mut out = sequence_words(seq, transcripts);
-    if depth >= MAX_NEST_DEPTH {
-        return out;
-    }
-    for (ti, track) in seq.audio_tracks.iter().enumerate() {
-        for it in &track.items {
-            if !it.enabled || it.reverse || it.frame_hold.is_some() || it.speed <= 0.0 || transcripts.contains_key(&it.item) {
-                continue;
-            }
-            let Some(inner) = nested(it.item) else { continue };
-            let (s_in, s_out) = (it.source_in, it.source_in + ticks(it.duration.0 as f64 * it.speed));
-            let to_tl = |m: Tick| it.start + ticks((m - it.source_in).0 as f64 / it.speed);
-            for w in collect_nested(inner, transcripts, nested, depth + 1) {
-                if out.len() >= MAX_NESTED_WORDS {
-                    return out;
-                }
-                if w.end <= s_in || w.start >= s_out {
-                    continue;
-                }
-                let (a, b) = (to_tl(w.start.max(s_in)), to_tl(w.end.min(s_out)));
-                out.push(SeqWord { start: a, end: b.max(a), clip: it.id, track: ti, ..w });
-            }
-        }
     }
     out
 }
