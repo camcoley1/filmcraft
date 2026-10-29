@@ -141,6 +141,55 @@ fn damaged_parameter_sets_do_not_panic() {
     }
 }
 
+/// The NAL units (with their start codes) of an Annex-B stream.
+fn nal_units(data: &[u8]) -> Vec<Vec<u8>> {
+    annexb_nals(data).into_iter().map(|n| [&[0u8, 0, 0, 1][..], n].concat()).collect()
+}
+
+/// An SPS re-sent between two slices of one picture: with the same content the picture decodes as
+/// before; with another content (here 12-bit instead of 8-bit) the slice is refused instead of being
+/// decoded against the state of the old SPS (which underflowed a bit-depth difference).
+#[test]
+fn sps_change_within_a_picture_is_refused() {
+    let (Some((a, a_yuv)), Some((b, _))) = (common::ensure(common::fixture("slices4")), common::ensure(common::fixture("medium_main12"))) else {
+        return;
+    };
+    let nals = nal_units(&std::fs::read(a).unwrap());
+    let t = |n: &[u8]| (n[4] >> 1) & 0x3f;
+    let own_sps = nals.iter().find(|n| t(n) == 33).unwrap().clone();
+    let other_sps = nal_units(&std::fs::read(b).unwrap()).into_iter().find(|n| t(n) == 33).unwrap();
+    // after the first slice segment of the first picture
+    let first_slice = nals.iter().position(|n| t(n) < 32).unwrap();
+    let with = |sps: &[u8]| -> Vec<u8> {
+        let mut v = Vec::new();
+        for (i, n) in nals.iter().enumerate() {
+            v.extend_from_slice(n);
+            if i == first_slice {
+                v.extend_from_slice(sps);
+            }
+        }
+        v
+    };
+    // (one call for the whole stream: the inserted SPS is inside an access unit)
+    let decode = |data: &[u8]| -> (Vec<filmcraft_hevc::Picture>, Option<String>) {
+        let mut dec = Decoder::with_threads(1);
+        let mut out = Vec::new();
+        let mut err = None;
+        match dec.decode(data, 0) {
+            Ok(p) => out.extend(p),
+            Err(e) => err = Some(e.to_string()),
+        }
+        out.extend(dec.flush());
+        (out, err.or(dec.take_error().map(|e| e.to_string())))
+    };
+    let f = common::fixture("slices4");
+    let (pics, err) = decode(&with(&own_sps));
+    assert!(err.is_none(), "a repeated identical SPS is accepted: {err:?}");
+    common::compare(&pics, &std::fs::read(a_yuv).unwrap(), f.width as usize, f.height as usize, f.bit_depth, f.chroma).unwrap();
+    let (_, err) = decode(&with(&other_sps));
+    assert!(err.is_some_and(|e| e.contains("SPS changed")), "an SPS with other content within a picture is refused");
+}
+
 #[test]
 fn garbage_input_is_rejected_gracefully() {
     let mut seed = 42u64;

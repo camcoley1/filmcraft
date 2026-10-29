@@ -35,8 +35,8 @@ and fixture generators.
 | Tiles / WPP | parsed and decoded sequentially within a picture (parallelism is across pictures) |
 | 4:2:2 (Main 4:2:2 10 / 12 and Intra), 12-bit 4:2:0 (Main 12): geometry, 4:2:2 intra mode mapping, two chroma blocks (and cbfs) per TU, QpC = Min(qPi, 51), taller chroma MC, chroma deblocking grid and SAO; CU chroma QP offsets (`chroma_qp_offset_list`) | done (bit-exact on the x265 4:2:2 fixtures and the JCT-VC Main_422_10_A/B, GENERAL_*b_420/422, IPCM_A and ADJUST_IPRED_ANGLE streams) |
 | Other range-extension tools: transform skip rotation / context / above 4x4, implicit / explicit RDPCM, persistent Rice adaptation, intra smoothing disabled, high-precision weighted prediction offsets, SAO offset scaling, extended precision, CABAC bypass alignment, cross-component prediction | not yet (`Error::Unsupported`: parsed, then refused because no 4:2:0 / 4:2:2 reference stream exercises them) |
-| Tiles together with WPP (allowed outside Main / Main 10) | not yet (`Error::Unsupported`: the one reference stream, `WPP_AND_TILE_10Bit422Test_HIGH_TP_444_10BIT_RExt_Apple_2`, decodes differently after the first substream) |
-| 4:4:4 / monochrome, more than 12 bits | not yet (`Error::Unsupported`) |
+| Tiles together with WPP (allowed outside Main / Main 10) | not yet (`Error::Unsupported`: the one reference stream, `WPP_AND_TILE_10Bit422Test_HIGH_TP_444_10BIT_RExt_Apple_2`, decodes differently after the first substream although the CABAC parse stays in sync: every substream ends exactly at its signalled entry point; open as a known gap) |
+| 4:4:4 / monochrome, more than 12 bits, unequal luma / chroma bit depths, tiles in 4:2:2 streams, CU chroma QP offset lists with several entries or with dependent slice segments | not yet (`Error::Unsupported`: no reference stream covers them) |
 | SCC, multilayer (SHVC / MV-HEVC), 3D extensions | not supported (layers > 0 are ignored) |
 
 ## API
@@ -103,9 +103,12 @@ with ffmpeg; tests print a message and skip when ffmpeg is absent).
   panics or deadlocks (single- and multi-threaded), including 4:2:2 / 12-bit streams and bit flips
   confined to the parameter sets (hostile chroma formats, bit depths, sizes).
 - Range-extension conformance (`rext_conformance_streams`): with `FILMCRAFT_HEVC_REXT_DIR` pointing
-  at the JCT-VC RExt bitstreams (not in the repository), the 4:2:0 / 4:2:2 ones decode bit-exactly
-  against ffmpeg and the ones using unsupported tools (4:4:4, RDPCM, persistent Rice, tiles + WPP)
-  are refused with `Error::Unsupported`. Skipped without the variable.
+  at the JCT-VC RExt bitstreams (not in the repository), every listed 4:2:0 / 4:2:2 stream must be
+  present and decode to the MD5 of the suite's own reconstruction (the MD5s are in the test), and
+  the ones using unsupported tools (4:4:4, RDPCM, persistent Rice, tiles + WPP) are refused with
+  `Error::Unsupported`. Skipped without the variable.
+- An SPS re-sent between the slices of a picture: identical content decodes as before, other
+  content is refused (`sps_change_within_a_picture_is_refused`).
 - Conformance (`tests/conformance.rs`): every fixture is decoded with 1 thread, 3 threads and every
   core and compared sample-exactly with `ffmpeg -f rawvideo -pix_fmt yuv420p / yuv422p / ...10le / ...12le`; on mismatch
   the first differing frame, plane, sample, CTB and 8x8 block are reported. Output pts/POC order is

@@ -80,27 +80,27 @@ fixture_tests!(
 );
 
 /// Range-extension conformance bitstreams (ITU-T JCT-VC RExt suite, not in the repository): with
-/// `FILMCRAFT_HEVC_REXT_DIR` set to a folder holding them (any layout), the 4:2:0 / 4:2:2 ones must
-/// decode bit-exactly against ffmpeg's decode, and the others (4:4:4, unsupported tools) must be
-/// refused with `Error::Unsupported`, never decoded wrongly. Skipped without the variable or ffmpeg.
+/// `FILMCRAFT_HEVC_REXT_DIR` set to a folder holding them (any layout), every listed 4:2:0 / 4:2:2
+/// stream must be present and decode (single- and multi-threaded) to the MD5 of the suite's own
+/// reconstruction (`*_yuv.md5` / `md5sum.txt`), and the others (4:4:4, unsupported tools) must be
+/// refused with `Error::Unsupported`, never decoded wrongly. Skipped without the variable.
 #[test]
 fn rext_conformance_streams() {
     let Some(dir) = std::env::var_os("FILMCRAFT_HEVC_REXT_DIR").map(std::path::PathBuf::from) else {
         eprintln!("skipped: FILMCRAFT_HEVC_REXT_DIR not set");
         return;
     };
-    let Some(ff) = common::ffmpeg() else { return };
-    // (stream name, expected: Some((width, height, bit depth, chroma_format_idc)) = bit-exact, None = refused)
-    let expected: &[(&str, Option<(usize, usize, u32, u32)>)] = &[
-        ("ADJUST_IPRED_ANGLE_A_RExt_Mitsubishi_2", Some((1920, 1080, 10, 2))),
-        ("GENERAL_8b_420_RExt_Sony_1", Some((400, 384, 8, 1))),
-        ("GENERAL_10b_420_RExt_Sony_1", Some((400, 384, 10, 1))),
-        ("GENERAL_12b_420_RExt_Sony_1", Some((400, 384, 12, 1))),
-        ("GENERAL_10b_422_RExt_Sony_1", Some((400, 384, 10, 2))),
-        ("GENERAL_12b_422_RExt_Sony_1", Some((400, 384, 12, 2))),
-        ("IPCM_A_RExt_NEC_2", Some((416, 240, 10, 2))),
-        ("Main_422_10_A_RExt_Sony_2", Some((1920, 1080, 10, 2))),
-        ("Main_422_10_B_RExt_Sony_2", Some((2560, 1600, 10, 2))),
+    // (stream name, Some(MD5 of the reconstructed YUV) = decoded exactly, None = refused)
+    let expected: &[(&str, Option<&str>)] = &[
+        ("ADJUST_IPRED_ANGLE_A_RExt_Mitsubishi_2", Some("b045776950c2e06d35348bd03268c07f")),
+        ("GENERAL_8b_420_RExt_Sony_1", Some("99eb7a5106988759fd0eaecdb66e2cd2")),
+        ("GENERAL_10b_420_RExt_Sony_1", Some("d19c7e1764971983f0e827277db2f69a")),
+        ("GENERAL_12b_420_RExt_Sony_1", Some("27a2b09b136687f7a391bfdbc50ac964")),
+        ("GENERAL_10b_422_RExt_Sony_1", Some("ea5dfb01c95bffb169cd78e549bd39ab")),
+        ("GENERAL_12b_422_RExt_Sony_1", Some("d4f51ab5405659ad90e788083bcfc18d")),
+        ("IPCM_A_RExt_NEC_2", Some("8d4eb18812338f9f475035b8da27e74a")),
+        ("Main_422_10_A_RExt_Sony_2", Some("66530b83be6647f87efbb2b9ae6e1e28")),
+        ("Main_422_10_B_RExt_Sony_2", Some("fd163bcbdc24792a23781ee7aace74eb")),
         ("WPP_AND_TILE_10Bit422Test_HIGH_TP_444_10BIT_RExt_Apple_2", None),
         ("PERSIST_RPARAM_A_RExt_Sony_3", None),
         ("TSCTX_8bit_RExt_SHARP_1", None),
@@ -118,39 +118,27 @@ fn rext_conformance_streams() {
             }
         }
     }
-    let out = common::fixtures_dir().join("rext");
-    std::fs::create_dir_all(&out).unwrap();
-    let mut checked = 0;
     for &(name, want) in expected {
-        let Some(path) = files.iter().find(|p| p.file_stem().is_some_and(|s| s == name)) else {
-            eprintln!("missing {name}");
-            continue;
-        };
-        let Some((w, h, bd, chroma)) = want else {
+        let path = files.iter().find(|p| p.file_stem().is_some_and(|s| s == name)).unwrap_or_else(|| panic!("{name} missing from FILMCRAFT_HEVC_REXT_DIR"));
+        let Some(md5) = want else {
             let err = common::decode_file_threads(path, 1).err().map(|(_, e, _)| e);
             assert!(matches!(err, Some(filmcraft_hevc::Error::Unsupported(_))), "{name}: expected an unsupported error, got {err:?}");
-            checked += 1;
             continue;
         };
-        let yuv = out.join(format!("{name}.yuv"));
-        if !yuv.exists() {
-            let ok = std::process::Command::new(&ff)
-                .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
-                .arg(path)
-                .args(["-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", common::pix_fmt(bd, chroma)])
-                .arg(&yuv)
-                .status()
-                .is_ok_and(|s| s.success());
-            assert!(ok, "{name}: reference decode failed");
-        }
-        let reference = std::fs::read(&yuv).unwrap();
         for threads in [1, 0] {
             let pics = common::decode_file_threads(path, threads).unwrap_or_else(|(au, e, _)| panic!("{name}: error at {au}: {e}"));
-            common::compare(&pics, &reference, w, h, bd, chroma).unwrap_or_else(|e| panic!("{name} (threads {threads}): {e}"));
+            let bytes: Vec<u8> = pics.iter().flat_map(|p| [&p.y, &p.u, &p.v].into_iter().flat_map(|pl| pl.to_le_bytes())).collect();
+            assert_eq!(common::md5_hex(&bytes), md5, "{name} (threads {threads}): reconstruction differs from the conformance MD5");
         }
-        checked += 1;
     }
-    assert!(checked > 0, "no RExt conformance streams found");
+}
+
+/// The MD5 helper the conformance checks rely on (RFC 1321 test vectors).
+#[test]
+fn md5_matches_rfc1321() {
+    assert_eq!(common::md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+    assert_eq!(common::md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+    assert_eq!(common::md5_hex(b"12345678901234567890123456789012345678901234567890123456789012345678901234567890"), "57edf4a22be3c955ac49da2e2107b67a");
 }
 
 /// Draft mode: sub-layer non-reference pictures skip deblocking and SAO and are flagged; every

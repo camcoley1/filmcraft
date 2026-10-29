@@ -97,7 +97,7 @@ pub fn skip_hrd(r: &mut BitReader, common: bool, max_sub_layers_minus1: u32) -> 
         }
         let mut cpb_cnt = 1;
         if !low_delay {
-            cpb_cnt = r.read_ue()? + 1;
+            cpb_cnt = r.read_ue()?.saturating_add(1);
             ensure!(cpb_cnt <= 32, "cpb_cnt_minus1 out of range");
         }
         if nal {
@@ -507,7 +507,7 @@ impl Sps {
         let start = if ordering_all { 0 } else { max_sub_layers_minus1 };
         for _ in start..=max_sub_layers_minus1 {
             // the values of the highest sub-layer are used
-            dpb = r.read_ue()? + 1;
+            dpb = r.read_ue()?.saturating_add(1);
             reorder = r.read_ue()?;
             latency = r.read_ue()?;
         }
@@ -662,6 +662,11 @@ impl Sps {
         if self.bit_depth_luma > 12 || self.bit_depth_chroma > 12 {
             return unsupported(format!("bit depth {}/{}", self.bit_depth_luma, self.bit_depth_chroma));
         }
+        // (pictures carry one bit depth for all planes, and no reference stream covers unequal
+        // ones outside 4:4:4)
+        if self.bit_depth_luma != self.bit_depth_chroma {
+            return unsupported(format!("unequal luma / chroma bit depths {}/{}", self.bit_depth_luma, self.bit_depth_chroma));
+        }
         if self.rext.extended_precision_processing {
             return unsupported("extended_precision_processing (range extension)");
         }
@@ -772,8 +777,8 @@ impl Pps {
         let num_extra_slice_header_bits = r.read_bits(3)?;
         let sign_data_hiding = r.read_flag()?;
         let cabac_init_present = r.read_flag()?;
-        let num_ref_idx_l0_default = r.read_ue()? + 1;
-        let num_ref_idx_l1_default = r.read_ue()? + 1;
+        let num_ref_idx_l0_default = r.read_ue()?.saturating_add(1);
+        let num_ref_idx_l1_default = r.read_ue()?.saturating_add(1);
         ensure!(num_ref_idx_l0_default <= 15 && num_ref_idx_l1_default <= 15, "num_ref_idx_default_active out of range");
         let init_qp = 26 + r.read_se()?;
         let constrained_intra_pred = r.read_flag()?;
@@ -794,8 +799,8 @@ impl Pps {
         let (mut column_widths, mut row_heights) = (Vec::new(), Vec::new());
         let mut loop_filter_across_tiles = true;
         if tiles_enabled {
-            num_tile_columns = r.read_ue()? + 1;
-            num_tile_rows = r.read_ue()? + 1;
+            num_tile_columns = r.read_ue()?.saturating_add(1);
+            num_tile_rows = r.read_ue()?.saturating_add(1);
             ensure!(num_tile_columns <= 64 && num_tile_rows <= 64, "too many tiles");
             uniform_spacing = r.read_flag()?;
             if !uniform_spacing {
@@ -840,8 +845,9 @@ impl Pps {
                 if rext.chroma_qp_offset_list {
                     rext.diff_cu_chroma_qp_offset_depth = r.read_ue()?;
                     ensure!(rext.diff_cu_chroma_qp_offset_depth <= 3, "diff_cu_chroma_qp_offset_depth out of range");
-                    let n = r.read_ue()? + 1;
-                    ensure!(n <= 6, "chroma_qp_offset_list_len_minus1 out of range");
+                    let n = r.read_ue()?;
+                    ensure!(n <= 5, "chroma_qp_offset_list_len_minus1 out of range");
+                    let n = n + 1;
                     for _ in 0..n {
                         let (cb, cr) = (r.read_se()?, r.read_se()?);
                         ensure!((-12..=12).contains(&cb) && (-12..=12).contains(&cr), "chroma QP offset list entry out of range");
@@ -919,6 +925,16 @@ impl Pps {
         // (allowed together outside Main / Main 10; not verified against a reference decoder)
         if self.tiles_enabled && self.entropy_coding_sync {
             return unsupported("tiles together with wavefront parallel processing");
+        }
+        // 4:2:2 tile boundaries (chroma SAO / deblocking across tiles) have no reference stream
+        if self.tiles_enabled && sps.chroma_format_idc != 1 {
+            return unsupported("tiles in 4:2:2 streams");
+        }
+        // CU chroma QP offset lists: only single-entry lists in independent slices are verified
+        // (Sony Main_422_10_A/B); cu_chroma_qp_offset_idx and the offsets' persistence across
+        // dependent slice segments have no reference stream
+        if self.rext.chroma_qp_offset_list && (self.rext.cb_qp_offset_list.len() > 1 || self.dependent_slice_segments_enabled) {
+            return unsupported("CU chroma QP offset lists with several entries or dependent slice segments");
         }
 
         if self.extension_flags & 0x7f != 0 {

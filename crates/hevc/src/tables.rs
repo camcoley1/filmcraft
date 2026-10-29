@@ -56,9 +56,8 @@ pub fn scan_diag(log2: u32) -> &'static [(u8, u8)] {
     scan_order(log2, 0)
 }
 
-/// Table 8-10: QpC as a function of qPi (ChromaArrayType 1).
-#[inline]
 /// QpC for qPi (Table 8-10 for ChromaArrayType 1, Min(qPi, 51) otherwise).
+#[inline]
 pub fn qpc(qpi: i32, not_420: bool) -> i32 {
     if not_420 { qpi.min(51) } else { qpc_420(qpi) }
 }
@@ -67,6 +66,8 @@ pub fn qpc(qpi: i32, not_420: bool) -> i32 {
 pub static MODE_422: [u8; 35] =
     [0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31];
 
+/// Table 8-10: QpC as a function of qPi (ChromaArrayType 1).
+#[inline]
 pub fn qpc_420(qpi: i32) -> i32 {
     if qpi < 30 {
         qpi

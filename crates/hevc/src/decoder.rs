@@ -71,6 +71,10 @@ pub struct Decoder {
     vpss: Vec<Option<Arc<Vps>>>,
     spss: Vec<Option<Arc<Sps>>>,
     ppss: Vec<Option<Arc<Pps>>>,
+    /// RBSPs of the stored parameter sets: a repeat with the same content keeps the stored one
+    /// (and the pictures being decoded with it).
+    sps_rbsp: Vec<Vec<u8>>,
+    pps_rbsp: Vec<Vec<u8>>,
     nal_length_size: Option<usize>,
     dpb: Dpb<FrameRef>,
     poc_state: PocState,
@@ -126,6 +130,8 @@ impl Decoder {
             vpss: vec![None; 16],
             spss: vec![None; 16],
             ppss: vec![None; 64],
+            sps_rbsp: vec![Vec::new(); 16],
+            pps_rbsp: vec![Vec::new(); 64],
             nal_length_size: None,
             dpb: Dpb::default(),
             poc_state: PocState::default(),
@@ -268,14 +274,22 @@ impl Decoder {
                 self.vpss[id] = Some(Arc::new(v));
             }
             nal_type::SPS => {
-                let s = Sps::parse(&unescape_rbsp(&nal[2..]))?;
+                let rbsp = unescape_rbsp(&nal[2..]);
+                let s = Sps::parse(&rbsp)?;
                 let id = s.id as usize;
-                self.spss[id] = Some(Arc::new(s));
+                if self.spss[id].is_none() || self.sps_rbsp[id] != rbsp {
+                    self.spss[id] = Some(Arc::new(s));
+                    self.sps_rbsp[id] = rbsp;
+                }
             }
             nal_type::PPS => {
-                let p = Pps::parse(&unescape_rbsp(&nal[2..]))?;
+                let rbsp = unescape_rbsp(&nal[2..]);
+                let p = Pps::parse(&rbsp)?;
                 let id = p.id as usize;
-                self.ppss[id] = Some(Arc::new(p));
+                if self.ppss[id].is_none() || self.pps_rbsp[id] != rbsp {
+                    self.ppss[id] = Some(Arc::new(p));
+                    self.pps_rbsp[id] = rbsp;
+                }
             }
             nal_type::EOS | nal_type::EOB => {
                 self.submit_pending();
@@ -345,6 +359,9 @@ impl Decoder {
         } else {
             let Some(p) = &self.pending else { return invalid("slice segment without the first slice of its picture") };
             ensure!(Arc::ptr_eq(&p.pps, &pps), "PPS changed within a picture");
+            // (an SPS re-sent between two slices of a picture replaces the Arc: the picture state
+            // was built from the old one)
+            ensure!(p.slices.first().is_none_or(|s| Arc::ptr_eq(&s.sps, &sps)), "SPS changed within a picture");
         }
         let Some(pending) = self.pending.as_mut() else {
             return invalid("slice segment without the first slice of its picture");

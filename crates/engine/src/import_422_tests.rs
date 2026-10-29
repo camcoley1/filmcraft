@@ -79,12 +79,12 @@ fn check_422_10(name: &str, codec: &[&str], codec_name: &str) {
     assert_eq!((v.width as usize, v.height as usize), (W, H), "{name}");
     assert!(v.codec.starts_with(codec_name), "{name}: codec {}", v.codec);
 
-    // decoded planes: bit-exact with ffmpeg
+    // decoded planes: bit-exact with ffmpeg, every frame
     let reference = std::fs::read(&yuv).unwrap();
     let fsize = (W * H + 2 * (W / 2) * H) * 2;
     assert_eq!(reference.len(), 25 * fsize);
     let src = s.source(item).unwrap();
-    for i in [0usize, 7, 10, 24] {
+    for i in 0..25usize {
         let f = src.video_frame(filmcraft_media::FrameRequest::full(v.frame_rate.tick_of(i as i64))).unwrap();
         let filmcraft_frame::PixelData::Yuv16 { planes, chroma, bits, .. } = &f.data else { panic!("frame {i}: not 16-bit YUV") };
         assert_eq!((*chroma, *bits), (filmcraft_frame::Chroma::C422, 10), "frame {i}");
