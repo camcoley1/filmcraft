@@ -149,7 +149,15 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
         let r = match r {
             Ok((t, _)) => {
                 *lock(&out) = Some(t);
-                Ok(filmcraft_export::Report { path: String::new(), frames: 0, seconds: secs, bytes: 0, render_fps: 0.0, extra_files: Vec::new() })
+                Ok(filmcraft_export::Report {
+                    path: String::new(),
+                    frames: 0,
+                    seconds: secs,
+                    bytes: 0,
+                    render_fps: 0.0,
+                    extra_files: Vec::new(),
+                    warnings: Vec::new(),
+                })
             }
             Err(e) => Err(e),
         };
