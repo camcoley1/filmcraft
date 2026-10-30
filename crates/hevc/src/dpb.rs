@@ -179,7 +179,8 @@ impl<F: Clone> Dpb<F> {
         for &(lsb, used, msb_present, cycle) in &sh.lt {
             let mut p = lsb as i32;
             if msb_present {
-                p += poc - (cycle as i32).wrapping_mul(max_poc_lsb) - (poc & (max_poc_lsb - 1));
+                // (wrapping: a hostile DeltaPocMsbCycleLt may leave the i32 range)
+                p = p.wrapping_add(poc.wrapping_sub((cycle as i32).wrapping_mul(max_poc_lsb)).wrapping_sub(poc & (max_poc_lsb - 1)));
             }
             let found =
                 self.entries.iter().position(|e| e.marking != Marking::Unused && if msb_present { e.poc == p } else { (e.poc & (max_poc_lsb - 1)) == p });
@@ -188,12 +189,12 @@ impl<F: Clone> Dpb<F> {
         // Short-term entries.
         let mut st: Vec<(Option<usize>, i32, bool, bool)> = Vec::new(); // (entry, poc, used, before)
         for &(d, used) in &sh.st_rps.s0 {
-            let p = poc + d;
+            let p = poc.wrapping_add(d);
             let found = self.entries.iter().position(|e| e.marking == Marking::Short && e.poc == p);
             st.push((found, p, used, true));
         }
         for &(d, used) in &sh.st_rps.s1 {
-            let p = poc + d;
+            let p = poc.wrapping_add(d);
             let found = self.entries.iter().position(|e| e.marking == Marking::Short && e.poc == p);
             st.push((found, p, used, false));
         }
@@ -293,15 +294,16 @@ impl PocState {
         } else {
             let prev_lsb = self.prev_tid0_poc & (max_poc_lsb - 1);
             let prev_msb = self.prev_tid0_poc - prev_lsb;
+            // (wrapping: a long hostile stream can walk PicOrderCntMsb out of the i32 range)
             if lsb < prev_lsb && prev_lsb - lsb >= max_poc_lsb / 2 {
-                prev_msb + max_poc_lsb
+                prev_msb.wrapping_add(max_poc_lsb)
             } else if lsb > prev_lsb && lsb - prev_lsb > max_poc_lsb / 2 {
-                prev_msb - max_poc_lsb
+                prev_msb.wrapping_sub(max_poc_lsb)
             } else {
                 prev_msb
             }
         };
-        msb + lsb
+        msb.wrapping_add(lsb)
     }
 
     /// Update after decoding a picture with the given header and POC.

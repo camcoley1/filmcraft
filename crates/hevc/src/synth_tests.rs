@@ -162,6 +162,11 @@ fn vps() -> Vec<u8> {
 }
 
 fn sps(pcm_loop_filter_disabled: bool) -> Vec<u8> {
+    sps_sized(pcm_loop_filter_disabled, W as u32, H as u32)
+}
+
+/// [`sps`] of a `width` x `height` picture.
+fn sps_sized(pcm_loop_filter_disabled: bool, width: u32, height: u32) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.write_bits(0, 4);
     w.write_bits(0, 3);
@@ -169,8 +174,8 @@ fn sps(pcm_loop_filter_disabled: bool) -> Vec<u8> {
     ptl(&mut w);
     w.write_ue(0); // sps id
     w.write_ue(1); // 4:2:0
-    w.write_ue(W as u32);
-    w.write_ue(H as u32);
+    w.write_ue(width);
+    w.write_ue(height);
     w.write_bits(0, 1); // conformance window
     w.write_ue(0);
     w.write_ue(0);
@@ -633,6 +638,25 @@ fn tiles_slices_and_dependent_segments() {
         Segment { start: 18, len: 6, dependent: true },
     ];
     run("tiles_slices", Some((vec![3, 3], vec![2, 2], true, false)), false, segs);
+}
+
+/// A 16880x16880 SPS (near the largest the parser accepts) is refused before its ~0.8 GiB of
+/// picture buffers are allocated, with an error that says why.
+#[test]
+fn oversized_picture_is_refused_before_allocation() {
+    let mut s = Vec::new();
+    s.extend(vps());
+    s.extend(sps_sized(false, 16880, 16880));
+    s.extend(pps(0, &None, false));
+    let p0 =
+        PicDesc { nal_type: 19, poc: 0, intra: true, cu: Cu::Pcm, pps_id: 0, st: vec![], lt: vec![], num_ref: 0, list_entry: None, segments: whole(WC * HC) };
+    encode_picture(&p0, &None, &content(0), &mut s, &mut None);
+    for threads in [1, 2] {
+        let mut dec = Decoder::with_threads(threads);
+        let e = dec.decode(&s, 0).unwrap_err().to_string();
+        assert!(e.contains("frame too large for software decode: "), "{e}");
+        assert!(dec.flush().is_empty());
+    }
 }
 
 #[test]

@@ -109,6 +109,10 @@ with ffmpeg; tests print a message and skip when ffmpeg is absent).
   `Error::Unsupported`. Skipped without the variable.
 - An SPS re-sent between the slices of a picture: identical content decodes as before, other
   content is refused (`sps_change_within_a_picture_is_refused`).
+- Hostile parameter sets: every SPS `ue(v)` field at `u32::MAX`, one past each spec maximum and
+  conformance window offsets whose sum wraps are refused (`max_value_sps_fields_are_refused`); a
+  picture larger than the memory budget is refused before allocation
+  (`oversized_picture_is_refused_before_allocation`, `memory_budget_*`).
 - Conformance (`tests/conformance.rs`): every fixture is decoded with 1 thread, 3 threads and every
   core and compared sample-exactly with `ffmpeg -f rawvideo -pix_fmt yuv420p / yuv422p / ...10le / ...12le`; on mismatch
   the first differing frame, plane, sample, CTB and 8x8 block are reported. Output pts/POC order is
@@ -213,12 +217,13 @@ context-coded bins are branch-free. Single-threaded 4K now splits into CABAC res
 
 ## Known gaps
 
-- 4:2:2 (Main 4:2:2 10, RExt) is the next step: chroma geometry is 4:2:0-specific in `slicedec`
-  (chroma TU placement, second chroma cbf flags, Table 8-3 intra mode mapping), `inter` (vertical
-  chroma MV scaling), `filter` (chroma edge spacing, QpC = Min(qPi, 51)) and `picture`. Range
-  extension tools (implicit / explicit RDPCM, cross-component prediction, extended precision,
-  persistent Rice adaptation, bypass alignment, chroma QP offset lists) are rejected with
-  `Error::Unsupported`.
+- Range extension tools that no 4:2:0 / 4:2:2 reference stream covers (implicit / explicit RDPCM,
+  cross-component prediction, extended precision, persistent Rice adaptation, bypass alignment)
+  are rejected with `Error::Unsupported`, as are 4:4:4 / 4:0:0 and tiles together with WPP.
+- Memory budget: a picture needing more than 512 MiB (shared frame, reconstruction state and block
+  metadata), or more than 8 GiB (1 GiB on 32-bit targets) for every picture that can be alive at
+  once, is refused with `Error::Unsupported("frame too large for software decode: N MB")` before
+  anything is allocated. 8K 4:2:2 12-bit fits with 16 worker threads.
 - Tiles and WPP substreams are decoded sequentially (entry points are parsed but the decoder finds
   substream starts itself); parallelism is at the picture level.
 - Error concealment is minimal: missing references are replaced by grey pictures, undecodable

@@ -8,9 +8,9 @@
 use crate::dpb::{Dpb, Output, OutputMeta, PocState, RefPicSet, build_ref_lists};
 use crate::error::{Error, Result, ensure, invalid};
 use crate::params::{Layout, Pps, Sps, Vps};
-use crate::picture::{Frame, FrameRef, Sample, stores_u8};
+use crate::picture::{ColMv, Frame, FrameRef, Sample, stores_u8};
 use crate::slice::{NalHeader, SliceHeader, nal_type};
-use crate::slicedec::{Blk, F_INTRA, F_SKIP, PicState, SliceDecoder, SliceJob};
+use crate::slicedec::{Blk, F_INTRA, F_SKIP, MvField, PicState, SaoParams, SliceDecoder, SliceJob};
 use crate::{ColorInfo, Picture};
 use filmcraft_bitstream::{annexb_nals, length_prefixed_nals, unescape_rbsp};
 use std::collections::VecDeque;
@@ -58,6 +58,44 @@ pub struct DecodeStats {
     pub missing_refs: u64,
     /// Pictures decoded in draft mode without in-loop filters ([`Decoder::set_draft`]).
     pub draft_pictures: u64,
+}
+
+/// Largest single picture the software decoder allocates: the samples of the shared frame and of
+/// the reconstruction state plus per-block metadata (8K 4:2:2 12-bit needs ~0.3 GiB).
+const MAX_PICTURE_BYTES: u64 = 512 << 20;
+/// Largest total for every picture that can be alive at once (the DPB, the picture being decoded
+/// and the pipelined ones).
+const MAX_DECODER_BYTES: u64 = if cfg!(target_pointer_width = "64") { 8 << 30 } else { 1 << 30 };
+
+/// Checks what pictures of `sps` need against [`MAX_PICTURE_BYTES`] and [`MAX_DECODER_BYTES`]
+/// before anything is allocated: a hostile SPS at the size limits would otherwise ask for more
+/// memory than the process has, which aborts instead of failing.
+fn check_memory_budget(sps: &Sps, max_in_flight: usize) -> Result<()> {
+    let (frame, job) = picture_bytes(sps);
+    let mb = |b: u64| b.div_ceil(1 << 20);
+    if frame + job > MAX_PICTURE_BYTES {
+        return Err(Error::Unsupported(format!("frame too large for software decode: {} MB", mb(frame + job))));
+    }
+    let frames = (sps.max_dec_pic_buffering as usize + 1 + max_in_flight) as u64;
+    let total = frames * frame + max_in_flight as u64 * job;
+    if total > MAX_DECODER_BYTES {
+        return Err(Error::Unsupported(format!("frame too large for software decode: {} MB for {frames} pictures in flight", mb(total))));
+    }
+    Ok(())
+}
+
+/// Bytes of one frame (samples and collocated motion, as kept in the DPB) and of one
+/// reconstruction state (samples and block / CTB metadata) of `sps`.
+fn picture_bytes(sps: &Sps) -> (u64, u64) {
+    let (w, h) = (u64::from(sps.width), u64::from(sps.height));
+    let (cw, ch) = (w >> (sps.sub_width_c() - 1), h >> (sps.sub_height_c() - 1));
+    let sample_bytes: u64 = if stores_u8(sps.bit_depth_luma, sps.bit_depth_chroma) { 1 } else { 2 };
+    let samples = (w * h + 2 * cw * ch) * sample_bytes;
+    let (w4, h4, w16, h16) = (w.div_ceil(4), h.div_ceil(4), w.div_ceil(16), h.div_ceil(16));
+    let ctbs = u64::from(sps.pic_width_in_ctbs()) * u64::from(sps.pic_height_in_ctbs());
+    let frame = samples + w16 * h16 * size_of::<ColMv>() as u64;
+    let job = samples + w4 * h4 * (size_of::<Blk>() + size_of::<MvField>()) as u64 + ctbs * (2 * size_of::<u32>() + size_of::<SaoParams>()) as u64;
+    (frame, job)
 }
 
 #[derive(Default)]
@@ -391,6 +429,7 @@ impl Decoder {
 
     fn start_picture(&mut self, sh: &SliceHeader, sps: &Arc<Sps>, pps: &Arc<Pps>, pts: i64) -> Result<()> {
         ensure!(sh.first_slice_segment_in_pic && !sh.dependent, "invalid first slice segment");
+        check_memory_budget(sps, self.max_in_flight)?;
         let hdr = sh.nal;
         let changed = match &self.active_sps {
             None => true,
@@ -555,7 +594,15 @@ fn run_job_as<S: Sample>(
     draft: bool,
     shared: &Shared,
 ) {
-    let mut pic = PicState::<S>::new(frame.clone(), sps, pps, layout, scaling);
+    let Some(mut pic) = PicState::<S>::try_new(frame.clone(), sps, pps, layout, scaling) else {
+        // make sure readers never block on this frame
+        frame.publish_gray();
+        let msg = format!("out of memory for a {}x{} picture", frame.width, frame.height);
+        if let Ok(mut slot) = shared.error.lock() {
+            slot.get_or_insert(Error::Unsupported(msg));
+        }
+        return;
+    };
     pic.draft = draft;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut first_err = None;
@@ -667,5 +714,49 @@ mod tests {
         }
         assert_eq!(block_counts(&blk), want);
         assert_eq!(block_counts(&[]), [0; 3]);
+    }
+
+    /// A 10-bit 4:2:2 SPS of `w` x `h` luma samples (CTB 16).
+    fn sps(w: u32, h: u32) -> Sps {
+        use crate::params::tests::{MAIN422_UE, main422_sps};
+        let mut sps = Sps::parse(&main422_sps(&MAIN422_UE)).unwrap();
+        (sps.width, sps.height, sps.conf_win) = (w, h, (0, 0, 0, 0));
+        sps
+    }
+
+    #[test]
+    fn memory_budget_accepts_8k_and_refuses_the_size_limit() {
+        // 8K 4:2:2 10-bit with 16 worker threads (64-bit address space)
+        if cfg!(target_pointer_width = "64") {
+            assert!(check_memory_budget(&sps(8192, 4320), 18).is_ok());
+        }
+        // 16888x16888 4:2:2 10-bit: ~1 GiB of samples per frame
+        let e = check_memory_budget(&sps(16888, 16888), 3).unwrap_err().to_string();
+        assert!(e.contains("frame too large for software decode: ") && e.ends_with(" MB"), "{e}");
+    }
+
+    /// The tallest 16384-wide picture (in 8-line steps) within MAX_PICTURE_BYTES.
+    fn tallest_within_cap() -> u32 {
+        let fits = |h| {
+            let (f, j) = picture_bytes(&sps(16384, h));
+            f + j <= MAX_PICTURE_BYTES
+        };
+        (1..=2111).rev().map(|k| k * 8).find(|&h| fits(h)).unwrap()
+    }
+
+    #[test]
+    fn memory_budget_boundary() {
+        // at the cap is accepted (one picture in flight), 8 lines more is not
+        let h = tallest_within_cap();
+        assert!(h < 16888);
+        assert!(check_memory_budget(&sps(16384, h), 1).is_ok());
+        assert!(check_memory_budget(&sps(16384, h + 8), 1).is_err());
+    }
+
+    #[test]
+    fn memory_budget_counts_pictures_in_flight() {
+        // a picture at the cap fits once, but not with 16 worker threads' pipeline
+        let e = check_memory_budget(&sps(16384, tallest_within_cap()), 18).unwrap_err().to_string();
+        assert!(e.contains("frame too large for software decode: ") && e.contains("pictures in flight"), "{e}");
     }
 }

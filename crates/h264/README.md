@@ -123,11 +123,18 @@ with ffmpeg + libx264; tests print a message and skip when `/opt/homebrew/bin/ff
   panics or deadlocks (single- and multi-threaded), also on High 10 streams and with bit flips
   confined to the SPS / PPS.
 - JVT conformance bitstreams (`jvt_high_bit_depth_conformance_streams`, with
-  `FILMCRAFT_H264_JVT_DIR` pointing at the downloaded suite; not in the repository):
-  `PPH10I1/2/3_Panasonic_A` (High 10 Intra, 720p), the 14 progressive Sony High 4:2:2 streams
-  `Hi422FR1-15` (8 and 10 bits; FR5 does not exist) and `PPH422I1/2/3_Panasonic_A` (High 4:2:2
-  Intra, 720p) bit-exact against ffmpeg; the interlaced `PPH10I4`, `Hi422FREXT16` and
-  `PPH422I4` are refused with `Error::Unsupported`.
+  `FILMCRAFT_H264_JVT_DIR` pointing at the downloaded suite; not in the repository): every listed
+  stream must be present and match its pinned SHA-256. `PPH10I1/2/3_Panasonic_A` (High 10 Intra,
+  720p), the 14 progressive Sony High 4:2:2 streams `Hi422FR1-15` (8 and 10 bits; FR5 does not
+  exist) and `PPH422I1/2/3_Panasonic_A` (High 4:2:2 Intra, 720p) decode to pinned reconstruction
+  MD5s; the interlaced `PPH10I4`, `Hi422FREXT16` and `PPH422I4` are refused with
+  `Error::Unsupported`. The suites ship no checksums: the MD5s of `Hi422FR10-15` are of the
+  reconstructed YUV the suite ships, the others of ffmpeg 8.1's decode (which reproduces those six
+  shipped files exactly). No ffmpeg is needed to run it.
+- Hostile parameter sets: every SPS `ue(v)` field at `u32::MAX`, one past each spec maximum and crop
+  offsets whose sum wraps are refused (`max_value_sps_fields_are_refused`); a picture larger than
+  the memory budget is refused before allocation (`oversized_picture_is_refused_before_allocation`,
+  `memory_budget_*`).
 - Conformance (`tests/conformance.rs`): every fixture is decoded single-threaded, with 3 threads
   and with every core, and compared byte-for-byte with `ffmpeg -f rawvideo -pix_fmt yuv420p`; on
   mismatch the first differing frame, plane, sample position and macroblock are reported. Output
@@ -239,6 +246,10 @@ file; `H264_BENCH_ITERS=n` (and `H264_THREADS=t`, `H264_DRAFT=1`) turns it into 
   (`qpprime_y_zero_transform_bypass`) return `Error::Unsupported`. The sample paths are generic up
   to 14 bits, but nothing verifies them above 10.
 - FMO (slice groups), SP/SI slices, data partitioning (Extended profile), MVC/SVC NAL units.
+- Memory budget: a picture needing more than 512 MiB (shared frame, reconstruction state and
+  macroblock metadata), or more than 8 GiB (1 GiB on 32-bit targets) for every picture that can be
+  alive at once, is refused with `Error::Unsupported("frame too large for software decode: N MB")`
+  before anything is allocated. 8K 4:2:2 10-bit fits with 16 worker threads.
 - Error concealment is minimal: undecodable slices leave the prediction/previous content; missing
   references are replaced by other references.
 - No SIMD intrinsics (the hot loops are written to auto-vectorise); CABAC residual decoding is

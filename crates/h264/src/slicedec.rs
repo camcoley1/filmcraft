@@ -49,15 +49,16 @@ pub struct PicState<P> {
 }
 
 impl<P: Pixel> PicState<P> {
-    pub fn new(frame: FrameRef) -> Self {
+    /// The reconstruction state of `frame`, or `None` when its buffers cannot be allocated.
+    pub fn try_new(frame: FrameRef) -> Option<Self> {
         let (mb_w, mb_h) = (frame.mb_w, frame.mb_h());
         let fmt = frame.fmt;
-        PicState {
-            planes: Planes::new(mb_w * 16, mb_h * 16, fmt),
+        Some(PicState {
+            planes: Planes::try_new(mb_w * 16, mb_h * 16, fmt)?,
             bd_y: fmt.bit_depth_y,
             bd_c: fmt.bit_depth_c,
             fmt,
-            mbs: vec![MbState::default(); mb_w * mb_h],
+            mbs: try_vec(mb_w * mb_h, MbState::default())?,
             slices: Vec::new(),
             mb_w,
             mb_h,
@@ -69,7 +70,7 @@ impl<P: Pixel> PicState<P> {
             rows_deblocked: 0,
             rows_published: 0,
             skip_deblock: false,
-        }
+        })
     }
 
     /// Reuse the buffers of a finished picture of the same size for a new frame.
@@ -281,8 +282,8 @@ impl<'a, P: Pixel> SliceDecoder<'a, P> {
         if sh.slice_type == SliceType::B && !sh.direct_spatial_mv_pred && !refs[1].is_empty() {
             let poc1 = refs[1][0].poc();
             for r0 in refs[0].iter() {
-                let tb = (pic.poc - r0.poc()).clamp(-128, 127);
-                let td = (poc1 - r0.poc()).clamp(-128, 127);
+                let tb = pic.poc.saturating_sub(r0.poc()).clamp(-128, 127);
+                let td = poc1.saturating_sub(r0.poc()).clamp(-128, 127);
                 if td == 0 || r0.long_term {
                     tdirect.push((256, true));
                 } else {
@@ -347,8 +348,8 @@ impl<'a, P: Pixel> SliceDecoder<'a, P> {
             w.mode = WpMode::Implicit;
             for r0 in refs[0].iter() {
                 for r1 in refs[1].iter() {
-                    let tb = (cur_poc - r0.poc()).clamp(-128, 127);
-                    let td = (r1.poc() - r0.poc()).clamp(-128, 127);
+                    let tb = cur_poc.saturating_sub(r0.poc()).clamp(-128, 127);
+                    let td = r1.poc().saturating_sub(r0.poc()).clamp(-128, 127);
                     let pair = if td == 0 || r0.long_term || r1.long_term {
                         (32, 32)
                     } else {

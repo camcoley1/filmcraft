@@ -230,8 +230,8 @@ impl<'a, S: crate::picture::Sample> SliceDecoder<'a, S> {
         if cur.long_term != col_lt {
             return None;
         }
-        let col_diff = col.poc - cm.ref_poc[list_col];
-        let cur_diff = self.pic.poc - cur.poc;
+        let col_diff = col.poc.saturating_sub(cm.ref_poc[list_col]);
+        let cur_diff = self.pic.poc.saturating_sub(cur.poc);
         if cur.long_term || col_diff == cur_diff { Some(mv) } else { Some(scale_mv(mv, col_diff, cur_diff)) }
     }
 
@@ -273,7 +273,9 @@ impl<'a, S: crate::picture::Sample> SliceDecoder<'a, S> {
             } else {
                 None
             };
-            pick.map(|(mv, r)| if r.poc != tpoc && !r.long_term && !tlt { scale_mv(mv, cur_poc - r.poc, cur_poc - tpoc) } else { mv })
+            pick.map(
+                |(mv, r)| if r.poc != tpoc && !r.long_term && !tlt { scale_mv(mv, cur_poc.saturating_sub(r.poc), cur_poc.saturating_sub(tpoc)) } else { mv },
+            )
         };
         let pa = [(xp - 1, yp + h), (xp - 1, yp + h - 1)];
         let av_a = [self.pb_avail(xc, yc, ncb, xp, yp, w, h, part_idx, pa[0].0, pa[0].1), self.pb_avail(xc, yc, ncb, xp, yp, w, h, part_idx, pa[1].0, pa[1].1)];

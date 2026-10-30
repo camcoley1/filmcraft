@@ -6,6 +6,14 @@ use crate::spec_tables::{DEFAULT_SCALING_INTER, DEFAULT_SCALING_INTRA};
 use crate::tables::scan_diag;
 use filmcraft_bitstream::BitReader;
 
+/// Reads `ue(v)` and checks its raw value against the spec range `0..=max` before the caller
+/// does any arithmetic on it (a hostile stream can code values up to `u32::MAX`).
+pub(crate) fn read_ue_max(r: &mut BitReader, max: u32, name: &str) -> Result<u32> {
+    let v = r.read_ue()?;
+    ensure!(v <= max, "{name} {v} out of range");
+    Ok(v)
+}
+
 /// General profile / tier / level information.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProfileTierLevel {
@@ -251,7 +259,7 @@ impl ScalingList {
             while m < 6 {
                 let coef_num = if size == 0 { 16 } else { 64 };
                 if !r.read_flag()? {
-                    let delta = r.read_ue()? as usize * step;
+                    let delta = read_ue_max(r, 5, "scaling_list_pred_matrix_id_delta")? as usize * step;
                     ensure!(delta <= m, "scaling_list_pred_matrix_id_delta out of range");
                     if delta == 0 {
                         // default list
@@ -341,12 +349,11 @@ impl StRps {
     pub fn parse(r: &mut BitReader, idx: usize, sets: &[StRps], num_sets: usize) -> Result<StRps> {
         let inter = if idx != 0 { r.read_flag()? } else { false };
         if inter {
-            let delta_idx = if idx == num_sets { r.read_ue()? as usize + 1 } else { 1 };
+            let delta_idx = if idx == num_sets { read_ue_max(r, 63, "delta_idx_minus1")? as usize + 1 } else { 1 };
             ensure!(delta_idx <= idx, "delta_idx_minus1 out of range");
             let rf = &sets[idx - delta_idx];
             let sign = r.read_flag()?;
-            let abs = r.read_ue()? as i32 + 1;
-            ensure!(abs <= 1 << 15, "abs_delta_rps_minus1 out of range");
+            let abs = read_ue_max(r, (1 << 15) - 1, "abs_delta_rps_minus1")? as i32 + 1;
             let delta_rps = if sign { -abs } else { abs };
             let n = rf.num_delta_pocs();
             let mut used = vec![false; n + 1];
@@ -398,15 +405,13 @@ impl StRps {
             let mut out = StRps::default();
             let mut poc = 0i32;
             for _ in 0..nneg {
-                let d = r.read_ue()? as i32 + 1;
-                ensure!(d <= 1 << 15, "delta_poc_s0_minus1 out of range");
+                let d = read_ue_max(r, (1 << 15) - 1, "delta_poc_s0_minus1")? as i32 + 1;
                 poc -= d;
                 out.s0.push((poc, r.read_flag()?));
             }
             poc = 0;
             for _ in 0..npos {
-                let d = r.read_ue()? as i32 + 1;
-                ensure!(d <= 1 << 15, "delta_poc_s1_minus1 out of range");
+                let d = read_ue_max(r, (1 << 15) - 1, "delta_poc_s1_minus1")? as i32 + 1;
                 poc += d;
                 out.s1.push((poc, r.read_flag()?));
             }
@@ -496,12 +501,21 @@ impl Sps {
         let mut conf_win = (0, 0, 0, 0);
         if r.read_flag()? {
             conf_win = (r.read_ue()?, r.read_ue()?, r.read_ue()?, r.read_ue()?);
+            // 7.4.3.2.1: SubWidthC * (left + right) < width, SubHeightC * (top + bottom) < height
+            let (sw, sh) = match chroma_format_idc {
+                1 => (2, 2),
+                2 => (2, 1),
+                _ => (1, 1),
+            };
+            let span = |a: u32, b: u32, unit: u32| a.checked_add(b).and_then(|s| s.checked_mul(unit));
+            let (l, rr, t, b) = conf_win;
+            let fits_x = span(l, rr, sw).is_some_and(|w| w < width);
+            let fits_y = span(t, b, sh).is_some_and(|h| h < height);
+            ensure!(fits_x && fits_y, "conformance window exceeds picture size");
         }
-        let bit_depth_luma = r.read_ue()? + 8;
-        let bit_depth_chroma = r.read_ue()? + 8;
-        ensure!(bit_depth_luma <= 16 && bit_depth_chroma <= 16, "bit depth out of range");
-        let log2_max_poc_lsb = r.read_ue()? + 4;
-        ensure!(log2_max_poc_lsb <= 16, "log2_max_pic_order_cnt_lsb_minus4 out of range");
+        let bit_depth_luma = read_ue_max(&mut r, 8, "bit_depth_luma_minus8")? + 8;
+        let bit_depth_chroma = read_ue_max(&mut r, 8, "bit_depth_chroma_minus8")? + 8;
+        let log2_max_poc_lsb = read_ue_max(&mut r, 12, "log2_max_pic_order_cnt_lsb_minus4")? + 4;
         let ordering_all = r.read_flag()?;
         let (mut dpb, mut reorder, mut latency) = (1, 0, 0);
         let start = if ordering_all { 0 } else { max_sub_layers_minus1 };
@@ -512,10 +526,11 @@ impl Sps {
             latency = r.read_ue()?;
         }
         ensure!(dpb <= 16 && reorder <= 16, "sps_max_dec_pic_buffering out of range");
-        let log2_min_cb = r.read_ue()? + 3;
-        let log2_ctb = log2_min_cb + r.read_ue()?;
-        let log2_min_tb = r.read_ue()? + 2;
-        let log2_max_tb = log2_min_tb + r.read_ue()?;
+        // (CtbLog2SizeY <= 6 bounds every one of these four raw values by 3)
+        let log2_min_cb = read_ue_max(&mut r, 3, "log2_min_luma_coding_block_size_minus3")? + 3;
+        let log2_ctb = log2_min_cb + read_ue_max(&mut r, 3, "log2_diff_max_min_luma_coding_block_size")?;
+        let log2_min_tb = read_ue_max(&mut r, 3, "log2_min_luma_transform_block_size_minus2")? + 2;
+        let log2_max_tb = log2_min_tb + read_ue_max(&mut r, 3, "log2_diff_max_min_luma_transform_block_size")?;
         ensure!((4..=6).contains(&log2_ctb) && log2_min_cb <= log2_ctb, "CTB size out of range");
         ensure!(log2_min_tb < log2_min_cb && log2_max_tb <= log2_ctb.min(5), "transform block sizes out of range");
         ensure!(width % (1 << log2_min_cb) == 0 && height % (1 << log2_min_cb) == 0, "picture size not a multiple of MinCbSizeY");
@@ -534,8 +549,8 @@ impl Sps {
         if pcm {
             pcm_bit_depth_luma = r.read_bits(4)? + 1;
             pcm_bit_depth_chroma = r.read_bits(4)? + 1;
-            log2_min_pcm = r.read_ue()? + 3;
-            log2_max_pcm = log2_min_pcm + r.read_ue()?;
+            log2_min_pcm = read_ue_max(&mut r, 2, "log2_min_pcm_luma_coding_block_size_minus3")? + 3;
+            log2_max_pcm = log2_min_pcm + read_ue_max(&mut r, 2, "log2_diff_max_min_pcm_luma_coding_block_size")?;
             pcm_loop_filter_disabled = r.read_flag()?;
             ensure!(pcm_bit_depth_luma <= bit_depth_luma && pcm_bit_depth_chroma <= bit_depth_chroma, "PCM bit depth out of range");
             ensure!(log2_max_pcm <= log2_ctb.min(5), "PCM size out of range");
@@ -647,10 +662,11 @@ impl Sps {
     pub fn crop_rect(&self) -> (u32, u32, u32, u32) {
         let (l, r, t, b) = self.conf_win;
         let (sw, sh) = (self.sub_width_c(), self.sub_height_c());
-        let x = (l * sw).min(self.width - 1);
-        let y = (t * sh).min(self.height - 1);
-        let w = self.width.saturating_sub(x + r * sw).max(1);
-        let h = self.height.saturating_sub(y + b * sh).max(1);
+        // (parse() bounds the window; saturating keeps a hand-built Sps safe too)
+        let x = l.saturating_mul(sw).min(self.width.saturating_sub(1));
+        let y = t.saturating_mul(sh).min(self.height.saturating_sub(1));
+        let w = self.width.saturating_sub(x.saturating_add(r.saturating_mul(sw))).max(1);
+        let h = self.height.saturating_sub(y.saturating_add(b.saturating_mul(sh))).max(1);
         (x, y, w, h)
     }
 
@@ -780,7 +796,7 @@ impl Pps {
         let num_ref_idx_l0_default = r.read_ue()?.saturating_add(1);
         let num_ref_idx_l1_default = r.read_ue()?.saturating_add(1);
         ensure!(num_ref_idx_l0_default <= 15 && num_ref_idx_l1_default <= 15, "num_ref_idx_default_active out of range");
-        let init_qp = 26 + r.read_se()?;
+        let init_qp = 26i32.saturating_add(r.read_se()?);
         let constrained_intra_pred = r.read_flag()?;
         let transform_skip = r.read_flag()?;
         let cu_qp_delta_enabled = r.read_flag()?;
@@ -827,8 +843,7 @@ impl Pps {
         }
         let scaling_list = if r.read_flag()? { Some(ScalingList::parse(&mut r)?) } else { None };
         let lists_modification_present = r.read_flag()?;
-        let log2_parallel_merge_level = r.read_ue()? + 2;
-        ensure!(log2_parallel_merge_level <= 6, "log2_parallel_merge_level out of range");
+        let log2_parallel_merge_level = read_ue_max(&mut r, 4, "log2_parallel_merge_level_minus2")? + 2;
         let slice_header_extension_present = r.read_flag()?;
         let mut rext = PpsRangeExt::default();
         let mut extension_flags = 0;
@@ -1032,5 +1047,112 @@ impl Layout {
     #[inline]
     pub fn tile_of_rs(&self, rs: u32) -> u32 {
         self.tile_id[self.rs_to_ts[rs as usize] as usize]
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use filmcraft_bitstream::BitWriter;
+
+    /// The ue(v) fields of a Main 4:2:2 10 SPS (64x64, conformance window on, PCM on), in coding
+    /// order, and the name of each.
+    pub(crate) const MAIN422_UE: [(&str, u32); 22] = [
+        ("sps_seq_parameter_set_id", 0),
+        ("chroma_format_idc", 2),
+        ("pic_width_in_luma_samples", 64),
+        ("pic_height_in_luma_samples", 64),
+        ("conf_win_left_offset", 1),
+        ("conf_win_right_offset", 0),
+        ("conf_win_top_offset", 0),
+        ("conf_win_bottom_offset", 2),
+        ("bit_depth_luma_minus8", 2),
+        ("bit_depth_chroma_minus8", 2),
+        ("log2_max_pic_order_cnt_lsb_minus4", 4),
+        ("sps_max_dec_pic_buffering_minus1", 4),
+        ("sps_max_num_reorder_pics", 0),
+        ("sps_max_latency_increase_plus1", 0),
+        ("log2_min_luma_coding_block_size_minus3", 0),
+        ("log2_diff_max_min_luma_coding_block_size", 1),
+        ("log2_min_luma_transform_block_size_minus2", 0),
+        ("log2_diff_max_min_luma_transform_block_size", 2),
+        ("max_transform_hierarchy_depth_inter", 0),
+        ("max_transform_hierarchy_depth_intra", 0),
+        ("log2_min_pcm_luma_coding_block_size_minus3", 0),
+        ("log2_diff_max_min_pcm_luma_coding_block_size", 1),
+    ];
+
+    pub(crate) fn main422_sps(ue: &[(&str, u32); 22]) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_bits(0, 4); // vps id
+        w.write_bits(0, 3); // max_sub_layers_minus1
+        w.write_bits(1, 1); // temporal_id_nesting
+        w.write_bits(0, 2); // profile_space
+        w.write_bits(0, 1); // tier
+        w.write_bits(4, 5); // RExt
+        w.write_bits(0x0800_0000, 32);
+        w.write_bits(0b1001, 4);
+        w.write_bits(0, 32);
+        w.write_bits(0, 11);
+        w.write_bits(0, 1);
+        w.write_bits(93, 8); // level 3.1
+        for (i, &(_, v)) in ue.iter().enumerate() {
+            match i {
+                4 => w.write_bits(1, 1),  // conformance_window_flag
+                11 => w.write_bits(1, 1), // sub_layer_ordering_info_present
+                20 => {
+                    w.write_bits(0, 1); // scaling lists
+                    w.write_bits(0, 1); // amp
+                    w.write_bits(0, 1); // sao
+                    w.write_bits(1, 1); // pcm
+                    w.write_bits(7, 4);
+                    w.write_bits(7, 4);
+                }
+                _ => {}
+            }
+            w.write_ue(v);
+        }
+        w.write_bits(0, 1); // pcm_loop_filter_disabled
+        w.write_ue(0); // num_short_term_ref_pic_sets
+        w.write_bits(0, 1); // long_term_ref_pics_present
+        w.write_bits(0, 1); // temporal mvp
+        w.write_bits(0, 1); // strong intra smoothing
+        w.write_bits(0, 1); // vui
+        w.write_bits(0, 1); // extensions
+        w.rbsp_trailing();
+        w.finish()
+    }
+
+    #[test]
+    fn main422_sps_reference_parses() {
+        let sps = Sps::parse(&main422_sps(&MAIN422_UE)).unwrap();
+        assert_eq!((sps.width, sps.height, sps.bit_depth_luma, sps.log2_ctb), (64, 64, 10, 4));
+        // SubWidthC 2, SubHeightC 1 in 4:2:2
+        assert_eq!(sps.crop_rect(), (2, 0, 62, 62));
+    }
+
+    /// Every ue(v) field at u32::MAX (one at a time) is refused: no overflow panic in debug, no
+    /// wrapped value accepted in release.
+    #[test]
+    fn max_value_sps_fields_are_refused() {
+        for i in 0..MAIN422_UE.len() {
+            if matches!(i, 12 | 13) {
+                continue; // reorder / latency: bounded by dpb or unused, u32::MAX is harmless
+            }
+            let mut ue = MAIN422_UE;
+            ue[i].1 = u32::MAX;
+            assert!(Sps::parse(&main422_sps(&ue)).is_err(), "{} = u32::MAX accepted", ue[i].0);
+        }
+        // conformance window offsets whose sum wraps u32
+        let mut ue = MAIN422_UE;
+        ue[4].1 = 1 << 31;
+        ue[5].1 = 1 << 31;
+        assert!(Sps::parse(&main422_sps(&ue)).is_err());
+        // one past each spec maximum
+        for (i, max) in [(8, 8), (9, 8), (10, 12), (14, 3), (15, 3), (16, 3), (17, 3), (20, 2), (21, 2)] {
+            let mut ue = MAIN422_UE;
+            ue[i].1 = max + 1;
+            assert!(Sps::parse(&main422_sps(&ue)).is_err(), "{} = {} accepted", ue[i].0, max + 1);
+        }
     }
 }

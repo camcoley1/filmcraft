@@ -117,12 +117,27 @@ pub struct Planes<P> {
     pub cheight: usize,
 }
 
+/// `vec![v; n]` that returns `None` instead of aborting when the allocation fails.
+pub(crate) fn try_vec<T: Clone>(n: usize, v: T) -> Option<Vec<T>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(n).ok()?;
+    out.resize(n, v);
+    Some(out)
+}
+
 impl<P: Pixel> Planes<P> {
     /// Black luma, mid-grey chroma.
     pub fn new(width: usize, height: usize, fmt: Format) -> Self {
         let (cw, ch) = (width / 2, height * fmt.mb_height_c() / 16);
         let gc = P::from_i32(1 << (fmt.bit_depth_c.clamp(1, 16) - 1));
         Planes { y: vec![P::default(); width * height], cb: vec![gc; cw * ch], cr: vec![gc; cw * ch], width, height, cwidth: cw, cheight: ch }
+    }
+    /// [`Planes::new`], or `None` when the memory is not available.
+    pub fn try_new(width: usize, height: usize, fmt: Format) -> Option<Self> {
+        let (cw, ch) = (width / 2, height * fmt.mb_height_c() / 16);
+        let gc = P::from_i32(1 << (fmt.bit_depth_c.clamp(1, 16) - 1));
+        let (y, cb, cr) = (try_vec(width * height, P::default())?, try_vec(cw * ch, gc)?, try_vec(cw * ch, gc)?);
+        Some(Planes { y, cb, cr, width, height, cwidth: cw, cheight: ch })
     }
     /// Mid-grey planes.
     pub fn gray(width: usize, height: usize, fmt: Format) -> Self {

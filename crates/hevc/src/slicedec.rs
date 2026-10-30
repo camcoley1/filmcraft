@@ -140,7 +140,8 @@ pub struct PicState<S> {
 }
 
 impl<S: Sample> PicState<S> {
-    pub fn new(frame: FrameRef, sps: Arc<Sps>, pps: Arc<Pps>, layout: Arc<Layout>, scaling: Option<Arc<Vec<Vec<u8>>>>) -> Self {
+    /// The reconstruction state of `frame`, or `None` when its buffers cannot be allocated.
+    pub fn try_new(frame: FrameRef, sps: Arc<Sps>, pps: Arc<Pps>, layout: Arc<Layout>, scaling: Option<Arc<Vec<Vec<u8>>>>) -> Option<Self> {
         let (width, height) = (sps.width as usize, sps.height as usize);
         let (sx, sy) = (frame.sx, frame.sy);
         let (cwidth, cheight) = (width >> sx, height >> sy);
@@ -150,7 +151,7 @@ impl<S: Sample> PicState<S> {
         let (bd_y, bd_c) = (sps.bit_depth_luma, sps.bit_depth_chroma);
         let gy = S::from_u16(1u16 << (bd_y - 1));
         let gc = S::from_u16(1u16 << (bd_c - 1));
-        PicState {
+        Some(PicState {
             poc: frame.poc,
             frame,
             sps,
@@ -169,12 +170,12 @@ impl<S: Sample> PicState<S> {
             hctb,
             bd_y,
             bd_c,
-            planes: [vec![gy; width * height], vec![gc; cwidth * cheight], vec![gc; cwidth * cheight]],
-            blk: vec![Blk::default(); w4 * h4],
-            mvf: vec![MvField::default(); w4 * h4],
-            ctb_slice: vec![u32::MAX; wctb * hctb],
-            ctb_addr: vec![u32::MAX; wctb * hctb],
-            sao: vec![SaoParams::default(); wctb * hctb],
+            planes: [try_vec(width * height, gy)?, try_vec(cwidth * cheight, gc)?, try_vec(cwidth * cheight, gc)?],
+            blk: try_vec(w4 * h4, Blk::default())?,
+            mvf: try_vec(w4 * h4, MvField::default())?,
+            ctb_slice: try_vec(wctb * hctb, u32::MAX)?,
+            ctb_addr: try_vec(wctb * hctb, u32::MAX)?,
+            sao: try_vec(wctb * hctb, SaoParams::default())?,
             slices: Vec::new(),
             row_done: vec![0; hctb],
             rows_complete: 0,
@@ -185,7 +186,7 @@ impl<S: Sample> PicState<S> {
             scaling,
             deblocking_enabled_anywhere: false,
             draft: false,
-        }
+        })
     }
 
     /// z-scan order availability (6.4.1) of luma location (xn, yn) for the block at (xc, yc) in the slice
@@ -212,6 +213,14 @@ impl<S: Sample> PicState<S> {
     pub fn blk_at(&self, x: i32, y: i32) -> &Blk {
         &self.blk[(y as usize >> 2) * self.w4 + (x as usize >> 2)]
     }
+}
+
+/// `vec![v; n]` that returns `None` instead of aborting when the allocation fails.
+fn try_vec<T: Clone>(n: usize, v: T) -> Option<Vec<T>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(n).ok()?;
+    out.resize(n, v);
+    Some(out)
 }
 
 #[inline]

@@ -565,6 +565,11 @@ fn poc_type1_reordering() {
 
 /// SPS of a High 10 / High 4:2:2 picture of MB_W x MB_H macroblocks (POC type 2, one reference).
 fn sps_high(chroma_format_idc: u32, bit_depth: u32) -> Vec<u8> {
+    sps_high_sized(chroma_format_idc, bit_depth, MB_W as u32, MB_H as u32)
+}
+
+/// [`sps_high`] of `mb_w` x `mb_h` macroblocks.
+fn sps_high_sized(chroma_format_idc: u32, bit_depth: u32, mb_w: u32, mb_h: u32) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.write_bits(if chroma_format_idc == 2 { 122 } else { 110 }, 8);
     w.write_bits(0, 8);
@@ -579,14 +584,29 @@ fn sps_high(chroma_format_idc: u32, bit_depth: u32) -> Vec<u8> {
     w.write_ue(2); // pic_order_cnt_type
     w.write_ue(1); // max_num_ref_frames
     w.write_bit(false);
-    w.write_ue(MB_W as u32 - 1);
-    w.write_ue(MB_H as u32 - 1);
+    w.write_ue(mb_w - 1);
+    w.write_ue(mb_h - 1);
     w.write_bit(true); // frame_mbs_only
     w.write_bit(true); // direct_8x8_inference
     w.write_bit(false); // cropping
     w.write_bit(false); // vui
     w.rbsp_trailing();
     nal(3, 7, &w.finish())
+}
+
+/// A 16384x16384 10-bit 4:2:2 SPS (the largest the parser accepts) is refused before its ~2 GiB
+/// of picture buffers are allocated, with an error that says why.
+#[test]
+fn oversized_picture_is_refused_before_allocation() {
+    let mut stream = sps_high_sized(2, 10, 1024, 1024);
+    stream.extend(pps(false, false));
+    stream.extend(slice_nal(&Pic { idr: true, frame_num: 0, ref_idc: 3, mbs: vec![None], ..Default::default() }, false));
+    for threads in [1, 2] {
+        let mut dec = Decoder::with_threads(threads);
+        let e = dec.decode(&stream, 0).unwrap_err().to_string();
+        assert!(e.contains("frame too large for software decode: "), "{e}");
+        assert!(dec.flush().is_empty());
+    }
 }
 
 /// I_PCM at high bit depths (CAVLC and CABAC): an IDR picture of random PCM macroblocks with

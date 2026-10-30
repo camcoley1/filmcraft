@@ -1,7 +1,7 @@
 //! NAL unit header and slice header parsing (7.3.1, 7.3.3).
 
 use crate::error::{Result, ensure};
-use crate::params::{Pps, Sps};
+use crate::params::{Pps, Sps, read_ue_max};
 use filmcraft_bitstream::BitReader;
 
 /// NAL unit types used by the decoder.
@@ -144,7 +144,7 @@ pub struct SliceHeader {
 
 impl SliceHeader {
     pub fn qp(&self, pps: &Pps) -> i32 {
-        pps.pic_init_qp + self.slice_qp_delta
+        pps.pic_init_qp.saturating_add(self.slice_qp_delta)
     }
     pub fn has_mmco5(&self) -> bool {
         self.mmcos.iter().any(|m| m.op == 5)
@@ -195,9 +195,9 @@ impl SliceHeader {
         let mut num_ref_idx_active = [pps.num_ref_idx_l0_default_active, pps.num_ref_idx_l1_default_active];
         if !slice_type.is_intra() {
             if r.read_flag()? {
-                num_ref_idx_active[0] = r.read_ue()? + 1;
+                num_ref_idx_active[0] = read_ue_max(&mut r, 31, "num_ref_idx_l0_active_minus1")? + 1;
                 if slice_type.is_b() {
-                    num_ref_idx_active[1] = r.read_ue()? + 1;
+                    num_ref_idx_active[1] = read_ue_max(&mut r, 31, "num_ref_idx_l1_active_minus1")? + 1;
                 }
             }
             let max = if field_pic { 32 } else { 16 };
@@ -303,7 +303,7 @@ impl SliceHeader {
             ensure!(cabac_init_idc <= 2, "cabac_init_idc out of range");
         }
         let slice_qp_delta = r.read_se()?;
-        let qp = pps.pic_init_qp + slice_qp_delta;
+        let qp = pps.pic_init_qp.saturating_add(slice_qp_delta);
         let qp_bd_offset_y = 6 * sps.bit_depth_luma.saturating_sub(8) as i32;
         ensure!((-qp_bd_offset_y..=51).contains(&qp), "slice QP {qp} out of range");
         let mut sp_for_switch = false;
@@ -426,45 +426,49 @@ impl Poc {
 
 impl PocState {
     /// Compute TopFieldOrderCnt/BottomFieldOrderCnt of a frame (8.2.1.1-8.2.1.3).
+    ///
+    /// The SPS / slice offsets each span the whole i32 range, so their sums can leave it on a
+    /// hostile stream; the arithmetic wraps instead of overflowing (a conforming stream stays
+    /// in range, 8.2.1).
     pub fn compute(&self, sh: &SliceHeader, sps: &Sps) -> Poc {
         match sps.pic_order_cnt_type {
             0 => {
                 let (prev_msb, prev_lsb) = if sh.idr { (0, 0) } else { (self.prev_ref_msb, self.prev_ref_lsb) };
                 let max_lsb = 1i32 << sps.log2_max_poc_lsb;
                 let lsb = sh.pic_order_cnt_lsb as i32;
-                let msb = if lsb < prev_lsb && prev_lsb - lsb >= max_lsb / 2 {
-                    prev_msb + max_lsb
+                let msb = if lsb < prev_lsb && prev_lsb.wrapping_sub(lsb) >= max_lsb / 2 {
+                    prev_msb.wrapping_add(max_lsb)
                 } else if lsb > prev_lsb && lsb - prev_lsb > max_lsb / 2 {
-                    prev_msb - max_lsb
+                    prev_msb.wrapping_sub(max_lsb)
                 } else {
                     prev_msb
                 };
-                let top = msb + lsb;
-                let bottom = top + sh.delta_pic_order_cnt_bottom;
+                let top = msb.wrapping_add(lsb);
+                let bottom = top.wrapping_add(sh.delta_pic_order_cnt_bottom);
                 Poc { top, bottom, msb, frame_num_offset: 0 }
             }
             1 => {
                 let frame_num_offset = self.frame_num_offset(sh.idr, sh.frame_num, sps);
                 let n = sps.offset_for_ref_frame.len() as i32;
-                let mut abs_frame_num = if n != 0 { frame_num_offset + sh.frame_num as i32 } else { 0 };
+                let mut abs_frame_num = if n != 0 { frame_num_offset.wrapping_add(sh.frame_num as i32) } else { 0 };
                 if sh.nal_ref_idc == 0 && abs_frame_num > 0 {
                     abs_frame_num -= 1;
                 }
                 let mut expected = 0i32;
-                if abs_frame_num > 0 {
+                if abs_frame_num > 0 && n > 0 {
                     let cycle_cnt = (abs_frame_num - 1) / n;
-                    let in_cycle = (abs_frame_num - 1) % n;
-                    let delta_cycle: i32 = sps.offset_for_ref_frame.iter().sum();
+                    let in_cycle = ((abs_frame_num - 1) % n) as usize;
+                    let delta_cycle = sps.offset_for_ref_frame.iter().fold(0i32, |a, &o| a.wrapping_add(o));
                     expected = cycle_cnt.wrapping_mul(delta_cycle);
-                    for &o in &sps.offset_for_ref_frame[..=in_cycle as usize] {
-                        expected += o;
+                    for &o in sps.offset_for_ref_frame.iter().take(in_cycle + 1) {
+                        expected = expected.wrapping_add(o);
                     }
                 }
                 if sh.nal_ref_idc == 0 {
-                    expected += sps.offset_for_non_ref_pic;
+                    expected = expected.wrapping_add(sps.offset_for_non_ref_pic);
                 }
-                let top = expected + sh.delta_pic_order_cnt[0];
-                let bottom = top + sps.offset_for_top_to_bottom_field + sh.delta_pic_order_cnt[1];
+                let top = expected.wrapping_add(sh.delta_pic_order_cnt[0]);
+                let bottom = top.wrapping_add(sps.offset_for_top_to_bottom_field).wrapping_add(sh.delta_pic_order_cnt[1]);
                 Poc { top, bottom, msb: 0, frame_num_offset }
             }
             _ => {
@@ -472,9 +476,9 @@ impl PocState {
                 let temp = if sh.idr {
                     0
                 } else if sh.nal_ref_idc == 0 {
-                    2 * (frame_num_offset + sh.frame_num as i32) - 1
+                    frame_num_offset.wrapping_add(sh.frame_num as i32).wrapping_mul(2).wrapping_sub(1)
                 } else {
-                    2 * (frame_num_offset + sh.frame_num as i32)
+                    frame_num_offset.wrapping_add(sh.frame_num as i32).wrapping_mul(2)
                 };
                 Poc { top: temp, bottom: temp, msb: 0, frame_num_offset }
             }
@@ -485,7 +489,7 @@ impl PocState {
         if idr {
             0
         } else if self.prev_frame_num > frame_num {
-            self.prev_frame_num_offset + sps.max_frame_num() as i32
+            self.prev_frame_num_offset.wrapping_add(sps.max_frame_num() as i32)
         } else {
             self.prev_frame_num_offset
         }
@@ -498,7 +502,7 @@ impl PocState {
         if sh.nal_ref_idc != 0 {
             if mmco5 {
                 self.prev_ref_msb = 0;
-                self.prev_ref_lsb = poc.top - poc.frame();
+                self.prev_ref_lsb = poc.top.wrapping_sub(poc.frame());
             } else {
                 self.prev_ref_msb = poc.msb;
                 self.prev_ref_lsb = sh.pic_order_cnt_lsb as i32;

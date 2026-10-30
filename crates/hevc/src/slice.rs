@@ -1,7 +1,7 @@
 //! NAL unit header (7.3.1.2) and slice segment header (7.3.6).
 
 use crate::error::{Result, ensure, invalid};
-use crate::params::{Pps, Sps, StRps};
+use crate::params::{Pps, Sps, StRps, read_ue_max};
 use filmcraft_bitstream::BitReader;
 
 pub mod nal_type {
@@ -295,9 +295,9 @@ impl SliceHeader {
             if sh.slice_type != SliceType::I {
                 sh.num_ref_idx = [pps.num_ref_idx_l0_default, if sh.is_b() { pps.num_ref_idx_l1_default } else { 0 }];
                 if r.read_flag()? {
-                    sh.num_ref_idx[0] = r.read_ue()? + 1;
+                    sh.num_ref_idx[0] = read_ue_max(&mut r, 14, "num_ref_idx_l0_active_minus1")? + 1;
                     if sh.is_b() {
-                        sh.num_ref_idx[1] = r.read_ue()? + 1;
+                        sh.num_ref_idx[1] = read_ue_max(&mut r, 14, "num_ref_idx_l1_active_minus1")? + 1;
                     }
                 }
                 ensure!(sh.num_ref_idx[0] <= 15 && sh.num_ref_idx[1] <= 15, "num_ref_idx_active out of range");
@@ -341,7 +341,7 @@ impl SliceHeader {
                 sh.max_num_merge_cand = 5 - five_minus;
             }
             sh.qp_delta = r.read_se()?;
-            let qp = pps.init_qp + sh.qp_delta;
+            let qp = pps.init_qp.saturating_add(sh.qp_delta);
             let qp_bd = 6 * (sps.bit_depth_luma as i32 - 8);
             ensure!((-qp_bd..=51).contains(&qp), "SliceQpY {qp} out of range");
             if pps.slice_chroma_qp_offsets_present {
@@ -370,10 +370,9 @@ impl SliceHeader {
             let n = r.read_ue()?;
             ensure!(n <= sps.pic_width_in_ctbs() * sps.pic_height_in_ctbs(), "num_entry_point_offsets out of range");
             if n > 0 {
-                let len = r.read_ue()? + 1;
-                ensure!(len <= 32, "offset_len_minus1 out of range");
+                let len = read_ue_max(&mut r, 31, "offset_len_minus1")? + 1;
                 for _ in 0..n {
-                    sh.entry_points.push(r.read_bits(len)? + 1);
+                    sh.entry_points.push(r.read_bits(len)?.saturating_add(1));
                 }
             }
         }
@@ -396,7 +395,7 @@ fn parse_pwt(r: &mut BitReader, sh: &SliceHeader, sps: &Sps) -> Result<PredWeigh
     ensure!(t.luma_log2_denom <= 7, "luma_log2_weight_denom out of range");
     let chroma = sps.chroma_array_type() != 0;
     if chroma {
-        let d = t.luma_log2_denom as i32 + r.read_se()?;
+        let d = (t.luma_log2_denom as i32).saturating_add(r.read_se()?);
         ensure!((0..=7).contains(&d), "ChromaLog2WeightDenom out of range");
         t.chroma_log2_denom = d as u32;
     }

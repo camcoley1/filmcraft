@@ -4,6 +4,14 @@ use crate::error::{Result, ensure, unsupported};
 use crate::tables::*;
 use filmcraft_bitstream::BitReader;
 
+/// Reads `ue(v)` and checks its raw value against the spec range `0..=max` before the caller
+/// does any arithmetic on it (a hostile stream can code values up to `u32::MAX`).
+pub(crate) fn read_ue_max(r: &mut BitReader, max: u32, name: &str) -> Result<u32> {
+    let v = r.read_ue()?;
+    ensure!(v <= max, "{name} {v} out of range");
+    Ok(v)
+}
+
 /// Scaling matrices after applying fall-back rules, stored in raster order (weightScale).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScalingMatrices {
@@ -150,8 +158,7 @@ pub struct HrdParameters {
 }
 
 fn parse_hrd(r: &mut BitReader) -> Result<HrdParameters> {
-    let cpb_cnt = r.read_ue()? + 1;
-    ensure!(cpb_cnt <= 32, "cpb_cnt_minus1 out of range");
+    let cpb_cnt = read_ue_max(r, 31, "cpb_cnt_minus1")? + 1;
     let mut h = HrdParameters { cpb_cnt, bit_rate_scale: r.read_bits(4)? as u8, cpb_size_scale: r.read_bits(4)? as u8, ..Default::default() };
     for _ in 0..cpb_cnt {
         h.bit_rate_value_minus1.push(r.read_ue()?);
@@ -353,9 +360,8 @@ impl Sps {
             if chroma_format_idc == 3 {
                 separate_colour_plane = r.read_flag()?;
             }
-            bit_depth_luma = r.read_ue()? + 8;
-            bit_depth_chroma = r.read_ue()? + 8;
-            ensure!(bit_depth_luma <= 14 && bit_depth_chroma <= 14, "bit depth out of range");
+            bit_depth_luma = read_ue_max(&mut r, 6, "bit_depth_luma_minus8")? + 8;
+            bit_depth_chroma = read_ue_max(&mut r, 6, "bit_depth_chroma_minus8")? + 8;
             bypass = r.read_flag()?;
             seq_scaling_matrix_present = r.read_flag()?;
             if seq_scaling_matrix_present {
@@ -363,8 +369,7 @@ impl Sps {
                 scaling_lists = parse_scaling_lists(&mut r, count, None)?;
             }
         }
-        let log2_max_frame_num = r.read_ue()? + 4;
-        ensure!(log2_max_frame_num <= 16, "log2_max_frame_num out of range");
+        let log2_max_frame_num = read_ue_max(&mut r, 12, "log2_max_frame_num_minus4")? + 4;
         let pic_order_cnt_type = r.read_ue()?;
         ensure!(pic_order_cnt_type <= 2, "pic_order_cnt_type out of range");
         let mut log2_max_poc_lsb = 0;
@@ -373,8 +378,7 @@ impl Sps {
         let mut offset_for_top_to_bottom_field = 0;
         let mut offset_for_ref_frame = Vec::new();
         if pic_order_cnt_type == 0 {
-            log2_max_poc_lsb = r.read_ue()? + 4;
-            ensure!(log2_max_poc_lsb <= 16, "log2_max_pic_order_cnt_lsb out of range");
+            log2_max_poc_lsb = read_ue_max(&mut r, 12, "log2_max_pic_order_cnt_lsb_minus4")? + 4;
         } else if pic_order_cnt_type == 1 {
             delta_pic_order_always_zero = r.read_flag()?;
             offset_for_non_ref_pic = r.read_se()?;
@@ -388,9 +392,8 @@ impl Sps {
         let max_num_ref_frames = r.read_ue()?;
         ensure!(max_num_ref_frames <= 16, "max_num_ref_frames out of range");
         let gaps_in_frame_num_allowed = r.read_flag()?;
-        let pic_width_in_mbs = r.read_ue()? + 1;
-        let pic_height_in_map_units = r.read_ue()? + 1;
-        ensure!(pic_width_in_mbs <= 1024 && pic_height_in_map_units <= 1024, "picture too large");
+        let pic_width_in_mbs = read_ue_max(&mut r, 1023, "pic_width_in_mbs_minus1")? + 1;
+        let pic_height_in_map_units = read_ue_max(&mut r, 1023, "pic_height_in_map_units_minus1")? + 1;
         let frame_mbs_only = r.read_flag()?;
         let mb_adaptive_frame_field = if !frame_mbs_only { r.read_flag()? } else { false };
         let direct_8x8_inference = r.read_flag()?;
@@ -429,7 +432,10 @@ impl Sps {
         };
         if let Some((l, rr, t, b)) = sps.frame_crop {
             let (cx, cy) = sps.crop_unit();
-            ensure!((l + rr) * cx < sps.width() && (t + b) * cy < sps.height(), "frame cropping exceeds picture size");
+            let span = |a: u32, b: u32, unit: u32| a.checked_add(b).and_then(|s| s.checked_mul(unit));
+            let fits_x = span(l, rr, cx).is_some_and(|w| w < sps.width());
+            let fits_y = span(t, b, cy).is_some_and(|h| h < sps.height());
+            ensure!(fits_x && fits_y, "frame cropping exceeds picture size");
         }
         Ok(sps)
     }
@@ -466,7 +472,11 @@ impl Sps {
             None => (0, 0, self.width(), self.height()),
             Some((l, r, t, b)) => {
                 let (cx, cy) = self.crop_unit();
-                (l * cx, t * cy, self.width() - (l + r) * cx, self.height() - (t + b) * cy)
+                // (parse() bounds the window; saturating keeps a hand-built Sps safe too)
+                let (x, y) = (l.saturating_mul(cx).min(self.width()), t.saturating_mul(cy).min(self.height()));
+                let w = self.width().saturating_sub(l.saturating_add(r).saturating_mul(cx));
+                let h = self.height().saturating_sub(t.saturating_add(b).saturating_mul(cy));
+                (x, y, w, h)
             }
         }
     }
@@ -685,7 +695,7 @@ impl Pps {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use filmcraft_bitstream::BitWriter;
 
@@ -737,5 +747,80 @@ mod tests {
         assert_eq!((sps.width(), sps.height()), (176, 144));
         assert_eq!(sps.pic_order_cnt_type, 2);
         assert_eq!(sps.crop_rect(), (0, 0, 176, 144));
+    }
+
+    /// The ue(v) fields of a High 4:2:2 SPS (176x144, cropping on), in coding order, and the
+    /// name of each.
+    pub(crate) const HIGH422_UE: [(&str, u32); 14] = [
+        ("seq_parameter_set_id", 0),
+        ("chroma_format_idc", 2),
+        ("bit_depth_luma_minus8", 2),
+        ("bit_depth_chroma_minus8", 2),
+        ("log2_max_frame_num_minus4", 0),
+        ("pic_order_cnt_type", 0),
+        ("log2_max_pic_order_cnt_lsb_minus4", 2),
+        ("max_num_ref_frames", 1),
+        ("pic_width_in_mbs_minus1", 10),
+        ("pic_height_in_map_units_minus1", 8),
+        ("frame_crop_left_offset", 0),
+        ("frame_crop_right_offset", 1),
+        ("frame_crop_top_offset", 0),
+        ("frame_crop_bottom_offset", 2),
+    ];
+
+    pub(crate) fn high422_sps(ue: &[(&str, u32); 14]) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_bits(122, 8);
+        w.write_bits(0, 8);
+        w.write_bits(40, 8);
+        for (i, &(_, v)) in ue.iter().enumerate() {
+            w.write_ue(v);
+            match i {
+                3 => {
+                    w.write_bit(false); // qpprime_y_zero_transform_bypass
+                    w.write_bit(false); // seq_scaling_matrix_present
+                }
+                7 => w.write_bit(false), // gaps_in_frame_num_value_allowed
+                9 => {
+                    w.write_bit(true); // frame_mbs_only
+                    w.write_bit(true); // direct_8x8_inference
+                    w.write_bit(true); // frame_cropping
+                }
+                _ => {}
+            }
+        }
+        w.write_bit(false); // vui
+        w.rbsp_trailing();
+        w.finish()
+    }
+
+    #[test]
+    fn high422_sps_reference_parses() {
+        let sps = Sps::parse(&high422_sps(&HIGH422_UE)).unwrap();
+        assert_eq!((sps.width(), sps.height(), sps.bit_depth_luma), (176, 144, 10));
+        // CropUnitX 2, CropUnitY 1 in 4:2:2 progressive
+        assert_eq!(sps.crop_rect(), (0, 0, 174, 142));
+    }
+
+    /// Every ue(v) field at u32::MAX (one at a time) is refused: no overflow panic in debug, no
+    /// wrapped value accepted in release (pic_width_in_mbs_minus1 used to wrap to 0 MBs).
+    #[test]
+    fn max_value_sps_fields_are_refused() {
+        for i in 0..HIGH422_UE.len() {
+            let mut ue = HIGH422_UE;
+            ue[i].1 = u32::MAX;
+            assert!(Sps::parse(&high422_sps(&ue)).is_err(), "{} = u32::MAX accepted", ue[i].0);
+        }
+        // crop offsets whose sum wraps u32
+        let mut ue = HIGH422_UE;
+        ue[10].1 = 1 << 31;
+        ue[11].1 = 1 << 31;
+        assert!(Sps::parse(&high422_sps(&ue)).is_err());
+        // one past each spec maximum
+        for (i, max) in [(2, 6), (3, 6), (4, 12), (6, 12), (8, 1023), (9, 1023)] {
+            let mut ue = HIGH422_UE;
+            ue[i].1 = max + 1;
+            assert!(Sps::parse(&high422_sps(&ue)).is_err(), "{} = {} accepted", ue[i].0, max + 1);
+        }
     }
 }
