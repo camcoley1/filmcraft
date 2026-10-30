@@ -615,7 +615,7 @@ fn retime_effect(e: &mut filmcraft_project::EffectInstance, from: &TrackItem, to
             t0 + (k - f0)
         }
     };
-    for p in e.params.values_mut() {
+    for (_, p) in e.all_params_mut() {
         for k in &mut p.keyframes {
             k.time = map(k.time);
         }

@@ -189,7 +189,13 @@ fn edit_mask<R>(s: &mut Session, p: &Value, label: &str, f: impl FnOnce(&mut Mas
         let e = &mut it.effects[ei];
         let mi = mask_i.ok_or_else(|| bad(label, "need `mask`"))?;
         let m = e.masks.get_mut(mi).ok_or_else(|| bad(label, format!("no mask {mi}")))?;
-        f(m, mt)
+        let old = m.name.clone();
+        let r = f(m, mt)?;
+        // Lumetri nodes limited to the mask follow its rename (M8d)
+        if let Some(new) = e.masks.get(mi).map(|m| m.name.clone()).filter(|n| *n != old) {
+            filmcraft_project::color_graph::rename_mask(e, &old, Some(&new));
+        }
+        Ok(r)
     };
     match str_p(p, "merge") {
         Some(k) => {
@@ -267,7 +273,11 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
         if mask_i >= e.masks.len() {
             return Err(bad("masks.remove", format!("no mask {mask_i}")));
         }
-        e.masks.remove(mask_i);
+        let removed = e.masks.remove(mask_i);
+        // Lumetri nodes limited to it become unlimited (unless another mask has its name)
+        if !e.masks.iter().any(|m| m.name == removed.name) {
+            filmcraft_project::color_graph::rename_mask(e, &removed.name, None);
+        }
         if st.selected_mask.is_some_and(|x| x.clip == clip && x.effect == ei) {
             st.selected_mask = None;
         }

@@ -238,9 +238,10 @@ pub fn builtin_presets() -> Vec<EffectPreset> {
 
 // ---------------------------------------------------------------- save / apply
 
-/// Every parameter of an effect instance (its own and its masks').
+/// Every parameter of an effect instance (its own, its Lumetri nodes' and its masks').
 fn params_mut(e: &mut EffectInstance) -> Vec<&mut Param> {
     let mut v: Vec<&mut Param> = e.params.values_mut().collect();
+    v.extend(filmcraft_project::color_graph::node_params_mut(&mut e.color).map(|(_, p)| p));
     for m in &mut e.masks {
         v.extend(m.params_mut());
     }
@@ -320,7 +321,7 @@ pub fn instantiate(p: &EffectPreset, target: &TrackItem, size: (u32, u32)) -> Ve
             .def()
             .map(|d| d.params.iter().filter(|q| matches!(q.kind, filmcraft_project::ParamKind::Point)).map(|q| q.id.to_string()).collect())
             .unwrap_or_default();
-        for (id, prm) in e.params.iter_mut() {
+        for (id, prm) in e.all_params_mut() {
             for k in &mut prm.keyframes {
                 k.time = retime(k.time, p.keyframes, p.source_duration, target);
             }

@@ -156,3 +156,180 @@ fn hostile_parameters_are_refused() {
     assert_eq!(nodes(&s.execute("color.nodes", json!({})).unwrap()), cg::MAX_NODES);
     let _ = ParamValue::Bool(true);
 }
+
+#[test]
+fn node_commands_are_atomic_and_need_lumetri() {
+    let mut s = demo();
+    let (c, _) = clips(&mut s);
+    let has = |s: &Session| s.active_sequence().unwrap().find_item(c).unwrap().1.effects.iter().any(|e| e.effect == "lumetri");
+    // commands that edit an existing grade refuse a clip without Lumetri and add nothing
+    for (id, p) in [
+        ("color.removeNode", json!({"node": 5})),
+        ("color.selectNode", json!({"node": 0})),
+        ("color.setNodeMix", json!({"node": 0, "mix": 0.5})),
+        ("color.version.delete", json!({})),
+        ("color.resetGrade", json!({})),
+    ] {
+        assert!(s.execute(id, p).is_err(), "{id}");
+        assert!(!has(&s), "{id} left no Lumetri behind");
+    }
+    // adding a node to a clip without Lumetri is one undo step, Lumetri included
+    s.execute("color.addNode", json!({})).unwrap();
+    assert!(has(&s));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(!has(&s), "one undo removes the node and the Lumetri it needed");
+    // a failing add (after = not an index) changes nothing either
+    assert!(s.execute("color.addNode", json!({"after": "x"})).is_err());
+    assert!(!has(&s));
+    s.execute("color.version.add", json!({})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(!has(&s));
+}
+
+#[test]
+fn versions_are_addressed_by_index_or_name() {
+    let mut s = demo();
+    clips(&mut s);
+    s.execute("color.version.add", json!({})).unwrap();
+    s.execute("color.version.add", json!({})).unwrap();
+    // C is active: deleting by name deletes B, not the active version
+    let r = s.execute("color.version.delete", json!({"name": "B"})).unwrap();
+    assert_eq!(r["versions"], json!(["A", "C"]));
+    assert_eq!(r["active"], 1);
+    let r = s.execute("color.version.rename", json!({"version": "A", "name": "Day"})).unwrap();
+    assert_eq!((r["versions"].clone(), r["active"].clone()), (json!(["Day", "C"]), json!(1)), "renaming A leaves C active");
+    let r = s.execute("color.version.switch", json!({"version": "Day"})).unwrap();
+    assert_eq!(r["active"], 0);
+    assert!(s.execute("color.version.delete", json!({"version": "Nope"})).is_err());
+    assert!(s.execute("color.version.switch", json!({"name": "Nope"})).is_err());
+    let r = s.execute("color.version.delete", json!({"version": 1})).unwrap();
+    assert_eq!(r["versions"], json!(["Day"]));
+}
+
+#[test]
+fn clicking_through_nodes_and_dragging_mix_are_one_undo_step_each() {
+    let mut s = demo();
+    let (c, _) = clips(&mut s);
+    s.execute("color.addNode", json!({})).unwrap();
+    s.execute("color.addNode", json!({})).unwrap();
+    let selected = |s: &mut Session| s.execute("color.nodes", json!({})).unwrap()["nodes"].as_array().unwrap().iter().position(|n| n["selected"] == true);
+    assert_eq!(selected(&mut s), Some(2));
+    for n in [0, 1, 0, 2, 1] {
+        s.execute("color.selectNode", json!({"node": n})).unwrap();
+    }
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(selected(&mut s), Some(2), "one undo returns to the node selected before the clicks");
+    for m in [0.9, 0.7, 0.5, 0.3] {
+        s.execute("color.setNodeMix", json!({"node": 2, "mix": m})).unwrap();
+    }
+    assert_eq!(cg::active_nodes(&lumetri(&s, c))[2].mix, 0.3);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(cg::active_nodes(&lumetri(&s, c))[2].mix, 1.0, "the whole drag undoes at once");
+}
+
+#[test]
+fn node_masks_follow_mask_renames_and_removal() {
+    let mut s = demo();
+    let (c, _) = clips(&mut s);
+    s.execute("color.addNode", json!({})).unwrap();
+    let li = s.active_sequence().unwrap().find_item(c).unwrap().1.effects.iter().position(|e| e.effect == "lumetri").unwrap();
+    let r = s.execute("masks.add", json!({"clip": c.0, "effect": li, "shape": "ellipse"})).unwrap();
+    let name = r["name"].as_str().unwrap().to_string();
+    s.execute("color.setNodeMask", json!({"node": 1, "mask": name})).unwrap();
+    s.execute("masks.set", json!({"clip": c.0, "effect": li, "mask": 0, "name": "Face"})).unwrap();
+    assert_eq!(cg::active_nodes(&lumetri(&s, c))[1].mask, Some("Face"));
+    s.execute("masks.remove", json!({"clip": c.0, "effect": li, "mask": 0})).unwrap();
+    assert_eq!(cg::active_nodes(&lumetri(&s, c))[1].mask, None, "no dangling name a later mask could take over");
+}
+
+/// Keyframe upkeep: a keyframed node that is not selected must come out of every edit exactly as
+/// it does when it is the selected node (whose parameters are the effect's own).
+#[test]
+fn keyframes_of_other_nodes_follow_every_edit() {
+    use filmcraft_time::Tick;
+    type Edit = fn(&mut Session, ClipId, ClipId) -> ClipId;
+    let edits: [(&str, Edit); 6] = [
+        ("paste attributes", |s, a, b| {
+            s.execute("timeline.select", json!({"clips": [a.0]})).unwrap();
+            s.execute("edit.copy", json!({})).unwrap();
+            s.execute("edit.pasteAttributes", json!({"clips": [b.0]})).unwrap();
+            b
+        }),
+        ("paste grade", |s, a, b| {
+            s.execute("color.copyGrade", json!({"clip": a.0})).unwrap();
+            s.execute("color.pasteGrade", json!({"clips": [b.0]})).unwrap();
+            b
+        }),
+        ("preset with keyframes", |s, a, b| {
+            let li = s.active_sequence().unwrap().find_item(a).unwrap().1.effects.iter().position(|e| e.effect == "lumetri").unwrap();
+            s.execute("presets.save", json!({"clip": a.0, "name": "grade-k", "keyframes": "anchorIn", "effects": [li]})).unwrap();
+            s.execute("presets.apply", json!({"preset": "grade-k", "clips": [b.0]})).unwrap();
+            b
+        }),
+        ("preset without keyframes", |s, a, b| {
+            let li = s.active_sequence().unwrap().find_item(a).unwrap().1.effects.iter().position(|e| e.effect == "lumetri").unwrap();
+            s.execute("presets.save", json!({"clip": a.0, "name": "grade-still", "keyframes": "none", "effects": [li]})).unwrap();
+            s.execute("presets.apply", json!({"preset": "grade-still", "clips": [b.0]})).unwrap();
+            b
+        }),
+        ("speed change", |s, a, _| {
+            s.execute("clip.speedDuration", json!({"clips": [a.0], "speed": 200})).unwrap();
+            a
+        }),
+        ("slip", |s, a, _| {
+            s.execute("timeline.slip", json!({"clip": a.0, "deltaFrames": 12})).unwrap();
+            a
+        }),
+    ];
+    // node 0 keyframed (exposure 0 -> 1 over the clip); `keyed_selected`: node 0 is the selected one
+    let run = |edit: Edit, keyed_selected: bool| -> Vec<(Tick, Option<f64>)> {
+        let mut s = demo();
+        let (a, b) = clips(&mut s);
+        s.execute("color.addNode", json!({"clip": a.0})).unwrap();
+        s.execute("color.selectNode", json!({"clip": a.0, "node": 0})).unwrap();
+        let it = s.active_sequence().unwrap().find_item(a).unwrap().1.clone();
+        let (k1, k2) = (it.start + Tick(254_016_000_000 / 2), it.end() - Tick(254_016_000_000));
+        s.set_playhead(k1);
+        let k1 = s.playhead();
+        let li = it.effects.iter().position(|e| e.effect == "lumetri").unwrap();
+        s.execute("effects.toggleAnimation", json!({"clip": a.0, "effect": li, "param": "exposure", "time": k1.0})).unwrap();
+        s.execute("effects.setParam", json!({"clip": a.0, "effect": li, "param": "exposure", "value": 0.0, "time": k1.0})).unwrap();
+        s.execute("effects.setParam", json!({"clip": a.0, "effect": li, "param": "exposure", "value": 1.0, "time": k2.0})).unwrap();
+        if !keyed_selected {
+            s.execute("color.selectNode", json!({"clip": a.0, "node": 1})).unwrap();
+        }
+        let c = edit(&mut s, a, b);
+        s.execute("color.selectNode", json!({"clip": c.0, "node": 0})).unwrap();
+        let e = lumetri(&s, c);
+        let p = e.param("exposure").unwrap();
+        let mut out: Vec<(Tick, Option<f64>)> = p.keyframes.iter().map(|k| (k.time, k.value.as_f64())).collect();
+        out.push((Tick(-1), p.value.as_f64()));
+        out
+    };
+    for (name, edit) in edits {
+        let selected = run(edit, true);
+        let other = run(edit, false);
+        assert_eq!(other, selected, "{name}: the unselected node's keyframes went their own way");
+    }
+}
+
+#[test]
+fn paste_grade_replaces_only_the_active_version_of_the_target() {
+    let mut s = demo();
+    let (a, b) = clips(&mut s);
+    // source: three nodes; target: versions A (exposure 0.3) and B (active, exposure -0.3)
+    s.execute("color.addNode", json!({"clip": a.0})).unwrap();
+    s.execute("color.addNode", json!({"clip": a.0})).unwrap();
+    s.execute("color.version.add", json!({"clip": b.0, "duplicate": false})).unwrap();
+    s.execute("color.version.switch", json!({"clip": b.0, "version": 0})).unwrap();
+    set_exposure(&mut s, b, 0.3);
+    s.execute("color.version.switch", json!({"clip": b.0, "version": 1})).unwrap();
+    set_exposure(&mut s, b, -0.3);
+    s.execute("color.copyGrade", json!({"clip": a.0})).unwrap();
+    let r = s.execute("color.pasteGrade", json!({"clips": [b.0]})).unwrap();
+    assert_eq!(r["nodes"], 3);
+    let g = s.execute("color.nodes", json!({"clip": b.0})).unwrap();
+    assert_eq!((nodes(&g), g["versions"].clone(), g["active"].clone()), (3, json!(["A", "B"]), json!(1)));
+    s.execute("color.version.switch", json!({"clip": b.0, "version": 0})).unwrap();
+    assert_eq!(exposure(&s, b), 0.3, "version A of the target is kept");
+}

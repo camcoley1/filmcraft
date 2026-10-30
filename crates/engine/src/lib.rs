@@ -336,9 +336,10 @@ pub struct EditorState {
     /// Timeline clipboard (serialized track items with their relative track index).
     #[serde(skip)]
     pub clipboard: Vec<(TrackKind, usize, filmcraft_project::TrackItem)>,
-    /// Copy Grade / Paste Grade: the copied Lumetri grade (its nodes).
+    /// Copy Grade / Paste Grade: the copied Lumetri grade (its nodes) and the copied clip's
+    /// `source_in` (the grade's keyframes are in that clip's media time).
     #[serde(skip)]
-    pub grade_clipboard: Option<filmcraft_project::color_graph::GradeVersion>,
+    pub grade_clipboard: Option<(filmcraft_project::color_graph::GradeVersion, Tick)>,
     pub default_video_transition: String,
     pub default_audio_transition: String,
     /// Selected edit points (trim mode).
