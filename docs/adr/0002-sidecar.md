@@ -89,10 +89,17 @@ AI features run in **`craft-ai`**, a separate Python process installed by craft-
 
 13. **A feature may call a hosted service through the helper (M8f, Generative Extend).** Only the
     helper talks to the network, with the user's own key (`FAL_KEY` or `~/.config/craft-ai/fal.env`,
-    never put in a project, a job folder, a log or a result); the feature is offered only while a
-    key is present, and the command's description says that it costs money and sends the clip's
-    frame to the provider. FilmCraft itself still opens no outbound connection. The service and
-    its terms are recorded in `LICENSES.md` instead of a weights licence.
+    never put in a project, a job folder, a log or a result; the helper's error messages are fixed
+    phrases, scrubbed of anything key-like); the feature is offered only while a key is present.
+    A new request runs only with `confirm: true`: without it the command fails with a message
+    saying that it is billed and sends the clip's frame to the provider (the params text says so
+    too). One user action submits at most once: the helper keeps the accepted request id, retries
+    only GETs against it, cancels it at the provider on a timeout or a cancel, reports a submit
+    whose connection broke as "may have been submitted" without resending it, and `resume: <id>`
+    fetches an existing request's result without a new charge. The result is project media
+    (`JobSpec::media`), never left in the prunable cache. FilmCraft itself still opens no
+    outbound connection. The service and its terms are recorded in `LICENSES.md` instead of a
+    weights licence.
 
 ## Consequences
 

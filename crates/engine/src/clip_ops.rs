@@ -1517,7 +1517,7 @@ fn set_interpolation(s: &mut Session, p: &Value, m: TimeInterpolation) -> Result
 
 /// Fit to frame (the whole clip visible) / Fill frame (the frame covered): sets Motion ▸ Scale
 /// and centres the clip.
-fn fit_fill(s: &mut Session, p: &Value, fill: bool) -> Result<Value> {
+pub(crate) fn fit_fill(s: &mut Session, p: &Value, fill: bool) -> Result<Value> {
     let clips = video_clips(s, p);
     let q = s.active_sequence().ok_or(EngineError::NoSequence)?;
     let (fw, fh) = (q.settings.width as f64, q.settings.height as f64);
