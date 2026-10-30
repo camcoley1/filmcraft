@@ -16,7 +16,7 @@ use crate::transform::LevelScale;
 use crate::{ColorInfo, Picture};
 use filmcraft_bitstream::{BitReader, annexb_nals, length_prefixed_nals, unescape_rbsp};
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// One slice of a picture job.
 struct SliceJob {
@@ -122,9 +122,20 @@ struct Shared {
     /// Test hook: reconstruction buffers fail to allocate.
     #[cfg(test)]
     fail_alloc: std::sync::atomic::AtomicBool,
+    /// Test hook: recycle() reports "checked" and waits for "go" between its SPS check and the
+    /// pool insertion.
+    #[cfg(test)]
+    recycle_pause: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl Shared {
+    #[cfg(test)]
+    fn pause_recycling(&self) {
+        if let Some((checked, go)) = self.recycle_pause.lock().unwrap_or_else(PoisonError::into_inner).take() {
+            let _ = checked.send(());
+            let _ = go.recv();
+        }
+    }
     #[cfg(test)]
     fn alloc_fails(&self) -> bool {
         self.fail_alloc.load(std::sync::atomic::Ordering::Relaxed)
@@ -486,16 +497,16 @@ impl Decoder {
     /// are dropped (the budget of `sps` counts only its own), then the memory budget is checked.
     fn admit(&self, sps: &Sps) -> Result<()> {
         let cur = (sps.pic_width_in_mbs as usize, sps.frame_height_in_mbs() as usize, sps.format());
-        if let Ok(mut c) = self.shared.current.lock() {
-            *c = Some(cur);
-        }
+        // (lock order `current`, then pool, as in recycle(): no buffer of the old SPS can be
+        // added after the pools are cleared)
+        let mut current = self.shared.current.lock().unwrap_or_else(PoisonError::into_inner);
+        *current = Some(cur);
         fn keep<P>(pool: &Mutex<Vec<PicState<P>>>, (mb_w, mb_h, fmt): (usize, usize, Format)) {
-            if let Ok(mut p) = pool.lock() {
-                p.retain(|s| (s.mb_w, s.mb_h, s.fmt) == (mb_w, mb_h, fmt));
-            }
+            pool.lock().unwrap_or_else(PoisonError::into_inner).retain(|s| (s.mb_w, s.mb_h, s.fmt) == (mb_w, mb_h, fmt));
         }
         keep(&self.shared.pool8, cur);
         keep(&self.shared.pool16, cur);
+        drop(current);
         check_memory_budget(sps, self.max_in_flight)
     }
 
@@ -670,14 +681,23 @@ fn run_job<P: Pooled>(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared, d
     if let (Some(e), Ok(mut slot)) = (err, shared.error.lock()) {
         slot.get_or_insert(e);
     }
-    // Recycle the buffers if they still fit the active SPS, without keeping the frame alive.
-    let current = shared.current.lock().ok().and_then(|c| *c);
-    if current == Some((pic.mb_w, pic.mb_h, pic.fmt))
-        && let Ok(mut p) = P::pool(shared).lock()
-        && p.len() < POOL_LEN
-    {
+    recycle(shared, pic);
+}
+
+/// Keep the buffers of a finished picture for reuse if they fit the active SPS, without keeping
+/// its frame alive. The `current` guard is held until the buffers are in the pool (lock order
+/// `current`, then pool, as in [`Decoder::admit`]), so an SPS admitted meanwhile cannot miss them.
+fn recycle<P: Pooled>(shared: &Shared, mut pic: PicState<P>) {
+    let current = shared.current.lock().unwrap_or_else(PoisonError::into_inner);
+    if *current != Some((pic.mb_w, pic.mb_h, pic.fmt)) {
+        return;
+    }
+    #[cfg(test)]
+    shared.pause_recycling();
+    let mut pool = P::pool(shared).lock().unwrap_or_else(PoisonError::into_inner);
+    if pool.len() < POOL_LEN {
         pic.frame = Arc::new(Frame::new(0, 0, 0, 0, pic.fmt));
-        p.push(pic);
+        pool.push(pic);
     }
 }
 
@@ -847,5 +867,41 @@ mod tests {
         let tall = sps(1024, tallest_within_cap());
         assert!(dec.admit(&tall).is_ok());
         assert!(dec.shared.pool8.lock().unwrap().is_empty());
+    }
+
+    /// A worker recycling buffers of the old SPS while a new one is admitted: the worker holds
+    /// the `current` guard from its check to the insertion, so the admission clears its buffers
+    /// afterwards and no incompatible buffer remains (the race GPT found in M8e.5).
+    #[test]
+    fn recycling_does_not_race_an_sps_change() {
+        let dec = Decoder::with_threads(1);
+        let s422 = sps(4, 3);
+        let mut s420 = sps(4, 3);
+        (s420.chroma_format_idc, s420.bit_depth_luma, s420.bit_depth_chroma) = (1, 8, 8);
+        dec.admit(&s420).unwrap();
+        let (checked_tx, checked) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel();
+        *dec.shared.recycle_pause.lock().unwrap() = Some((checked_tx, go_rx));
+        let shared = &dec.shared;
+        std::thread::scope(|sc| {
+            let worker = sc.spawn(|| run_job_any(Arc::new(Frame::new(0, 0, 4, 3, s420.format())), Vec::new(), shared, false));
+            // the worker passed the check for the 8-bit SPS and is paused before inserting...
+            checked.recv().unwrap();
+            // ...still holding the guard, so the admission below cannot run in between
+            let held = shared.current.try_lock().is_err();
+            let admit = sc.spawn(|| dec.admit(&s422));
+            if !held {
+                // (the bug: let the admission finish first, as the race allows)
+                let _ = admit.join();
+                go.send(()).unwrap();
+                let _ = worker.join();
+                panic!("the recycling worker released the SPS guard between its check and the insertion");
+            }
+            go.send(()).unwrap();
+            worker.join().unwrap();
+            admit.join().unwrap().unwrap();
+        });
+        assert!(dec.shared.pool8.lock().unwrap().is_empty(), "an 8-bit buffer survived the switch to 10-bit 4:2:2");
+        assert_eq!(*dec.shared.current.lock().unwrap(), Some((4, 3, s422.format())));
     }
 }
