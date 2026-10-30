@@ -30,13 +30,21 @@ fn wav(seconds: f64) -> Vec<u8> {
     b
 }
 
-/// What the last `stems` job received: (rate, channels, data bytes) of its `source.wav`.
-static SOURCE: std::sync::Mutex<Option<(u32, u16, usize)>> = std::sync::Mutex::new(None);
+/// What each `stems` job received, by its job folder: (rate, channels, data bytes) of its
+/// `source.wav`. One record per job, because tests run in parallel and share this static: a single
+/// "last job" slot let another test's job overwrite it, and the failed assertion then poisoned the
+/// lock for every other stems test.
+static SOURCES: std::sync::Mutex<std::collections::BTreeMap<String, (u32, u16, usize)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn source_of(out_dir: &str) -> Option<(u32, u16, usize)> {
+    SOURCES.lock().unwrap_or_else(|e| e.into_inner()).get(out_dir).copied()
+}
 
 /// The fixture's source is 2 s long.
 fn stems(req: &JobRequest) -> Vec<(String, Vec<u8>)> {
     if let Ok(b) = std::fs::read(&req.inputs[0]) {
-        *SOURCE.lock().unwrap() = Some((u32::from_le_bytes(b[24..28].try_into().unwrap()), u16::from_le_bytes(b[22..24].try_into().unwrap()), b.len() - 44));
+        let rec = (u32::from_le_bytes(b[24..28].try_into().unwrap()), u16::from_le_bytes(b[22..24].try_into().unwrap()), b.len() - 44);
+        SOURCES.lock().unwrap_or_else(|e| e.into_inner()).insert(req.out_dir.clone(), rec);
     }
     ["vocals", "drums", "bass", "other"].iter().map(|s| (format!("{s}.wav"), wav(2.0))).collect()
 }
@@ -85,7 +93,7 @@ fn stems_land_in_a_bin_in_one_undo_step() {
     // the helper got the source decoded by FilmCraft: 2 s of 44.1 kHz float stereo, deleted after
     assert_eq!(req.kind, "stems");
     assert!(req.inputs.len() == 1 && req.inputs[0].ends_with("source.wav"), "{:?}", req.inputs);
-    assert_eq!(*SOURCE.lock().unwrap(), Some((44_100, 2, 2 * 44_100 * 2 * 4)));
+    assert_eq!(source_of(&req.out_dir), Some((44_100, 2, 2 * 44_100 * 2 * 4)));
     assert!(!std::path::Path::new(&req.inputs[0]).exists(), "the decoded input is deleted");
     // the stems live in the project's AI media folder, not in the cache, and the job folder is gone
     let out = std::path::PathBuf::from(r["outDir"].as_str().unwrap());
