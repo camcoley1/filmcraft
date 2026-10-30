@@ -623,6 +623,40 @@ pub(crate) fn param_modified(ti: &TrackItem, effect: &str, param_id: &str) -> bo
     }
 }
 
+/// The non-intrinsic effects of an item as a format without FilmCraft's Lumetri node graphs can
+/// carry them: a Lumetri with several nodes (or Mix / a node mask) becomes one Lumetri per enabled
+/// node of the active grade version, in order, which renders the same where every node is plain
+/// (on, Mix 100 %, no node mask). What the stacked effects cannot carry (Mix, node masks, other
+/// grade versions) is reported once per item.
+pub(crate) fn exported_effects<'a>(ti: &'a TrackItem, report: &mut Report) -> Vec<std::borrow::Cow<'a, EffectInstance>> {
+    use filmcraft_project::color_graph as cg;
+    let mut out = Vec::new();
+    for e in standard_effects(ti) {
+        let versions = cg::versions(e).0.len();
+        if e.effect != "lumetri" || cg::is_single(e) {
+            if e.effect == "lumetri" && versions > 1 {
+                report.warn(format!("clip \"{}\": only the active grade version of its Lumetri was exported ({versions} versions)", ti.name));
+            }
+            out.push(std::borrow::Cow::Borrowed(e));
+            continue;
+        }
+        let nodes = cg::active_nodes(e);
+        let lossy = nodes.iter().any(|n| n.enabled && (n.mix < 1.0 || n.mask.is_some())) || versions > 1;
+        for n in nodes.iter().filter(|n| n.enabled) {
+            let mut x = cg::node_instance(n);
+            x.enabled = e.enabled;
+            out.push(std::borrow::Cow::Owned(x));
+        }
+        report.warn(format!(
+            "clip \"{}\": its Lumetri node graph was exported as {} stacked Lumetri effects{}",
+            ti.name,
+            nodes.iter().filter(|n| n.enabled).count(),
+            if lossy { " (node Mix, node masks and other grade versions are not kept)" } else { "" }
+        ));
+    }
+    out
+}
+
 /// Non-intrinsic effects on an item.
 pub(crate) fn standard_effects(ti: &TrackItem) -> impl Iterator<Item = &EffectInstance> {
     ti.effects.iter().filter(|e| !e.def().is_some_and(|d| d.intrinsic))

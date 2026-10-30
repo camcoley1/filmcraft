@@ -27,7 +27,7 @@ use roxmltree::Node;
 
 use crate::common::{
     Builder, MediaSpec, base_item, db_to_gain, empty_sequence, file_name, gain_to_db, generator_of, item_media, item_path, kind_from_ext, param,
-    param_modified, path_to_file_url, resolve_path_in, scaled, set_param, settings_for, standard_effects, transition_effect, transition_name,
+    param_modified, path_to_file_url, resolve_path_in, scaled, set_param, settings_for, transition_effect, transition_name,
 };
 use crate::xml::{child, children, elements, num};
 use crate::{Error, ExportOptions, Format, ImportOptions, Imported, Report, Result};
@@ -1039,7 +1039,7 @@ impl Exp<'_, '_> {
                 self.report.warn("pan and channel volume are not exported to FCPXML");
             }
         }
-        for e in standard_effects(it) {
+        for e in crate::common::exported_effects(it, self.report) {
             let n = e.def().map(|d| d.name).unwrap_or(&e.effect).to_string();
             let r = self.effect(&n, &e.effect);
             let tag = if kind == TrackKind::Video { "filter-video" } else { "filter-audio" };
