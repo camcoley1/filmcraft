@@ -122,7 +122,8 @@ fn no_helper_disables_every_ai_command_with_a_reason() {
     let st = s.execute("ai.status", json!({})).unwrap();
     assert_eq!(st["connected"], false);
     assert_eq!(st["reason"], NOT_CONNECTED);
-    for id in FEATURES.iter().chain(&["ai.echo"]) {
+    // ai.search finds transcript words without a helper: it stays enabled (the picture part says why it is left out)
+    for id in FEATURES.iter().chain(&["ai.echo"]).filter(|id| **id != "ai.search") {
         assert_eq!(reason(&s, id), NOT_CONNECTED, "{id}");
     }
     let e = s.execute("ai.reframe", json!({})).unwrap_err().to_string();
@@ -159,7 +160,8 @@ fn version_mismatch_disables_with_both_versions() {
     let mut f = fixture("version", Script { protocol: 99, version: "9.9.0".into(), ..Default::default() });
     let e = f.s.execute("ai.connect", json!({"port": f.helper.port()})).unwrap_err().to_string();
     assert!(e.contains("version 9.9.0 (protocol 99)") && e.contains("needs protocol 1"), "{e}");
-    for id in FEATURES.iter().chain(&["ai.echo"]) {
+    // ai.search finds transcript words without a helper: it stays enabled (the picture part says why it is left out)
+    for id in FEATURES.iter().chain(&["ai.echo"]).filter(|id| **id != "ai.search") {
         assert!(reason(&f.s, id).contains("protocol 99"), "{id}");
     }
     assert_eq!(f.s.execute("ai.status", json!({})).unwrap()["connected"], false);
