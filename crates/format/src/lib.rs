@@ -84,18 +84,17 @@ pub const COLOR_GRAPH_SCHEMA: u32 = 18;
 
 /// The schema `project` is written in: the oldest that holds everything in it, so builds without
 /// the newer features keep opening files that do not use them. v18 for a project with a Lumetri
-/// node graph, v17 for one with an id (an AI job ran), v16 otherwise.
+/// node graph, v17 for one with an id (an AI job ran), v16 otherwise: the newest schema of the
+/// features it uses. A future schema bump adds its feature's line here.
 pub fn schema_for(project: &Project) -> u32 {
-    if SCHEMA_VERSION != COLOR_GRAPH_SCHEMA {
-        return SCHEMA_VERSION;
+    let mut v = PROJECT_ID_SCHEMA - 1;
+    if !project.id.is_empty() {
+        v = v.max(PROJECT_ID_SCHEMA);
     }
     if project.has_color_graphs() {
-        COLOR_GRAPH_SCHEMA
-    } else if !project.id.is_empty() {
-        PROJECT_ID_SCHEMA
-    } else {
-        PROJECT_ID_SCHEMA - 1
+        v = v.max(COLOR_GRAPH_SCHEMA);
     }
+    v
 }
 
 /// Oldest schema this build can still upgrade.

@@ -326,4 +326,47 @@ fn lumetri_graphs_are_v18_and_older_lumetri_stays_one_node() {
     let again = decode(&encode(&p, true)).unwrap();
     assert_eq!(again.schema_version, 18);
     assert_eq!(again.project, p);
+    // a graph removed back to one plain node writes the older schema again
+    let mut q = p.clone();
+    let e = q.sequence_mut(ItemId(21)).unwrap().video_tracks[0].items[0].effects.iter_mut().find(|e| e.effect == "lumetri").unwrap();
+    color_graph::delete_version(e, 1).unwrap();
+    color_graph::remove_node(e, 1).unwrap();
+    assert!(e.color.is_none());
+    assert_eq!(schema_for(&q), 16);
+}
+
+#[test]
+fn hostile_lumetri_graphs_in_a_project_file() {
+    use filmcraft_project::{color_graph, find_effect};
+    let mut p = decode(&fixture("v8-subclip.fcproj")).unwrap().project;
+    let mut lumetri = find_effect("lumetri").unwrap().instance();
+    color_graph::add_node(&mut lumetri, None, "").unwrap();
+    p.sequence_mut(ItemId(21)).unwrap().video_tracks[0].items[0].effects.push(lumetri);
+    let bytes = encode(&p, true);
+    let mut v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let path = |v: &mut serde_json::Value| -> serde_json::Value {
+        let effects = &mut v["project"]["items"]["21"]["kind"]["Sequence"]["video_tracks"][0]["items"][0]["effects"];
+        effects.as_array().unwrap().iter().find(|e| e["effect"] == "lumetri").unwrap()["color"].clone()
+    };
+    let graph = path(&mut v);
+    assert_eq!(graph["versions"][0]["nodes"].as_array().unwrap().len(), 2);
+    // over the node cap: the file is refused with a reason, not opened with the grade cut short
+    let node = graph["versions"][0]["nodes"][1].clone();
+    let effects = v["project"]["items"]["21"]["kind"]["Sequence"]["video_tracks"][0]["items"][0]["effects"].as_array_mut().unwrap();
+    let lum = effects.iter_mut().find(|e| e["effect"] == "lumetri").unwrap();
+    lum["color"]["versions"][0]["nodes"] = serde_json::Value::Array(vec![node; color_graph::MAX_NODES + 1]);
+    let err = match decode(&serde_json::to_vec(&v).unwrap()) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a graph over the caps was opened"),
+    };
+    assert!(err.contains("at most 32"), "{err}");
+    // an empty version is repaired, the valid one is kept
+    let effects = v["project"]["items"]["21"]["kind"]["Sequence"]["video_tracks"][0]["items"][0]["effects"].as_array_mut().unwrap();
+    let lum = effects.iter_mut().find(|e| e["effect"] == "lumetri").unwrap();
+    lum["color"] = graph.clone();
+    lum["color"]["versions"].as_array_mut().unwrap().push(serde_json::json!({"name": "B", "nodes": []}));
+    let back = decode(&serde_json::to_vec(&v).unwrap()).unwrap().project;
+    let e = back.sequence(ItemId(21)).unwrap().video_tracks[0].items[0].effects.iter().find(|e| e.effect == "lumetri").unwrap();
+    let g = e.color.as_deref().unwrap();
+    assert_eq!((g.versions[0].nodes.len(), g.versions[1].nodes.len()), (2, 1));
 }

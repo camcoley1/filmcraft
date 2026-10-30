@@ -142,7 +142,22 @@ impl EffectInstance {
         self.params.get(id).map(|p| p.vec2_at(t)).unwrap_or_default()
     }
     pub fn is_animated(&self) -> bool {
-        self.params.values().any(Param::is_animated) || self.masks.iter().any(Mask::is_animated)
+        self.params.values().any(Param::is_animated) || self.masks.iter().any(Mask::is_animated) || self.node_params().any(|(_, p)| p.is_animated())
+    }
+
+    /// The parameters of a Lumetri node graph's other nodes (every grade version; M8d), which
+    /// `params` (the selected node's) does not hold.
+    fn node_params(&self) -> impl Iterator<Item = (&String, &Param)> {
+        self.color.iter().flat_map(|g| &g.versions).flat_map(|v| &v.nodes).flat_map(|n| &n.params)
+    }
+
+    /// Every parameter the instance renders with: its own and every node's of every grade version
+    /// (M8d). Masks are not included (`Mask::params_mut`). Anything that moves, scales or bakes
+    /// keyframes goes through this so a grade's other nodes stay in step with the selected one.
+    pub fn all_params_mut(&mut self) -> Vec<(&String, &mut Param)> {
+        let mut v: Vec<(&String, &mut Param)> = self.params.iter_mut().collect();
+        v.extend(crate::color_graph::node_params_mut(&mut self.color));
+        v
     }
 }
 

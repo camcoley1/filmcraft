@@ -625,8 +625,14 @@ impl FxOp {
         use filmcraft_project::color_graph;
         let mut ops = Vec::new();
         for n in color_graph::active_nodes(e).iter().filter(|n| n.enabled) {
+            // a node naming a mask the effect lacks applies nowhere
+            let mask = match color_graph::node_mask(e, n) {
+                color_graph::NodeMask::Nowhere => continue,
+                color_graph::NodeMask::Frame => None,
+                color_graph::NodeMask::Inside(m) => Some(m),
+            };
             let Some(mut op) = Self::eval(&color_graph::node_instance(n), cx, w, h) else { continue };
-            if let Some(m) = n.mask.and_then(|name| e.masks.iter().find(|m| m.name == name)) {
+            if let Some(m) = mask {
                 let masks = crate::mask::prepare(std::slice::from_ref(m), cx.t, cx.px_scale);
                 if !masks.is_empty() {
                     op = FxOp::Masked { op: Box::new(op), masks };
@@ -645,7 +651,7 @@ impl FxOp {
     /// (a Lumetri node graph: the masks no node names).
     pub fn eval_masked(e: &EffectInstance, cx: &FxCtx, w: usize, h: usize) -> Option<FxOp> {
         let op = Self::eval(e, cx, w, h)?;
-        let masks = if e.color.is_some() {
+        let masks = if filmcraft_project::color_graph::graph(e).is_some() {
             crate::mask::prepare(&filmcraft_project::color_graph::effect_wide_masks(e), cx.t, cx.px_scale)
         } else {
             crate::mask::prepare(&e.masks, cx.t, cx.px_scale)
@@ -1144,7 +1150,7 @@ impl FxOp {
             FxOp::Blend { op, mix } => {
                 let original = img.clone();
                 op.apply(img);
-                crate::mask::mix(img, &original, &vec![*mix; img.w * img.h]);
+                crate::mask::mix_by(img, &original, *mix);
             }
             FxOp::Nodes(ops) => {
                 for op in ops {

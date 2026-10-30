@@ -572,7 +572,7 @@ pub fn rebase_source_timecode(project: &mut Project, item: ItemId, start_tc_fram
                         *h -= off;
                     }
                     for e in &mut ti.effects {
-                        for p in e.params.values_mut() {
+                        for (_, p) in e.all_params_mut() {
                             for k in &mut p.keyframes {
                                 k.time -= off;
                             }

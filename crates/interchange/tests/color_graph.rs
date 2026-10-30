@@ -76,7 +76,24 @@ fn xml_formats_stack_the_nodes_and_say_so() {
             cg::set_mix(e, 1, 0.5).unwrap();
         });
         let (_, rep, _) = through(&p, s, format);
-        assert!(rep.to_string().contains("not kept"), "{format:?}: {rep}");
+        assert!(rep.to_string().contains("not kept: node Mix"), "{format:?}: {rep}");
+        // a bypassed node: exported as a disabled Lumetri (renders the same), and said so
+        let (p, s) = project(|e| {
+            two_plain_nodes(e);
+            cg::set_enabled(e, 0, false).unwrap();
+        });
+        let (imp, rep, text) = through(&p, s, format);
+        let got = lumetris(&imp);
+        assert_eq!(got.iter().map(|e| e.enabled).collect::<Vec<_>>(), vec![false, true], "{format:?}: {text}");
+        let msg = rep.to_string();
+        assert!(msg.contains("1 of them off") && !msg.contains("not kept"), "{format:?}: {msg}");
+        // the effect's own masks are not carried by the stacked effects: reported
+        let (p, s) = project(|e| {
+            two_plain_nodes(e);
+            e.masks.push(filmcraft_project::Mask::new("frame", filmcraft_project::MaskPath::rect(0.0, 0.0, 100.0, 100.0)));
+        });
+        let (_, rep, _) = through(&p, s, format);
+        assert!(rep.to_string().contains("not kept: the effect's masks"), "{format:?}: {rep}");
         // one node: as before, no warning; several versions: only the active one, reported
         let (p, s) = project(|_| {});
         let (imp, rep, _) = through(&p, s, format);
@@ -89,4 +106,34 @@ fn xml_formats_stack_the_nodes_and_say_so() {
         let (_, rep, _) = through(&p, s, format);
         assert!(rep.to_string().contains("only the active grade version"), "{format:?}: {rep}");
     }
+}
+
+#[test]
+fn otio_refuses_a_grade_over_the_caps_and_says_so() {
+    let (p, s) = project(two_plain_nodes);
+    let (bytes, _) = export(&p, s, Format::Otio, &ExportOptions::default()).unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    // the node list as written, repeated past the cap
+    let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let mut done = false;
+    fn walk(v: &mut serde_json::Value, done: &mut bool) {
+        match v {
+            serde_json::Value::Object(m) => {
+                if let Some(nodes) = m.get_mut("nodes").and_then(|n| n.as_array_mut())
+                    && let Some(first) = nodes.first().cloned()
+                {
+                    *nodes = vec![first; cg::MAX_NODES + 1];
+                    *done = true;
+                }
+                m.values_mut().for_each(|x| walk(x, done));
+            }
+            serde_json::Value::Array(a) => a.iter_mut().for_each(|x| walk(x, done)),
+            _ => {}
+        }
+    }
+    walk(&mut v, &mut done);
+    assert!(done, "the graph is in the OTIO metadata");
+    let (imp, rep) = import(&serde_json::to_vec(&v).unwrap(), Format::Otio, None).unwrap();
+    assert!(lumetris(&imp).is_empty(), "no grade cut short");
+    assert!(rep.to_string().contains("could not be read") && rep.to_string().contains("at most 32"), "{rep}");
 }

@@ -176,6 +176,11 @@ pub fn mix(img: &mut Image, original: &Image, cov: &[f32]) {
     });
 }
 
+/// [`mix`] with one coverage for every pixel (a Lumetri node's Mix).
+pub fn mix_by(img: &mut Image, original: &Image, c: f32) {
+    img.px.par_iter_mut().zip(original.px.par_iter()).for_each(|(p, o)| *p = o + (*p - o) * c);
+}
+
 /// Scale premultiplied pixels by coverage (opacity masks).
 pub fn scale_by(img: &mut Image, cov: &[f32]) {
     img.px.par_chunks_mut(4).zip(cov.par_iter()).for_each(|(p, &c)| {
@@ -193,7 +198,7 @@ pub fn apply_effect(img: &mut Image, e: &EffectInstance, cx: &crate::effects::Fx
     }
     // a Lumetri node graph: the masks its nodes name limit those nodes, not the whole effect
     let graph_masks;
-    let masks = if e.color.is_some() {
+    let masks = if filmcraft_project::color_graph::graph(e).is_some() {
         graph_masks = filmcraft_project::color_graph::effect_wide_masks(e);
         &graph_masks
     } else {

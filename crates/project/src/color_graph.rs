@@ -12,11 +12,20 @@
 //! A mask a node names limits that node only, so it no longer limits the whole effect
 //! ([`effect_wide_masks`]).
 //!
-//! Every index read from a file is hostile: accessors clamp `active` / `selected`, a graph with no
-//! version or no node reads as no graph, and the node and version counts are capped.
+//! Every graph read from a file is hostile. A file with more than [`MAX_NODES`] nodes in a version
+//! or more than [`MAX_VERSIONS`] versions is refused when it is read (a grade is never silently cut
+//! short); within the caps it is repaired without touching valid parts: indices are clamped, a
+//! version without nodes gets one default node, mixes are clamped to 0..1 and labels and names
+//! are shortened ([`repair`]). A graph with no version reads as no graph.
+//!
+//! Errors name nodes and versions by their 0-based index, as the commands take them.
+//!
+//! A graph that is just the single Lumetri again (one version "A" holding one plain, unlabelled
+//! node) is dropped after every edit, so such a project still saves at the schema it had before.
 
 use std::collections::BTreeMap;
 
+use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
 use crate::effect::{EffectInstance, find_effect};
@@ -67,21 +76,108 @@ impl ColorNode {
     }
 }
 
+/// Longest node label kept.
+const MAX_LABEL: usize = 64;
+/// Longest grade version name kept.
+const MAX_NAME: usize = 32;
+
 /// A named grade: its nodes in order, and which of them the Lumetri controls edit.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GradeVersion {
     pub name: String,
+    #[serde(deserialize_with = "capped_nodes")]
     pub nodes: Vec<ColorNode>,
     #[serde(default)]
     pub selected: usize,
 }
 
-/// The grade versions of a Lumetri Color effect and the active one.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// The grade versions of a Lumetri Color effect and the active one. Reading one checks the caps
+/// and [`repair`]s it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ColorGraph {
     pub versions: Vec<GradeVersion>,
-    #[serde(default)]
     pub active: usize,
+}
+
+impl<'de> Deserialize<'de> for ColorGraph {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(deserialize_with = "capped_versions")]
+            versions: Vec<GradeVersion>,
+            #[serde(default)]
+            active: usize,
+        }
+        let r = Raw::deserialize(d)?;
+        let mut g = ColorGraph { versions: r.versions, active: r.active };
+        repair(&mut g);
+        Ok(g)
+    }
+}
+
+/// A list of at most `max` items; a longer one is an error (read no further than the cap).
+fn capped<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D, max: usize, what: &'static str) -> Result<Vec<T>, D::Error> {
+    struct V<T> {
+        max: usize,
+        what: &'static str,
+        t: std::marker::PhantomData<T>,
+    }
+    impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
+        type Value = Vec<T>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a list of at most {} {}", self.max, self.what)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<T>, A::Error> {
+            let mut out = Vec::new();
+            while let Some(x) = seq.next_element()? {
+                if out.len() >= self.max {
+                    return Err(de::Error::custom(format!("a Lumetri grade has more than {} {} (FilmCraft reads at most {})", self.max, self.what, self.max)));
+                }
+                out.push(x);
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_seq(V { max, what, t: std::marker::PhantomData })
+}
+
+fn capped_nodes<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<ColorNode>, D::Error> {
+    capped(d, MAX_NODES, "nodes in a version")
+}
+
+fn capped_versions<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<GradeVersion>, D::Error> {
+    capped(d, MAX_VERSIONS, "grade versions")
+}
+
+/// Make a graph (within the caps) consistent without touching its valid parts: clamp `active` and
+/// every `selected`, give a version without nodes one node (the active version's takes the
+/// effect's own parameters, as its selected node; another one Lumetri's defaults), clamp mixes to
+/// 0..1 (not a number: 1) and shorten labels and names. Unnamed versions get a free letter.
+pub fn repair(g: &mut ColorGraph) {
+    g.active = g.active();
+    let active = g.active;
+    for (i, v) in g.versions.iter_mut().enumerate() {
+        if v.nodes.is_empty() {
+            let params = if i == active { BTreeMap::new() } else { default_params() };
+            v.nodes.push(ColorNode { params, ..ColorNode::new("") });
+        }
+        v.selected = v.selected();
+        v.name = v.name.trim().chars().take(MAX_NAME).collect();
+        for n in &mut v.nodes {
+            n.mix = if n.mix.is_finite() { n.mix.clamp(0.0, 1.0) } else { 1.0 };
+            if n.label.chars().count() > MAX_LABEL {
+                n.label = n.label.chars().take(MAX_LABEL).collect();
+            }
+        }
+    }
+    for i in 0..g.versions.len() {
+        if g.versions.get(i).is_some_and(|v| v.name.is_empty()) {
+            let name = next_version_name(&g.versions);
+            if let Some(v) = g.versions.get_mut(i) {
+                v.name = name;
+            }
+        }
+    }
 }
 
 /// One node as the renderer reads it (the selected node's parameters are the effect's own).
@@ -100,7 +196,7 @@ pub fn default_params() -> BTreeMap<String, Param> {
 
 /// The name a new grade version gets: the first unused letter.
 fn next_version_name(versions: &[GradeVersion]) -> String {
-    ('A'..='Z').map(String::from).find(|n| !versions.iter().any(|v| &v.name == n)).unwrap_or_else(|| format!("{}", versions.len() + 1))
+    ('A'..='Z').map(String::from).find(|n| !versions.iter().any(|v| &v.name == n)).unwrap_or_else(|| format!("{}", versions.len().saturating_add(1)))
 }
 
 impl ColorGraph {
@@ -125,6 +221,27 @@ impl ColorGraph {
     fn usable(&self) -> bool {
         self.active_version().is_some_and(|v| !v.nodes.is_empty())
     }
+
+    /// Whether the graph is the single Lumetri again: one version "A" with one plain, unlabelled node.
+    fn is_trivial(&self) -> bool {
+        match self.versions.as_slice() {
+            [v] => v.name == "A" && matches!(v.nodes.as_slice(), [n] if n.is_plain() && n.label.is_empty()),
+            _ => false,
+        }
+    }
+}
+
+/// Whether the effect is a Lumetri holding a real node graph (anything beyond the single Lumetri;
+/// what needs schema v18).
+pub fn has_graph(e: &EffectInstance) -> bool {
+    e.effect == "lumetri" && e.color.as_deref().is_some_and(|g| !g.versions.is_empty() && !g.is_trivial())
+}
+
+/// Drop a graph that is the single Lumetri again (after an edit).
+fn settle(e: &mut EffectInstance) {
+    if e.color.as_deref().is_some_and(|g| g.versions.is_empty() || g.is_trivial()) {
+        e.color = None;
+    }
 }
 
 impl GradeVersion {
@@ -134,9 +251,15 @@ impl GradeVersion {
     }
 }
 
-/// The effect's graph, if it has a usable one.
+/// The stored parameters of every node of every version (not the selected node's, which are the
+/// effect's own): see `EffectInstance::all_params_mut`.
+pub fn node_params_mut(color: &mut Option<Box<ColorGraph>>) -> impl Iterator<Item = (&String, &mut Param)> {
+    color.iter_mut().flat_map(|g| &mut g.versions).flat_map(|v| &mut v.nodes).flat_map(|n| &mut n.params)
+}
+
+/// The effect's graph, if it is a Lumetri with a usable one (another effect's `color` is ignored).
 pub fn graph(e: &EffectInstance) -> Option<&ColorGraph> {
-    e.color.as_deref().filter(|g| g.usable())
+    e.color.as_deref().filter(|g| e.effect == "lumetri" && g.usable())
 }
 
 /// The nodes of the active version in order, as the renderer evaluates them. Without a graph:
@@ -153,8 +276,8 @@ pub fn active_nodes(e: &EffectInstance) -> Vec<NodeRef<'_>> {
         .collect()
 }
 
-/// A node as a plain Lumetri Color instance (its parameters, no masks, no graph): what the renderer
-/// evaluates for it.
+/// A node as a plain Lumetri Color instance (its parameters over Lumetri's defaults, so a node
+/// missing some keeps the defaults; no masks, no graph): what the renderer evaluates for it.
 pub fn node_instance(n: &NodeRef<'_>) -> EffectInstance {
     let mut e = find_effect("lumetri").map(|d| d.instance()).unwrap_or_else(|| EffectInstance {
         effect: "lumetri".into(),
@@ -166,8 +289,30 @@ pub fn node_instance(n: &NodeRef<'_>) -> EffectInstance {
         layer: None,
         color: None,
     });
-    e.params = n.params.clone();
+    for (k, p) in n.params {
+        e.params.insert(k.clone(), p.clone());
+    }
     e
+}
+
+/// Where a node applies.
+#[derive(Clone, Copy, Debug)]
+pub enum NodeMask<'a> {
+    /// The whole frame (no node mask).
+    Frame,
+    /// Inside this mask of the effect.
+    Inside(&'a Mask),
+    /// Nowhere: the node names a mask the effect does not have.
+    Nowhere,
+}
+
+/// Where node `n` applies: inside the first of the effect's masks with its name. A node naming a
+/// mask the effect does not have applies nowhere, never to the whole frame.
+pub fn node_mask<'a>(e: &'a EffectInstance, n: &NodeRef<'_>) -> NodeMask<'a> {
+    match n.mask {
+        None => NodeMask::Frame,
+        Some(name) => e.masks.iter().find(|m| m.name == name).map_or(NodeMask::Nowhere, NodeMask::Inside),
+    }
 }
 
 /// Whether the effect renders as the single Lumetri of its own parameters (no graph, or a graph
@@ -179,20 +324,36 @@ pub fn is_single(e: &EffectInstance) -> bool {
     }
 }
 
-/// The effect's masks that limit the whole effect: all of them except those a node of the active
-/// version names (those limit their node).
+/// The effect's masks that limit the whole effect: all of them except the ones nodes of the active
+/// version are limited to (the first mask of each name a node names, see [`node_mask`]).
 pub fn effect_wide_masks(e: &EffectInstance) -> Vec<Mask> {
-    let named: Vec<&str> = active_nodes(e).iter().filter_map(|n| n.mask).collect();
-    e.masks.iter().filter(|m| !named.contains(&m.name.as_str())).cloned().collect()
+    let nodes = active_nodes(e);
+    let taken: Vec<usize> = nodes.iter().filter_map(|n| n.mask).filter_map(|name| e.masks.iter().position(|m| m.name == name)).collect();
+    e.masks.iter().enumerate().filter(|(i, _)| !taken.contains(i)).map(|(_, m)| m.clone()).collect()
 }
 
-/// The effect's graph for editing, created (as the single node it already is) when it has none.
-fn graph_mut(e: &mut EffectInstance) -> &mut ColorGraph {
-    if !e.color.as_deref().is_some_and(ColorGraph::usable) {
-        e.color = Some(Box::new(ColorGraph::single()));
+/// Follow a mask rename (`to` = the new name) or removal (`to` = None: the nodes it limited become
+/// unlimited, which the node strip shows) in every node of every version, so no node keeps a
+/// dangling name a later mask could silently take over.
+pub fn rename_mask(e: &mut EffectInstance, from: &str, to: Option<&str>) {
+    if let Some(g) = e.color.as_deref_mut() {
+        for n in g.versions.iter_mut().flat_map(|v| &mut v.nodes) {
+            if n.mask.as_deref() == Some(from) {
+                n.mask = to.map(str::to_string);
+            }
+        }
     }
-    // (just made usable above)
-    e.color.get_or_insert_with(|| Box::new(ColorGraph::single()))
+}
+
+/// The effect's graph for editing: created (as the single node it already is) when it has none,
+/// else [`repair`]ed, which keeps every valid version.
+fn graph_mut(e: &mut EffectInstance) -> &mut ColorGraph {
+    let g = e.color.get_or_insert_with(|| Box::new(ColorGraph::single()));
+    if g.versions.is_empty() {
+        **g = ColorGraph::single();
+    }
+    repair(g);
+    g
 }
 
 /// Normalise indices after a change so the stored ones are in range.
@@ -240,7 +401,7 @@ fn load(e: &mut EffectInstance) {
 
 fn node_index(e: &EffectInstance, i: usize) -> Result<usize, String> {
     let n = active_nodes(e).len();
-    if i < n { Ok(i) } else { Err(format!("no node {} (the grade has {n})", i + 1)) }
+    if i < n { Ok(i) } else { Err(format!("no node {i} (the grade's nodes are 0 to {})", n.saturating_sub(1))) }
 }
 
 /// Select node `i` of the active version for editing.
@@ -253,6 +414,7 @@ pub fn select_node(e: &mut EffectInstance, i: usize) -> Result<(), String> {
         v.selected = i;
     }
     load(e);
+    settle(e);
     Ok(())
 }
 
@@ -269,8 +431,8 @@ pub fn add_node(e: &mut EffectInstance, after: Option<usize>, label: &str) -> Re
     let g = graph_mut(e);
     let a = g.active();
     let v = g.versions.get_mut(a).ok_or("no grade version")?;
-    let label = if label.is_empty() { format!("Node {}", v.nodes.len() + 1) } else { label.to_string() };
-    v.nodes.insert(at.min(v.nodes.len()), ColorNode::new(label));
+    // an empty label shows as "Node <n>" (translated, by position)
+    v.nodes.insert(at.min(v.nodes.len()), ColorNode::new(label.chars().take(MAX_LABEL).collect::<String>()));
     v.selected = at.min(v.nodes.len() - 1);
     load(e);
     Ok(at)
@@ -292,6 +454,7 @@ pub fn remove_node(e: &mut EffectInstance, i: usize) -> Result<(), String> {
     }
     tidy(g);
     load(e);
+    settle(e);
     Ok(())
 }
 
@@ -312,6 +475,7 @@ pub fn move_node(e: &mut EffectInstance, from: usize, to: usize) -> Result<(), S
     order.insert(to, moved);
     v.selected = order.iter().position(|o| *o == selected_node).unwrap_or(0);
     load(e);
+    settle(e);
     Ok(())
 }
 
@@ -328,17 +492,20 @@ pub fn set_mix(e: &mut EffectInstance, i: usize, mix: f64) -> Result<(), String>
         return Err("mix must be a number".into());
     }
     node_mut(e, i)?.mix = mix.clamp(0.0, 1.0);
+    settle(e);
     Ok(())
 }
 
 /// Turn node `i` on or off (off = bypassed).
 pub fn set_enabled(e: &mut EffectInstance, i: usize, on: bool) -> Result<(), String> {
     node_mut(e, i)?.enabled = on;
+    settle(e);
     Ok(())
 }
 
 pub fn set_label(e: &mut EffectInstance, i: usize, label: &str) -> Result<(), String> {
-    node_mut(e, i)?.label = label.chars().take(64).collect();
+    node_mut(e, i)?.label = label.chars().take(MAX_LABEL).collect();
+    settle(e);
     Ok(())
 }
 
@@ -350,7 +517,12 @@ pub fn set_mask(e: &mut EffectInstance, i: usize, mask: Option<&str>) -> Result<
         return Err(format!("the effect has no mask `{m}`"));
     }
     node_mut(e, i)?.mask = mask.map(str::to_string);
+    settle(e);
     Ok(())
+}
+
+fn version_error(i: usize, n: usize) -> String {
+    format!("no grade version {i} (the effect's versions are 0 to {})", n.saturating_sub(1))
 }
 
 /// The grade versions' names, and the active one's index.
@@ -367,10 +539,11 @@ pub fn add_version(e: &mut EffectInstance, name: Option<&str>, duplicate: bool) 
     if versions(e).0.len() >= MAX_VERSIONS {
         return Err(format!("an effect has at most {MAX_VERSIONS} grade versions"));
     }
-    let mut v = if duplicate { active_grade(e) } else { GradeVersion { name: String::new(), nodes: vec![ColorNode::new("Node 1")], selected: 0 } };
+    let mut v = if duplicate { active_grade(e) } else { GradeVersion { name: String::new(), nodes: vec![ColorNode::new("")], selected: 0 } };
     stash(e);
     let g = graph_mut(e);
-    v.name = name.map(|n| n.chars().take(32).collect()).filter(|n: &String| !n.trim().is_empty()).unwrap_or_else(|| next_version_name(&g.versions));
+    v.name =
+        name.map(|n| n.trim().chars().take(MAX_NAME).collect()).filter(|n: &String| !n.trim().is_empty()).unwrap_or_else(|| next_version_name(&g.versions));
     g.versions.push(v);
     g.active = g.versions.len() - 1;
     let i = g.active;
@@ -382,23 +555,25 @@ pub fn add_version(e: &mut EffectInstance, name: Option<&str>, duplicate: bool) 
 pub fn switch_version(e: &mut EffectInstance, i: usize) -> Result<(), String> {
     let n = versions(e).0.len();
     if i >= n {
-        return Err(format!("no grade version {} (the effect has {n})", i + 1));
+        return Err(version_error(i, n));
     }
     stash(e);
     graph_mut(e).active = i;
     load(e);
+    settle(e);
     Ok(())
 }
 
 pub fn rename_version(e: &mut EffectInstance, i: usize, name: &str) -> Result<(), String> {
-    let name: String = name.trim().chars().take(32).collect();
+    let name: String = name.trim().chars().take(MAX_NAME).collect();
     if name.is_empty() {
         return Err("a grade version needs a name".into());
     }
     let n = versions(e).0.len();
     let g = graph_mut(e);
-    let v = g.versions.get_mut(i).ok_or_else(|| format!("no grade version {} (the effect has {n})", i + 1))?;
+    let v = g.versions.get_mut(i).ok_or_else(|| version_error(i, n))?;
     v.name = name;
+    settle(e);
     Ok(())
 }
 
@@ -406,7 +581,7 @@ pub fn rename_version(e: &mut EffectInstance, i: usize, name: &str) -> Result<()
 pub fn delete_version(e: &mut EffectInstance, i: usize) -> Result<(), String> {
     let n = versions(e).0.len();
     if i >= n {
-        return Err(format!("no grade version {} (the effect has {n})", i + 1));
+        return Err(version_error(i, n));
     }
     if n <= 1 {
         return Err("an effect keeps at least one grade version".into());
@@ -419,6 +594,7 @@ pub fn delete_version(e: &mut EffectInstance, i: usize) -> Result<(), String> {
     }
     tidy(g);
     load(e);
+    settle(e);
     Ok(())
 }
 
@@ -445,12 +621,23 @@ pub fn paste_grade(e: &mut EffectInstance, grade: &GradeVersion) -> Result<(), S
         v.selected = grade.selected();
     }
     load(e);
+    settle(e);
     Ok(())
+}
+
+/// Move every keyframe of `grade` by `ticks` (saturating): a grade pasted onto a clip whose media
+/// starts elsewhere.
+pub fn shift_keyframes(grade: &mut GradeVersion, ticks: i64) {
+    for p in grade.nodes.iter_mut().flat_map(|n| n.params.values_mut()) {
+        for k in &mut p.keyframes {
+            k.time = filmcraft_time::Tick(k.time.0.saturating_add(ticks));
+        }
+    }
 }
 
 /// Reset the active version to one node with Lumetri's defaults.
 pub fn reset_grade(e: &mut EffectInstance) {
-    let fresh = GradeVersion { name: String::new(), nodes: vec![ColorNode::new("Node 1")], selected: 0 };
+    let fresh = GradeVersion { name: String::new(), nodes: vec![ColorNode::new("")], selected: 0 };
     let _ = paste_grade(e, &fresh);
 }
 
@@ -619,5 +806,152 @@ mod tests {
             add_version(&mut e, None, false).unwrap();
         }
         assert!(add_version(&mut e, None, false).is_err());
+    }
+
+    fn graph_json(versions: usize, nodes: usize) -> String {
+        let node = r#"{"params":{}}"#;
+        let v = format!(r#"{{"name":"V","nodes":[{}]}}"#, vec![node; nodes].join(","));
+        format!(r#"{{"versions":[{}],"active":0}}"#, vec![v.as_str(); versions].join(","))
+    }
+
+    #[test]
+    fn files_over_the_caps_are_refused_when_read() {
+        assert!(serde_json::from_str::<ColorGraph>(&graph_json(1, MAX_NODES)).is_ok());
+        assert!(serde_json::from_str::<ColorGraph>(&graph_json(MAX_VERSIONS, 1)).is_ok());
+        let err = serde_json::from_str::<ColorGraph>(&graph_json(1, MAX_NODES + 1)).unwrap_err().to_string();
+        assert!(err.contains("at most 32"), "{err}");
+        assert!(serde_json::from_str::<ColorGraph>(&graph_json(MAX_VERSIONS + 1, 1)).is_err());
+        // a huge list is refused at the cap, not read whole
+        assert!(serde_json::from_str::<ColorGraph>(&graph_json(1, 100_000)).is_err());
+        // and through an effect instance (project files, OTIO metadata, presets)
+        let mut e = serde_json::to_value(lumetri()).unwrap();
+        e["color"] = serde_json::from_str(&graph_json(2, 40).replace(r#""params":{}"#, r#""mix":1.0"#)).unwrap();
+        assert!(serde_json::from_value::<EffectInstance>(e).is_err());
+    }
+
+    #[test]
+    fn a_read_graph_is_repaired_without_touching_valid_versions() {
+        // version A valid (2 nodes, the second keyframe-free exposure 0.7), version B empty, active B
+        let mut e = lumetri();
+        set_exposure(&mut e, 0.25);
+        add_node(&mut e, None, "").unwrap();
+        set_exposure(&mut e, 0.7);
+        add_version(&mut e, None, true).unwrap();
+        let mut j = serde_json::to_value(&e).unwrap();
+        j["color"]["versions"][1]["nodes"] = serde_json::json!([]);
+        j["color"]["versions"][0]["nodes"][0]["mix"] = serde_json::json!(4.0);
+        j["color"]["versions"][0]["nodes"][0]["label"] = serde_json::json!("x".repeat(500));
+        j["color"]["versions"][0]["name"] = serde_json::json!("   ");
+        j["color"]["active"] = serde_json::json!(1);
+        let mut e: EffectInstance = serde_json::from_value(j).unwrap();
+        let g = e.color.as_deref().unwrap();
+        assert_eq!(g.versions[1].nodes.len(), 1, "the empty version got a node");
+        assert_eq!(g.versions[0].nodes.len(), 2, "the valid version is untouched");
+        assert_eq!(g.versions[0].nodes[0].mix, 1.0);
+        assert_eq!(g.versions[0].nodes[0].label.chars().count(), MAX_LABEL);
+        assert_eq!(g.versions[0].name, "A", "an unnamed version gets a free letter");
+        // switching to the valid version keeps it (it used to be replaced by a fresh graph)
+        switch_version(&mut e, 0).unwrap();
+        let ex: Vec<f64> = active_nodes(&e).iter().map(|n| n.params.get("exposure").unwrap().value.as_f64().unwrap()).collect();
+        assert_eq!(ex, vec![0.25, 0.7]);
+        assert_eq!(versions(&e).0.len(), 2);
+    }
+
+    #[test]
+    fn hostile_indices_are_errors_not_panics() {
+        let mut e = lumetri();
+        add_node(&mut e, None, "").unwrap();
+        add_version(&mut e, None, true).unwrap();
+        let m = usize::MAX;
+        assert!(select_node(&mut e, m).unwrap_err().contains(&m.to_string()), "0-based index in the error");
+        assert!(remove_node(&mut e, m).is_err());
+        assert!(move_node(&mut e, m, 0).is_err() && move_node(&mut e, 0, m).is_err());
+        assert!(set_mix(&mut e, m, 0.5).is_err() && set_enabled(&mut e, m, false).is_err() && set_label(&mut e, m, "x").is_err());
+        assert!(set_mask(&mut e, m, None).is_err());
+        assert!(switch_version(&mut e, m).is_err() && rename_version(&mut e, m, "x").is_err() && delete_version(&mut e, m).is_err());
+        assert!(add_node(&mut e, Some(m), "").is_ok(), "after = past the end adds at the end");
+        assert_eq!(select_node(&mut e, 9).unwrap_err(), "no node 9 (the grade's nodes are 0 to 2)");
+    }
+
+    #[test]
+    fn a_graph_back_to_one_plain_node_is_dropped() {
+        let mut e = lumetri();
+        set_exposure(&mut e, 0.5);
+        add_node(&mut e, None, "").unwrap();
+        assert!(has_graph(&e));
+        remove_node(&mut e, 1).unwrap();
+        assert!(e.color.is_none() && !has_graph(&e), "one plain node again: no graph");
+        assert_eq!(exposure(&e), 0.5);
+        select_node(&mut e, 0).unwrap();
+        assert!(e.color.is_none(), "selecting the only node makes no graph");
+        // a label, a mix or a second version is a real graph
+        set_label(&mut e, 0, "Base").unwrap();
+        assert!(has_graph(&e));
+        set_label(&mut e, 0, "").unwrap();
+        assert!(e.color.is_none());
+        set_mix(&mut e, 0, 0.5).unwrap();
+        assert!(has_graph(&e));
+        reset_grade(&mut e);
+        assert!(e.color.is_none());
+        // another effect's graph is never one
+        let mut blur = find_effect("gaussian_blur").unwrap().instance();
+        blur.color = Some(Box::new(ColorGraph::single()));
+        add_version_raw(&mut blur);
+        assert!(!has_graph(&blur) && graph(&blur).is_none());
+    }
+
+    fn add_version_raw(e: &mut EffectInstance) {
+        if let Some(g) = e.color.as_deref_mut() {
+            g.versions.push(GradeVersion { name: "B".into(), nodes: vec![ColorNode::new("")], selected: 0 });
+        }
+    }
+
+    #[test]
+    fn deleting_the_active_version_in_the_middle() {
+        let mut e = lumetri();
+        set_exposure(&mut e, 0.1);
+        add_version(&mut e, None, false).unwrap();
+        set_exposure(&mut e, 0.2);
+        add_version(&mut e, None, false).unwrap();
+        set_exposure(&mut e, 0.3);
+        switch_version(&mut e, 1).unwrap();
+        delete_version(&mut e, 1).unwrap();
+        assert_eq!(versions(&e), (vec!["A".to_string(), "C".to_string()], 1), "the next version becomes active");
+        assert_eq!(exposure(&e), 0.3);
+        switch_version(&mut e, 0).unwrap();
+        assert_eq!(exposure(&e), 0.1);
+    }
+
+    #[test]
+    fn node_masks_resolve_to_the_first_mask_of_their_name_and_follow_renames() {
+        let mut e = lumetri();
+        let rect = crate::mask::MaskPath::rect(0.0, 0.0, 10.0, 10.0);
+        e.masks = vec![Mask::new("m", rect.clone()), Mask::new("m", rect.clone()), Mask::new("sky", rect)];
+        add_node(&mut e, None, "").unwrap();
+        set_mask(&mut e, 1, Some("m")).unwrap();
+        // the node takes the first "m"; the second "m" and "sky" still limit the whole effect
+        assert_eq!(effect_wide_masks(&e).len(), 2);
+        let n = active_nodes(&e)[1];
+        assert!(matches!(node_mask(&e, &n), NodeMask::Inside(m) if std::ptr::eq(m, &e.masks[0])));
+        // a dangling name applies nowhere
+        rename_mask(&mut e, "m", Some("face"));
+        assert_eq!(active_nodes(&e)[1].mask, Some("face"));
+        let n = active_nodes(&e)[1];
+        assert!(matches!(node_mask(&e, &n), NodeMask::Nowhere));
+        rename_mask(&mut e, "face", None);
+        assert_eq!(active_nodes(&e)[1].mask, None);
+    }
+
+    #[test]
+    fn every_node_parameter_is_reachable_for_keyframe_upkeep() {
+        let mut e = lumetri();
+        add_node(&mut e, None, "").unwrap();
+        add_version(&mut e, None, true).unwrap();
+        let own = e.params.len();
+        // own params (B's selected node), A's two nodes, and B's other node (B duplicated A)
+        assert_eq!(e.all_params_mut().len(), own * 4);
+        let k = crate::keyframe::Keyframe::new(filmcraft_time::Tick(10), ParamValue::Float(1.0));
+        e.color.as_deref_mut().unwrap().versions[0].nodes[0].params.get_mut("exposure").unwrap().keyframes.push(k);
+        assert!(e.is_animated(), "a keyframed node of another version animates the effect");
     }
 }

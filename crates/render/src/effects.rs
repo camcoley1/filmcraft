@@ -628,8 +628,13 @@ fn within_unit(v: [f32; 3], hdr: bool, f: impl Fn([f32; 3]) -> [f32; 3]) -> [f32
 fn lumetri_graph(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
     use filmcraft_project::color_graph;
     for n in color_graph::active_nodes(e).iter().filter(|n| n.enabled) {
+        // a node naming a mask the effect lacks applies nowhere
+        let mask = match color_graph::node_mask(e, n) {
+            color_graph::NodeMask::Nowhere => continue,
+            color_graph::NodeMask::Frame => None,
+            color_graph::NodeMask::Inside(m) => Some(m),
+        };
         let node = color_graph::node_instance(n);
-        let mask = n.mask.and_then(|name| e.masks.iter().find(|m| m.name == name));
         let cov = mask.and_then(|m| crate::mask::effect_coverage(std::slice::from_ref(m), cx.t, cx.px_scale, img.w, img.h));
         let mix = n.mix.clamp(0.0, 1.0) as f32;
         if cov.is_none() && mix >= 1.0 {
@@ -642,7 +647,7 @@ fn lumetri_graph(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
             crate::mask::mix(img, &input, cov);
         }
         if mix < 1.0 {
-            crate::mask::mix(img, &input, &vec![mix; img.w * img.h]);
+            crate::mask::mix_by(img, &input, mix);
         }
     }
 }

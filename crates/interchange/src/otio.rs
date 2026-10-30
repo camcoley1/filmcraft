@@ -337,9 +337,15 @@ fn null_to_sentinel(v: &mut Value) {
 }
 
 fn effects_from(v: Option<&Value>) -> Option<Vec<EffectInstance>> {
-    let mut v = v?.clone();
+    read_effects(v?).ok()
+}
+
+/// FilmCraft's effects metadata, or why it cannot be read (for example a Lumetri grade over the
+/// node or version caps, which is refused rather than cut short).
+fn read_effects(v: &Value) -> std::result::Result<Vec<EffectInstance>, String> {
+    let mut v = v.clone();
     null_to_sentinel(&mut v);
-    let mut effects: Vec<EffectInstance> = serde_json::from_value(v).ok()?;
+    let mut effects: Vec<EffectInstance> = serde_json::from_value(v).map_err(|e| e.to_string())?;
     let fix = |p: &mut ParamValue| {
         if let ParamValue::Vec2(v) = p {
             if v.x == NAN_SENTINEL {
@@ -351,12 +357,12 @@ fn effects_from(v: Option<&Value>) -> Option<Vec<EffectInstance>> {
         }
     };
     for e in &mut effects {
-        for p in e.params.values_mut() {
+        for (_, p) in e.all_params_mut() {
             fix(&mut p.value);
             p.keyframes.iter_mut().for_each(|k| fix(&mut k.value));
         }
     }
-    Some(effects)
+    Ok(effects)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -587,8 +593,10 @@ impl Imp<'_, '_> {
         if let Some(l) = m.get("label").and_then(|l| serde_json::from_value::<Label>(l.clone()).ok()) {
             ti.label = l;
         }
-        if let Some(effects) = effects_from(m.get("effects")) {
-            ti.effects = effects;
+        match m.get("effects").map(read_effects) {
+            Some(Ok(effects)) => ti.effects = effects,
+            Some(Err(e)) => self.report.warn(format!("clip \"{}\": its FilmCraft effects could not be read and were not imported ({e})", ti.name)),
+            None => {}
         }
         if let Some(l) = m.get("link").and_then(Value::as_u64) {
             let next = self.b.link_id();

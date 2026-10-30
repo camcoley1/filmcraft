@@ -624,10 +624,11 @@ pub(crate) fn param_modified(ti: &TrackItem, effect: &str, param_id: &str) -> bo
 }
 
 /// The non-intrinsic effects of an item as a format without FilmCraft's Lumetri node graphs can
-/// carry them: a Lumetri with several nodes (or Mix / a node mask) becomes one Lumetri per enabled
-/// node of the active grade version, in order, which renders the same where every node is plain
-/// (on, Mix 100 %, no node mask). What the stacked effects cannot carry (Mix, node masks, other
-/// grade versions) is reported once per item.
+/// carry them: a Lumetri with several nodes (or Mix / a node mask) becomes one Lumetri per node of
+/// the active grade version, in order (a bypassed node as a disabled effect), which renders the
+/// same where every node is plain (Mix 100 %, no node mask) and the effect has no masks. What the
+/// stacked effects cannot carry (node Mix, node masks, the effect's masks, other grade versions)
+/// is reported once per item.
 pub(crate) fn exported_effects<'a>(ti: &'a TrackItem, report: &mut Report) -> Vec<std::borrow::Cow<'a, EffectInstance>> {
     use filmcraft_project::color_graph as cg;
     let mut out = Vec::new();
@@ -641,17 +642,31 @@ pub(crate) fn exported_effects<'a>(ti: &'a TrackItem, report: &mut Report) -> Ve
             continue;
         }
         let nodes = cg::active_nodes(e);
-        let lossy = nodes.iter().any(|n| n.enabled && (n.mix < 1.0 || n.mask.is_some())) || versions > 1;
-        for n in nodes.iter().filter(|n| n.enabled) {
+        let mut lost = Vec::new();
+        if nodes.iter().any(|n| n.enabled && n.mix < 1.0) {
+            lost.push("node Mix");
+        }
+        if nodes.iter().any(|n| n.enabled && n.mask.is_some()) {
+            lost.push("node masks");
+        }
+        if !cg::effect_wide_masks(e).is_empty() {
+            lost.push("the effect's masks");
+        }
+        if versions > 1 {
+            lost.push("other grade versions");
+        }
+        for n in &nodes {
             let mut x = cg::node_instance(n);
-            x.enabled = e.enabled;
+            x.enabled = e.enabled && n.enabled;
             out.push(std::borrow::Cow::Owned(x));
         }
+        let bypassed = nodes.iter().filter(|n| !n.enabled).count();
         report.warn(format!(
-            "clip \"{}\": its Lumetri node graph was exported as {} stacked Lumetri effects{}",
+            "clip \"{}\": its Lumetri node graph was exported as {} stacked Lumetri effects{}{}",
             ti.name,
-            nodes.iter().filter(|n| n.enabled).count(),
-            if lossy { " (node Mix, node masks and other grade versions are not kept)" } else { "" }
+            nodes.len(),
+            if bypassed > 0 { format!(", {bypassed} of them off (bypassed nodes)") } else { String::new() },
+            if lost.is_empty() { String::new() } else { format!(" (not kept: {})", lost.join(", ")) }
         ));
     }
     out

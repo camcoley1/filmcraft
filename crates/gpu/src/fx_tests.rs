@@ -1323,6 +1323,48 @@ fn working_textures_stay_within_the_budget() {
 /// the ungraded frame: working textures over the budget, the device refusing them (out of memory),
 /// a table larger than the device's storage binding, and recording the prepared passes failing
 /// (which no input reaches; forced here), which renders the frame again with the layer on the CPU.
+/// A Lumetri node graph that does not fit the effect stage's budget renders on the CPU, the same
+/// picture as on the GPU (no grade dropped).
+#[test]
+fn a_node_graph_over_the_budget_renders_on_the_cpu() {
+    use filmcraft_project::color_graph as cg;
+    let Some((dev, q)) = gpu_or_skip("a_node_graph_over_the_budget_renders_on_the_cpu") else { return };
+    let (w, h) = (320usize, 180usize);
+    let mut e = heavy_grade();
+    e.masks = effect_masks(w as f64, h as f64);
+    let first = e.masks.first().map(|m| m.name.clone()).unwrap();
+    cg::add_node(&mut e, None, "").unwrap();
+    e.params.get_mut("exposure").unwrap().value = fl(0.8);
+    cg::set_mask(&mut e, 1, Some(&first)).unwrap();
+    cg::set_mix(&mut e, 1, 0.5).unwrap();
+    cg::add_node(&mut e, None, "").unwrap();
+    e.params.get_mut("temperature").unwrap().value = fl(-35.0);
+    let op = FxOp::eval_masked(&e, &cx(Tick::ZERO, 1.0), w, h).unwrap();
+    assert!(op.gpu_ok());
+    let layer = PlanLayer {
+        frame: yuv_frame(320, 180),
+        matrix: Affine::IDENTITY,
+        opacity: 1.0,
+        blend: Blend::Normal,
+        fx: Some(Arc::new(LayerFx { size: (320, 180), decimation: 1, ops: vec![op] })),
+        input: None,
+    };
+    let plan = FramePlan::Layers { width: w, height: h, layers: vec![layer.clone()] };
+    let cpu = execute_cpu(&plan).over_black_rgba8();
+    let all = vec![true; w * h];
+    let ungraded = execute_cpu(&FramePlan::Layers { width: w, height: h, layers: vec![PlanLayer { fx: None, ..layer }] }).over_black_rgba8();
+    assert!(stats8(&cpu, &ungraded, &all).1 > 5.0, "the graph changes the picture");
+    let mut c = GpuCompositor::new(&dev, &q);
+    for (what, budget) in [("GPU stage", fx::FX_TEXTURE_BUDGET), ("over the budget (CPU)", 1)] {
+        c.fx.as_mut().unwrap().budget = budget;
+        c.composite(&plan);
+        let (_, _, gpu) = c.read_output().expect("readback");
+        let (p99, mean, _) = stats8(&cpu, &gpu, &all);
+        eprintln!("node graph / {what}: p99 {p99} mean {mean:.3}");
+        assert!(p99 <= 6 && mean < 1.5, "{what}: p99 {p99} mean {mean}");
+    }
+}
+
 #[test]
 fn no_preparation_failure_drops_a_grade() {
     let Some((dev, q)) = gpu_or_skip("no_preparation_failure_drops_a_grade") else { return };
@@ -1437,8 +1479,8 @@ fn empty_masks_are_bounded_and_match_cpu() {
     }
 }
 
-/// Lumetri node graphs (M8d) on the GPU against the CPU: four nodes (one at Mix 50 %, one limited
-/// to a node mask, one bypassed) inside an effect-wide mask, on the chart and the demo scene; a
+/// Lumetri node graphs (M8d) on the GPU against the CPU: five nodes (one at Mix 50 %, one limited
+/// to a node mask, one bypassed, one masked at Mix 60 %) inside an effect-wide mask, on the chart and the demo scene; a
 /// one-node graph is the same GPU op as the single Lumetri it replaces.
 #[test]
 fn lumetri_node_graphs_match_cpu() {
@@ -1474,7 +1516,14 @@ fn lumetri_node_graphs_match_cpu() {
         cg::add_node(&mut e, None, "off").unwrap();
         set(&mut e, &[("exposure", fl(-2.0))]);
         cg::set_enabled(&mut e, 3, false).unwrap();
+        // Mix below 100 % and a node mask together: the deepest nesting (Blend around Masked)
+        cg::add_node(&mut e, None, "left, mixed").unwrap();
+        set(&mut e, &[("tint", fl(35.0)), ("contrast", fl(40.0))]);
+        cg::set_mask(&mut e, 4, Some("left")).unwrap();
+        cg::set_mix(&mut e, 4, 0.6).unwrap();
         let op = FxOp::eval_masked(&e, &cx(Tick::ZERO, 1.0), w as usize, h as usize).unwrap();
+        let nested = |op: &FxOp| matches!(op, FxOp::Masked { op, .. } if matches!(&**op, FxOp::Nodes(n) if n.iter().any(|o| matches!(o, FxOp::Blend { op, .. } if matches!(&**op, FxOp::Masked { .. })))));
+        assert!(nested(&op), "{picture_name}: the plan nests Blend around Masked inside the effect mask");
         assert!(op.gpu_ok(), "{picture_name}: the graph runs on the GPU");
         let mut cpu = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.clone() };
         op.apply(&mut cpu);
@@ -1486,7 +1535,7 @@ fn lumetri_node_graphs_match_cpu() {
         let frame = VideoFrame::rgba_f32(w, h, px.clone());
         let (_, _, gpu) = c.effect_image(&frame, &LayerFx { size: (w, h), decimation: 1, ops: vec![op] }).expect("effect image");
         let (fl_diff, b8) = diff_float_and_8bit(&cpu.px, &gpu);
-        eprintln!("{picture_name} / 4-node graph: max float diff {fl_diff:.2e}, max 8-bit diff {b8}");
+        eprintln!("{picture_name} / 5-node graph: max float diff {fl_diff:.2e}, max 8-bit diff {b8}");
         assert!(fl_diff <= 1.0 / 255.0 && b8 <= 1, "{picture_name}: {fl_diff} / {b8}");
     }
 }

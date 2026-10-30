@@ -1456,7 +1456,7 @@ impl Project {
     pub fn has_color_graphs(&self) -> bool {
         self.sequences()
             .filter_map(ProjectItem::as_sequence)
-            .any(|s| s.video_tracks.iter().chain(&s.audio_tracks).flat_map(|t| &t.items).any(|it| it.effects.iter().any(|e| e.color.is_some())))
+            .any(|s| s.video_tracks.iter().chain(&s.audio_tracks).flat_map(|t| &t.items).any(|it| it.effects.iter().any(crate::color_graph::has_graph)))
     }
 
     /// The part of a nested-sequence clip's timeline range that lies past the end of the nested
@@ -1586,7 +1586,7 @@ impl Project {
                             *h -= delta;
                         }
                         for e in &mut ti.effects {
-                            for p in e.params.values_mut() {
+                            for (_, p) in e.all_params_mut() {
                                 for k in &mut p.keyframes {
                                     k.time -= delta;
                                 }

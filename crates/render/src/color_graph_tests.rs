@@ -189,3 +189,51 @@ fn the_planned_op_is_the_cpu_render_and_hdr_graphs_render() {
     assert_eq!(got, want.px);
     assert_ne!(got, picture().px);
 }
+
+#[test]
+fn a_dangling_node_mask_applies_nowhere() {
+    let mut e = two_nodes();
+    e.masks = vec![Mask::new("left", MaskPath::rect(0.0, 0.0, 20.0, 32.0))];
+    cg::set_mask(&mut e, 1, Some("left")).unwrap();
+    // the mask goes away behind the graph's back (a hostile file): the node grades nothing
+    e.masks.clear();
+    let want = render(&lumetri(&warm()), WorkingSpace::Rec709);
+    let got = {
+        let mut img = picture();
+        crate::mask::apply_effect(&mut img, &e, &cx(WorkingSpace::Rec709));
+        img.px
+    };
+    assert_eq!(got, want, "only the first node");
+    let op = FxOp::eval_masked(&e, &cx(WorkingSpace::Rec709), 48, 32).unwrap();
+    let mut planned = picture();
+    op.apply(&mut planned);
+    let worst = planned.px.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    assert!(worst < 1e-5, "{worst}");
+}
+
+#[test]
+fn a_keyframed_node_that_is_not_selected_animates() {
+    use filmcraft_project::Keyframe;
+    let mut e = two_nodes();
+    // keyframe node 0 (exposure 0 at tick 0, 1.5 at one second), then select node 1
+    cg::select_node(&mut e, 0).unwrap();
+    let sec = Tick(254_016_000_000);
+    e.params.get_mut("exposure").unwrap().keyframes = vec![Keyframe::new(Tick::ZERO, ParamValue::Float(0.0)), Keyframe::new(sec, ParamValue::Float(1.5))];
+    let keyed = e.clone();
+    cg::select_node(&mut e, 1).unwrap();
+    assert!(e.is_animated());
+    for t in [Tick::ZERO, sec] {
+        let at = |e: &EffectInstance| {
+            let mut img = picture();
+            apply(&mut img, e, &FxCtx { t, ..cx(WorkingSpace::Rec709) });
+            img.px
+        };
+        assert_eq!(at(&e), at(&keyed), "at {t:?}: the same picture whichever node is selected");
+    }
+    let frame = |t: Tick| {
+        let mut img = picture();
+        apply(&mut img, &e, &FxCtx { t, ..cx(WorkingSpace::Rec709) });
+        img.px
+    };
+    assert_ne!(frame(Tick::ZERO), frame(sec), "the unselected node's keyframes animate the picture");
+}
