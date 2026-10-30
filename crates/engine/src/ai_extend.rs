@@ -23,7 +23,10 @@
 //! everything behind it on the track and on sync-locked tracks moves later. On a sync-locked track
 //! an item crossing that point (a music bed, an L-cut) is split there and a gap of the new clip's
 //! length opens in it, as for any insert; the clip's own linked audio is not extended. A
-//! transition on the extended edge moves to the new clip's outer edge. The new clip is named
+//! transition on the extended edge moves to the new clip's outer edge; one on another moving
+//! track that sat on a cut at the insert point (a crossfade of the linked audio) becomes a fade
+//! of the item on the far side of the new gap (`end`: a fade in of the later item; `start`: a fade
+//! out of the earlier one). The new clip is named
 //! "<clip> (extended)", fills the frame (Fill Frame), keeps the clip's effects except Motion and
 //! animated ones, and plays at 100 % at the video's own frame rate whatever the clip's speed. Its
 //! length is the seconds asked for, snapped down to whole sequence frames, or the video's own if
@@ -33,7 +36,7 @@ use std::path::{Path, PathBuf};
 
 use filmcraft_edit as edit;
 use filmcraft_media::FrameRequest;
-use filmcraft_project::{BinEntry, BinId, ClipId, ItemId, TrackItem, TrackKind, TransitionId};
+use filmcraft_project::{BinEntry, BinId, ClipId, ItemId, TrackId, TrackItem, TrackKind, TransitionId};
 use filmcraft_sidecar::JobResult;
 use filmcraft_time::{Tick, TimeRange};
 use serde_json::{Value, json};
@@ -381,26 +384,38 @@ fn place_in(s: &mut Session, pl: &Placement) -> Result<()> {
     let (clip, at_end) = (pl.clip, pl.at_end);
     s.edit_sequence("Generative Extend", move |seq, ctx, _| {
         // transitions on the extended edge move to the new clip's outer edge
-        let moved: Vec<(TransitionId, Tick)> = seq
-            .track(track)
-            .map(|t| {
-                t.transitions
-                    .iter()
-                    .filter(|tr| if at_end { tr.from == Some(clip) } else { tr.to == Some(clip) })
-                    .map(|tr| (tr.id, if at_end { tr.start + dur } else { tr.start }))
-                    .collect()
-            })
-            .unwrap_or_default();
-        edit::insert(seq, vec![(track, ti)], ctx)?;
-        if let Some(t) = seq.track_mut(track) {
-            for tr in t.transitions.iter_mut() {
-                if let Some((_, start)) = moved.iter().find(|(id, _)| *id == tr.id) {
-                    tr.start = *start;
-                    if at_end {
-                        tr.from = Some(new_id);
-                    } else {
-                        tr.to = Some(new_id);
+        // A transition on another track that will move (sync-locked, like insert) and sits on a cut
+        // at the insert point loses its partner: there the new clip leaves a gap. With `end` it
+        // becomes a fade in of the item that moves later, with `start` a fade out of the item
+        // that stays.
+        let mut moved: Vec<(TrackId, TransitionId, Tick, Option<ClipId>, Option<ClipId>)> = Vec::new();
+        for t in seq.all_tracks() {
+            let gap = !t.locked && (t.id == track || t.sync_lock);
+            for tr in &t.transitions {
+                if t.id == track {
+                    if at_end && tr.from == Some(clip) {
+                        moved.push((t.id, tr.id, tr.start + dur, Some(new_id), tr.to));
+                    } else if !at_end && tr.to == Some(clip) {
+                        moved.push((t.id, tr.id, tr.start, tr.from, Some(new_id)));
                     }
+                    continue;
+                }
+                let (Some(from), Some(to)) = (tr.from, tr.to) else { continue };
+                let on_cut = t.item(from).is_some_and(|i| i.end() == at) && t.item(to).is_some_and(|i| i.start == at);
+                if gap && on_cut {
+                    if at_end {
+                        moved.push((t.id, tr.id, at + dur, None, Some(to)));
+                    } else {
+                        moved.push((t.id, tr.id, at - tr.duration, Some(from), None));
+                    }
+                }
+            }
+        }
+        edit::insert(seq, vec![(track, ti)], ctx)?;
+        for t in seq.all_tracks_mut() {
+            for tr in t.transitions.iter_mut() {
+                if let Some((_, _, start, from, to)) = moved.iter().find(|m| m.0 == t.id && m.1 == tr.id) {
+                    (tr.start, tr.from, tr.to) = (*start, *from, *to);
                 }
             }
         }

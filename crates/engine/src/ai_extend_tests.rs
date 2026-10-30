@@ -49,7 +49,8 @@ fn fixture(name: &str, seq_size: (u32, u32), rate: FrameRate, steps: u32) -> Fx 
     let src = dir.join("src.mp4");
     let generated = dir.join("generated.mp4");
     make_movie(&src, DemoScene::Aurora, 160, 90, 192);
-    make_movie(&generated, DemoScene::CityNight, 96, 54, 48);
+    // 4:3, so filling and fitting the 16:9 frames below differ
+    make_movie(&generated, DemoScene::CityNight, 96, 72, 48);
     let mut s = Session::default();
     let r = s.execute("file.import", json!({"paths": [src.to_string_lossy()]})).unwrap();
     let item = ItemId(r["items"][0].as_u64().unwrap());
@@ -169,9 +170,11 @@ fn the_end_of_a_clip_is_extended_with_ripple_in_one_undo_step() {
     let q = f.s.project.sequence(f.seq).unwrap();
     let new = &q.video_tracks[0].items[1];
     assert_eq!(new.name, "src.mp4 (extended)");
-    // Fill Frame: a 96x54 video in a 160x90 frame is scaled to cover it, not fitted
+    // Fill Frame: a 4:3 96x72 video in a 16:9 160x90 frame is scaled to cover it (x 160/96, the
+    // sides cropped), not fitted (x 90/72, pillarboxed)
     let scale = new.effect("motion").unwrap().f64_at("scale", Tick::ZERO);
     assert!(!new.scale_to_frame && (scale - 100.0 * 160.0 / 96.0).abs() < 0.01, "{scale}");
+    assert!((scale - 100.0 * 90.0 / 72.0).abs() > 10.0, "fill, not fit: {scale}");
     // the result is in a bin called Generated, its file in the project's AI media (not the cache)
     let bin = f.s.project.root.children.iter().find_map(|e| match e {
         filmcraft_project::BinEntry::Bin(b) if b.name == "Generated" => Some(b.children.len()),
@@ -303,6 +306,14 @@ fn a_transition_on_the_extended_edge_moves_to_the_new_clips_edge() {
         f.s.execute("sequence.applyVideoTransition", json!({"clip": a, "edge": "out", "frames": 12})).unwrap();
         let tr = f.s.project.sequence(f.seq).unwrap().video_tracks[0].transitions[0].clone();
         assert_eq!((tr.from, tr.to), (Some(a), Some(b)));
+        // and a crossfade between their linked sounds on A1
+        let (aa, ba) = {
+            let q = f.s.project.sequence(f.seq).unwrap();
+            (q.audio_tracks[0].items[0].id, q.audio_tracks[0].items[1].id)
+        };
+        f.s.execute("sequence.applyAudioTransition", json!({"clip": aa, "edge": "out", "frames": 12})).unwrap();
+        let xf = f.s.project.sequence(f.seq).unwrap().audio_tracks[0].transitions[0].clone();
+        assert_eq!((xf.from, xf.to), (Some(aa), Some(ba)));
         let target = if at_end { a } else { b };
         f.s.state.selection = vec![target];
         f.s.execute("ai.generativeExtend", json!({"seconds": 1, "side": if at_end { "end" } else { "start" }, "wait": true, "confirm": true})).unwrap();
@@ -322,6 +333,21 @@ fn a_transition_on_the_extended_edge_moves_to_the_new_clips_edge() {
         }
         let cut = if at_end { t.item(b).unwrap().start } else { t.item(new).unwrap().start };
         assert!(now.start < cut && now.end() > cut, "the dissolve straddles its cut");
+        // A1: the sounds are now apart (the gap under the new clip); the crossfade becomes a fade on
+        // the far side of the gap, not a transition across it
+        let a1 = &q.audio_tracks[0];
+        assert_eq!(a1.transitions.len(), 1);
+        let x = &a1.transitions[0];
+        assert_eq!(a1.item(ba).unwrap().start, secs(4.0), "b's sound moved with b");
+        if at_end {
+            assert_eq!((x.from, x.to, x.start), (None, Some(ba), secs(4.0)), "a fade in of b's sound");
+        } else {
+            assert_eq!((x.from, x.to, x.start), (Some(aa), None, secs(3.0) - x.duration), "a fade out of a's sound");
+        }
+        assert_eq!(x.duration, xf.duration);
+        f.s.execute("edit.undo", json!({})).unwrap();
+        let q = f.s.project.sequence(f.seq).unwrap();
+        assert_eq!(q.audio_tracks[0].transitions[0], xf, "undo restores the crossfade");
     }
 }
 
