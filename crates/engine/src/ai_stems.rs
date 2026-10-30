@@ -41,9 +41,6 @@ const TICKS_PER_SAMPLE: i64 = TICKS_PER_SECOND / RATE as i64;
 const MAX_STEM_BYTES: u64 = 2 << 30;
 /// A stem may differ from the decoded length by this much.
 const LENGTH_SLACK_S: f64 = 0.05;
-/// An audio stream may end this much before the media does (camera audio a few ms short): reads
-/// past its last decodable sample there are silence. Earlier failures are errors.
-const END_SLACK_S: f64 = 0.5;
 
 pub(crate) fn enabled(s: &Session) -> std::result::Result<(), String> {
     super::helper_ready(s, "stems")?;
@@ -195,9 +192,9 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// Write `samples` samples of `src`'s audio stream `stream` from sample `offset` (at [`RATE`],
 /// resampled), channels `channels`, as a 32-bit float WAV, ten seconds at a time; stops when
-/// `stop` says so. `end` is the media's end (samples): a stream that stops decoding within
-/// [`END_SLACK_S`] of it is padded with silence ([`read_chunk`]); any other decode failure is an
-/// error naming the stream and the range.
+/// `stop` says so. `end` is the media's end (samples, for messages). A read that comes back short
+/// (the stream ended) is padded with silence; a decode failure is an error naming the stream and
+/// the range ([`read_chunk`]).
 fn decode_to_wav(
     src: &dyn filmcraft_media::MediaSource,
     stream: usize,
@@ -255,10 +252,10 @@ fn decode_to_wav(
     w.flush().map_err(|e| e.to_string())
 }
 
-/// `n` samples of audio stream `stream` from sample `pos`. When the decoder fails, the longest
-/// decodable prefix is found (by halving); if it ends within [`END_SLACK_S`] of the media's `end`
-/// the stream has ended there and the rest is silence, else the failure is returned with the
-/// stream and the range.
+/// `n` samples of audio stream `stream` from sample `pos`. FilmCraft's decoders answer reads past
+/// the end of a stream with silence or a short buffer (the stream's own end-of-stream signal),
+/// which is padded with silence; an error is never taken for the end: it fails the job with the
+/// stream and the range. A cancelled read stops.
 fn read_chunk(
     src: &dyn filmcraft_media::MediaSource,
     stream: usize,
@@ -266,37 +263,19 @@ fn read_chunk(
     n: usize,
     end: i64,
 ) -> std::result::Result<filmcraft_frame::AudioBuffer, String> {
-    let e = match src.audio_stream(stream, pos, n, RATE) {
-        Ok(b) => return Ok(b),
-        Err(filmcraft_media::MediaError::Cancelled) => return Err("stopped".into()),
-        Err(e) => e,
-    };
-    let (mut good, mut bad) = (0usize, n);
-    let mut prefix = None;
-    while bad - good > 1 {
-        let mid = good + (bad - good) / 2;
-        match src.audio_stream(stream, pos, mid, RATE) {
-            Ok(b) => {
-                good = mid;
-                prefix = Some(b);
-            }
-            Err(_) => bad = mid,
+    match src.audio_stream(stream, pos, n, RATE) {
+        Ok(b) => Ok(b),
+        Err(filmcraft_media::MediaError::Cancelled) => Err("stopped".into()),
+        Err(e) => {
+            let t = |x: i64| x as f64 / f64::from(RATE);
+            Err(format!(
+                "decoding audio stream {stream} failed reading {:.3} to {:.3} s (the media lasts {:.3} s): {e}",
+                t(pos),
+                t(pos.saturating_add(n as i64)),
+                t(end)
+            ))
         }
     }
-    let stopped = pos.saturating_add(good as i64);
-    let slack = (END_SLACK_S * f64::from(RATE)) as i64;
-    if stopped < end.saturating_sub(slack) {
-        let t = |x: i64| x as f64 / f64::from(RATE);
-        return Err(format!(
-            "decoding audio stream {stream} failed at {:.3} s (reading {:.3} to {:.3} s; the media lasts {:.3} s): {e}",
-            t(stopped),
-            t(pos),
-            t(pos.saturating_add(n as i64)),
-            t(end)
-        ));
-    }
-    // the stream ended: what decoded, then silence
-    Ok(prefix.unwrap_or_else(|| filmcraft_frame::AudioBuffer::silence(RATE, 1, 0)))
 }
 
 pub(crate) fn apply(s: &mut Session, pj: &super::PendingAi, files: &[std::path::PathBuf]) -> Result<()> {

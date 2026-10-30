@@ -446,10 +446,14 @@ fn unplaced_stems_survive_a_move_and_placing_needs_the_sequence() {
     assert!(toasts.iter().any(|m| m.contains("open the clip's sequence to place them")), "{toasts:?}");
 }
 
-/// An audio source that decodes up to sample `decodes_to` (44.1 kHz) and fails after it.
+/// An audio source that decodes up to sample `decodes_to` (44.1 kHz) and fails after it, whose
+/// stream ends at `ends_at` (reads past it come back as silence, as FilmCraft's decoders do), and
+/// that answers `Cancelled` when `cancel` is set.
 struct Broken {
     info: filmcraft_media::MediaInfo,
     decodes_to: i64,
+    ends_at: i64,
+    cancel: bool,
 }
 
 impl filmcraft_media::MediaSource for Broken {
@@ -460,39 +464,51 @@ impl filmcraft_media::MediaSource for Broken {
         Err(filmcraft_media::MediaError::NoStream("video"))
     }
     fn audio(&self, start: i64, frames: usize, rate: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
-        if start + frames as i64 > self.decodes_to {
+        if self.cancel {
+            return Err(filmcraft_media::MediaError::Cancelled);
+        }
+        if start + frames as i64 > self.decodes_to.min(self.ends_at) && self.decodes_to < self.ends_at {
             return Err(filmcraft_media::MediaError::Decode("corrupt packet".into()));
         }
-        Ok(filmcraft_frame::AudioBuffer { sample_rate: rate, channels: vec![vec![0.5; frames]; 2] })
+        let ch: Vec<f32> = (0..frames as i64).map(|i| if start + i < self.ends_at { 0.5 } else { 0.0 }).collect();
+        Ok(filmcraft_frame::AudioBuffer { sample_rate: rate, channels: vec![ch.clone(), ch] })
     }
 }
 
-fn broken(decodes_to: i64) -> Broken {
+fn broken(decodes_to: i64, ends_at: i64) -> Broken {
     use filmcraft_media::MediaSource;
     let rate = filmcraft_time::FrameRate::FPS_24;
     let info =
         filmcraft_media::generators::GeneratorSource::new(filmcraft_media::Generator::Demo(filmcraft_media::DemoScene::Plasma), 8, 8, rate, rate.tick_of(240))
             .info()
             .clone();
-    Broken { info, decodes_to }
+    Broken { info, decodes_to, ends_at, cancel: false }
 }
 
-/// A decoder that fails inside the media is an error naming the stream and the range (no silent
-/// stems); a stream that only ends a little before the media is padded with silence.
+/// A decode failure is an error naming the stream and the range wherever it happens (inside the
+/// media, inside its last half second, or a short source that never decodes): never silent
+/// stems. Only the stream's own end (reads past it come back as silence) is padded. A cancelled
+/// read stops.
 #[test]
 fn decode_failures_are_errors_and_only_a_stream_end_is_silence() {
     let dir = std::env::temp_dir().join(format!("filmcraft-ai-broken-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("source.wav");
     let end = 10 * 44_100;
-    let e = super::decode_to_wav(&broken(4 * 44_100), 0, &[0, 1], (0, end, end), &path, &|| false, &mut |_| {}).unwrap_err();
-    assert!(e.contains("decoding audio stream 0 failed at 4.000 s") && e.contains("corrupt packet"), "{e}");
-    // 0.1 s short of the media: the rest is silence
+    let run = |src: &Broken, end: i64| super::decode_to_wav(src, 0, &[0, 1], (0, end, end), &path, &|| false, &mut |_| {});
+    for (decodes_to, end, what) in [(4 * 44_100, end, "inside the media"), (end - 8_820, end, "in its last 0.5 s"), (0, 13_230, "a 0.3 s source")] {
+        let e = run(&broken(decodes_to, end), end).unwrap_err();
+        assert!(e.contains("decoding audio stream 0 failed") && e.contains("corrupt packet"), "{what}: {e}");
+    }
+    // the stream ends 0.1 s before the media: the decoder's silence after its end is kept
     let short = end - 4_410;
-    super::decode_to_wav(&broken(short), 0, &[0, 1], (0, end, end), &path, &|| false, &mut |_| {}).unwrap();
+    run(&broken(i64::MAX, short), end).unwrap();
     let b = std::fs::read(&path).unwrap();
     let sample = |i: i64| f32::from_le_bytes(b[44 + i as usize * 8..48 + i as usize * 8].try_into().unwrap());
     assert_eq!((sample(0), sample(short - 1), sample(short), sample(end - 1)), (0.5, 0.5, 0.0, 0.0));
+    let mut c = broken(4 * 44_100, end);
+    c.cancel = true;
+    assert_eq!(run(&c, end).unwrap_err(), "stopped");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
