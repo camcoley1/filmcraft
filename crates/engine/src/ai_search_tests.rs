@@ -61,6 +61,7 @@ fn fixture_with(name: &str, hits_for: impl Fn(ItemId, ItemId) -> Value, steps: u
     p.transcripts.insert(b, std::sync::Arc::new(t));
     s.project = std::sync::Arc::new(p);
     s.ai.cache_root = Some(dir.join("cache"));
+    s.ai.media_root = Some(dir.join("media"));
     s.ai.limits = Limits { poll_interval: Duration::from_millis(5), max_poll_failures: 3, io_timeout: Duration::from_secs(2), ..Default::default() };
     // the canned index meta names item ids; the ids are known only now: rewrite the script's ids
     let mut sc = script(hits_for(a, b), steps);
@@ -308,24 +309,55 @@ fn set_duration(f: &mut Fx, item: ItemId, d: Tick) {
 }
 
 #[test]
-fn a_changed_file_gets_a_new_file_pair_and_the_old_one_is_removed() {
+fn a_changed_file_gets_a_new_file_pair_and_the_one_before_goes_a_publish_later() {
     let mut f = fixture("pair", visual, 1);
     f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
     let dir = index_dir(&f);
     let d = f.s.project.item(f.b).and_then(|i| if let ItemKind::Media(m) = &i.kind { Some(m.info.duration) } else { None }).unwrap();
     let b = f.b;
+    let pair = |ver: u64| (dir.join(format!("i_{}_{ver}.f16", b.0)), dir.join(format!("i_{}_{ver}.json", b.0)));
     set_duration(&mut f, b, Tick(d.0 + 1));
     f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
     let doc = index_json(&f);
-    let b = doc["items"].as_array().unwrap().iter().find(|e| e["id"] == f.b.0).unwrap();
-    assert_eq!(b["f16"], format!("i_{}_2.f16", f.b.0), "{doc}");
-    assert!(dir.join(format!("i_{}_2.f16", f.b.0)).is_file() && dir.join(format!("i_{}_2.json", f.b.0)).is_file());
-    assert!(!dir.join(format!("i_{}_1.f16", f.b.0)).exists() && !dir.join(format!("i_{}_1.json", f.b.0)).exists(), "the replaced pair is gone");
+    let entry = doc["items"].as_array().unwrap().iter().find(|e| e["id"] == f.b.0).unwrap();
+    assert_eq!(entry["f16"], format!("i_{}_2.f16", f.b.0), "{doc}");
+    assert!(pair(2).0.is_file() && pair(2).1.is_file());
+    // a search that read the manifest before the switch can still open the pair it names
+    assert!(pair(1).0.is_file() && pair(1).1.is_file(), "the pair before stays for one more publish");
     assert!(dir.join(format!("i_{}_1.f16", f.a.0)).is_file(), "the untouched item keeps its pair");
+    // the next replacement removes the oldest
+    set_duration(&mut f, b, Tick(d.0 + 2));
+    f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    assert!(pair(3).0.is_file() && pair(2).0.is_file());
+    assert!(!pair(1).0.exists() && !pair(1).1.exists(), "two generations back is gone");
     // stray files the manifest does not name go too
     std::fs::write(dir.join("i_999_7.f16"), b"x").unwrap();
     f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
     assert!(!dir.join("i_999_7.f16").exists());
+}
+
+#[test]
+fn a_failed_publish_leaves_the_index_as_it_was() {
+    let mut f = fixture("failpub", visual, 1);
+    f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    let dir = index_dir(&f);
+    let before = std::fs::read(dir.join("index.json")).unwrap();
+    let d = f.s.project.item(f.b).and_then(|i| if let ItemKind::Media(m) = &i.kind { Some(m.info.duration) } else { None }).unwrap();
+    let (a, b) = (f.a, f.b);
+    set_duration(&mut f, a, Tick(d.0 + 5));
+    set_duration(&mut f, b, Tick(d.0 + 6));
+    // the second item's new pair cannot be written: a folder sits where its file should go
+    std::fs::create_dir(dir.join(format!("i_{}_2.f16", b.0))).unwrap();
+    let e = f.s.execute("ai.indexProject", json!({"wait": true})).unwrap_err().to_string();
+    assert!(!e.is_empty());
+    assert_eq!(std::fs::read(dir.join("index.json")).unwrap(), before, "the manifest still names the old pairs");
+    for it in [a, b] {
+        assert!(dir.join(format!("i_{}_1.f16", it.0)).is_file() && dir.join(format!("i_{}_1.json", it.0)).is_file());
+    }
+    assert!(!dir.join(format!("i_{}_2.f16", a.0)).exists(), "the first item's new pair was taken back");
+    // searches keep working on the old index
+    let r = f.s.execute("ai.search", json!({"query": "ocean", "wait": true})).unwrap();
+    assert_eq!(r["hits"].as_array().unwrap().len(), 3, "{r}");
 }
 
 #[test]
@@ -469,16 +501,106 @@ fn a_search_does_not_give_a_project_an_id() {
 }
 
 #[test]
-fn copies_of_a_project_keep_their_own_index() {
-    let mut f = fixture("copies", visual, 1);
-    let id = crate::ai::ensure_project_id(&mut f.s);
-    f.s.path = Some("/projects/one.fcraft".into());
-    let one = super::index_dir_of(&f.s, &id).unwrap();
-    f.s.path = Some("/projects/copy of one.fcraft".into());
-    let two = super::index_dir_of(&f.s, &id).unwrap();
-    assert_ne!(one, two);
-    assert_eq!(one.parent(), two.parent());
-    assert!(one.file_name().unwrap().to_string_lossy().starts_with(&id));
+fn the_index_follows_the_project_id_not_the_file_path() {
+    let mut f = fixture("untitled", visual, 1);
+    assert!(f.s.path.is_none());
+    f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    // the untitled project is saved: the index is still found
+    f.s.path = Some(f.dir.join("one.fcraft").to_string_lossy().to_string());
+    let r = f.s.execute("ai.search", json!({"query": "ocean", "wait": true})).unwrap();
+    assert_eq!((r["hits"].as_array().unwrap().len(), r["indexed"].as_u64()), (3, Some(2)), "{r}");
+    // Save As: same id, another path, same index; nothing is embedded again
+    f.s.path = Some(f.dir.join("two.fcraft").to_string_lossy().to_string());
+    let r = f.s.execute("ai.search", json!({"query": "ocean", "wait": true})).unwrap();
+    assert_eq!(r["indexed"], 2, "{r}");
+    assert_eq!(f.s.execute("ai.indexProject", json!({"wait": true})).unwrap()["upToDate"], true);
+    assert_eq!(f.helper.started().iter().filter(|r| r.kind == "searchIndex").count(), 1);
+    let id = f.s.project.id.clone();
+    assert_eq!(super::index_dir_of(&f.s, &id).unwrap(), index_dir(&f));
+}
+
+#[test]
+fn an_index_folder_named_after_the_path_hash_is_adopted() {
+    let mut f = fixture("legacy", visual, 1);
+    f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    let dir = index_dir(&f);
+    let legacy = dir.with_file_name(format!("{}-0123456789abcdef", f.s.project.id));
+    std::fs::rename(&dir, &legacy).unwrap();
+    assert!(!dir.exists());
+    let r = f.s.execute("ai.search", json!({"query": "ocean", "wait": true})).unwrap();
+    assert_eq!(r["indexed"], 2, "{r}");
+    assert!(dir.join("index.json").is_file() && !legacy.exists(), "renamed to the id's folder");
+}
+
+#[test]
+fn damaged_numbers_in_an_index_cannot_overflow_anything() {
+    let mut f = fixture("overflow", visual, 1);
+    f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    let dir = index_dir(&f);
+    let mut doc = index_json(&f);
+    for (k, e) in doc["items"].as_array_mut().unwrap().iter_mut().enumerate() {
+        e["frames"] = json!(u64::MAX);
+        if k == 1 {
+            e["frames"] = json!(2);
+            e["ver"] = json!(u64::MAX);
+        }
+    }
+    doc["failed"] = json!([{"id": 4_000_000, "fingerprint": "x", "ver": u64::MAX}]);
+    std::fs::write(dir.join("index.json"), serde_json::to_vec(&doc).unwrap()).unwrap();
+    let entries = super::read_index(&dir);
+    assert!(entries.values().all(|e| e.frames <= super::MAX_ITEM_FRAMES && e.ver <= super::MAX_VER), "{entries:?}");
+    assert!(!entries.contains_key(&f.a.0) && !entries.contains_key(&f.b.0), "both damaged entries are dropped");
+    // a search over it is just "no index"; indexing again rebuilds both items
+    let r = f.s.execute("ai.search", json!({"query": "ocean", "wait": true})).unwrap();
+    assert_eq!(r["indexed"], 0, "{r}");
+    let r = f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    assert_eq!(r["indexed"], 2, "{r}");
+    // the totals do not overflow either
+    let e = |item, frames, ver| super::Entry { item, fingerprint: "x".into(), sampling: String::new(), frames, ver, error: None };
+    let big = std::collections::BTreeMap::from([(1, e(1, u64::MAX, 0)), (2, e(2, u64::MAX, 0))]);
+    assert_eq!(big.values().fold(0u64, |t, e| t.saturating_add(e.frames)), u64::MAX);
+}
+
+#[test]
+fn a_search_that_cannot_start_still_replaces_the_one_in_flight() {
+    let mut f = fixture("early", visual, 1);
+    f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    // from now on the helper answers slowly
+    let slow = FakeHelper::start(script(visual(f.a, f.b), 100_000)).unwrap();
+    f.s.execute("ai.connect", json!({"port": slow.port()})).unwrap();
+    f.s.ai.background = true;
+    // "dog" is running (the helper answers slowly)
+    let dog = f.s.execute("ai.search", json!({"query": "dog"})).unwrap();
+    assert_eq!(dog["pending"], true);
+    // the helper goes away; "ocean" can only be answered from the transcripts
+    let other = FakeHelper::start(Script { features: vec!["echo".into()], ..Default::default() }).unwrap();
+    f.s.execute("ai.connect", json!({"port": other.port()})).unwrap();
+    let r = f.s.execute("ai.search", json!({"query": "ocean"})).unwrap();
+    assert_eq!(r["pending"], false, "{r}");
+    wait_idle(&mut f);
+    // dog's job was stopped and its end did not touch ocean's results or note
+    assert_eq!(f.s.search_results.query, "ocean");
+    assert!(!f.s.search_results.pending);
+    let note = f.s.search_results.note.clone().unwrap_or_default();
+    // the app connects in the background: the reason is "contacting..." or "does not provide `search`"
+    assert!(!note.is_empty() && !note.contains("stopped"), "{note}");
+    assert_eq!(f.s.search_results.hits.len(), 1);
+}
+
+#[test]
+fn an_answer_ready_before_a_search_that_cannot_start_is_dropped() {
+    let mut f = fixture("early2", visual, 1);
+    f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    f.s.ai.background = true;
+    f.s.execute("ai.search", json!({"query": "dog"})).unwrap();
+    // let dog's job finish its work without applying it
+    std::thread::sleep(Duration::from_millis(300));
+    let other = FakeHelper::start(Script { features: vec!["echo".into()], ..Default::default() }).unwrap();
+    f.s.execute("ai.connect", json!({"port": other.port()})).unwrap();
+    f.s.execute("ai.search", json!({"query": "ocean"})).unwrap();
+    wait_idle(&mut f);
+    assert_eq!(f.s.search_results.query, "ocean", "dog's finished answer did not replace it");
+    assert_eq!(f.s.search_results.hits.len(), 1);
 }
 
 #[test]

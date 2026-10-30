@@ -7,6 +7,7 @@
 //! `sidecar` build) the panel says why and the plain name filter is untouched.
 
 use egui::{Align2, Rect, Sense, pos2, vec2};
+use filmcraft_engine::search_results::SearchHit;
 use filmcraft_project::ItemId;
 use serde_json::json;
 
@@ -68,15 +69,19 @@ pub fn results(app: &mut FilmcraftApp, ui: &mut egui::Ui, content: Rect, pre: &s
         note(ui, y + 10.0, tl!("No matches"));
         return;
     }
-    // the hits scroll: a long list is reachable by wheel and scroll bar
-    let area = Rect::from_min_max(pos2(content.min.x, y), content.max);
+    hit_list(app, ui, Rect::from_min_max(pos2(content.min.x, y), content.max), pre, fs, &res.hits, actions);
+}
+
+/// The hits in `area`; they scroll, so a long list is reachable by wheel and scroll bar.
+fn hit_list(app: &mut FilmcraftApp, ui: &mut egui::Ui, area: Rect, pre: &str, fs: f32, hits: &[SearchHit], actions: &mut Actions) {
+    let t = app.tokens;
     if area.height() < 22.0 {
         return;
     }
     let mut bui = ui.new_child(egui::UiBuilder::new().max_rect(area).id_salt((pre, "aiHits")));
     bui.set_clip_rect(area.intersect(ui.clip_rect()));
     egui::ScrollArea::vertical().id_salt((pre, "ai-scroll")).auto_shrink([false, false]).show(&mut bui, |ui| {
-        for (n, h) in res.hits.iter().enumerate() {
+        for (n, h) in hits.iter().enumerate() {
             let (row, resp) = ui.allocate_exact_size(vec2((area.width() - 12.0).max(40.0), 22.0), Sense::click());
             if !ui.is_rect_visible(row) {
                 continue;
@@ -122,6 +127,7 @@ pub fn run(query: &str, actions: &mut Actions) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FilmcraftApp;
 
     #[test]
     fn a_question_mark_makes_a_search_by_content_and_leaves_name_filters_alone() {
@@ -130,6 +136,54 @@ mod tests {
         assert_eq!(question("plain"), "plain");
         assert_eq!(name_filter("?ocean"), "");
         assert_eq!(name_filter("MoV"), "mov");
+    }
+
+    /// A long hit list is reachable: the wheel scrolls it until the last hit is on screen.
+    #[test]
+    fn the_hit_list_scrolls_to_the_last_hit() {
+        let hits: Vec<SearchHit> =
+            (0..60).map(|i| SearchHit { item: ItemId(1000 + i), time: filmcraft_time::Tick(i as i64), score: 0.3, kind: "visual", stale: false }).collect();
+        let mut app = FilmcraftApp::new(filmcraft_engine::Session::default());
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx, &Tokens::for_kind(Default::default()));
+        let content = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 200.0));
+        let mut time = 0.0;
+        let hits_ref = hits.clone();
+        let mut frame = |app: &mut FilmcraftApp, wheel: f32| {
+            let hits = &hits_ref;
+            time += 0.05;
+            let mut events = vec![egui::Event::PointerMoved(pos2(100.0, 100.0))];
+            if wheel != 0.0 {
+                events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0.0, wheel),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: Default::default(),
+                });
+            }
+            let raw =
+                egui::RawInput { time: Some(time), events, screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 300.0))), ..Default::default() };
+            app.auto.begin_frame();
+            let mut out = ctx.run_ui(raw, |ui| {
+                let mut actions = Vec::new();
+                hit_list(app, ui, content, "p", 13.0, hits, &mut actions);
+            });
+            out.textures_delta.clear();
+        };
+        frame(&mut app, 0.0);
+        frame(&mut app, 0.0);
+        let shown = |app: &FilmcraftApp| -> Vec<usize> {
+            (0..60)
+                .filter(|n| app.auto.elements.iter().any(|e| e.id == format!("p.aiHit.{n}") && e.rect[1] >= content.min.y && e.rect[3] <= content.max.y + 1.0))
+                .collect()
+        };
+        let first = shown(&app);
+        assert!(first.contains(&0) && !first.contains(&59) && first.len() < 12, "{first:?}");
+        for _ in 0..60 {
+            frame(&mut app, -400.0);
+        }
+        let last = shown(&app);
+        assert!(last.contains(&59) && !last.contains(&0), "scrolled to the end: {last:?}");
     }
 
     #[test]

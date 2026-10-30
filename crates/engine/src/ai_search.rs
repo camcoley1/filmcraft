@@ -3,12 +3,14 @@
 //! **Index.** `ai.indexProject {items?, intervalSeconds=2, maxFrames=1800, wait}` asks the helper
 //! (`searchIndex`) to sample frames of the project's video and still files (one per interval, a
 //! short clip gets one in the middle) and embed them with OpenAI CLIP ViT-B/32. The index lives in
-//! `<media cache>/AI Index/<project id>[-<project file hash>]/` (a copy of a project that keeps its
-//! id has its own folder once it is saved elsewhere): `index.json` (per item: its fingerprint, the
-//! sampling it was made with, the file names) and per item a pair `i_<item>_<n>.f16` (frames x 512
+//! `<media cache>/AI Index/<project id>/` (keyed by the project id alone: saving an untitled project
+//! or Save As keeps the index, and copies of a project share it, which is harmless because entries
+//! are keyed by the media's fingerprint): `index.json` (per item: its fingerprint, the sampling it
+//! was made with, the file names) and per item a pair `i_<item>_<n>.f16` (frames x 512
 //! half floats) and `.json` (the frames' times). A new pair is written under a new `n` and
-//! `index.json` is switched to it with one rename, so a search never sees half of a replacement;
-//! files `index.json` does not name are deleted. The folder is outside the AI job cache, so pruning
+//! `index.json` is switched to it with one rename, so a search never sees half of a replacement; the
+//! pair before it stays for one more publish (a search that read the older manifest can still open
+//! it); older files and files no entry names are deleted. The folder is outside the AI job cache, so pruning
 //! never takes it. Incremental: an item is embedded only when it has no entry or its fingerprint
 //! (path, size, modification time in nanoseconds, duration) or the sampling (interval, frames per
 //! file, model) differs; an item that could not be read is recorded as failed under its
@@ -62,6 +64,10 @@ const MAX_INDEX_JSON: u64 = 32 << 20;
 pub const MAX_ENTRIES: usize = 4000;
 /// Most frames an index holds (the helper reads at most 2 GiB of half floats: 1 KiB a frame).
 pub const MAX_INDEX_FRAMES: u64 = (2 << 30) / 1024;
+/// Most frames one item has (the helper's cap per file); more is a damaged entry.
+const MAX_ITEM_FRAMES: u64 = 5000;
+/// Highest file-pair version taken from an index (a damaged entry otherwise).
+const MAX_VER: u64 = 1 << 32;
 /// Longest query.
 const MAX_QUERY: usize = 200;
 /// Transcript hits kept per item.
@@ -266,19 +272,32 @@ struct Entry {
     error: Option<String>,
 }
 
-/// FNV-1a of a project file's path: copies of a project (same id) keep apart.
-fn path_hash(path: &str) -> u64 {
-    path.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3))
-}
-
 fn index_dir_of(s: &Session, project: &str) -> Result<PathBuf> {
     // the AI cache folder's name check (a UUID) also guards this one
     project_cache_dir(s, project)?;
-    let name = match s.path.as_deref() {
-        Some(p) => format!("{project}-{:016x}", path_hash(p)),
-        None => project.to_string(),
-    };
-    Ok(cache_root(s).join("AI Index").join(name))
+    Ok(cache_root(s).join("AI Index").join(project))
+}
+
+/// An index folder an earlier build named `<project id>-<16 hex>` (it keyed indexes by the project
+/// file's path) becomes `<project id>` when there is none yet. On the job's thread.
+fn adopt_legacy_index(dir: &Path) {
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name().map(|n| n.to_string_lossy().to_string())) else { return };
+    if dir.exists() {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(parent) else { return };
+    let legacy = rd
+        .flatten()
+        .take(10_000)
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            n.strip_prefix(&format!("{name}-")).is_some_and(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        })
+        .filter(|e| e.path().join("index.json").is_file())
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok());
+    if let Some(e) = legacy {
+        let _ = std::fs::rename(e.path(), dir);
+    }
 }
 
 /// `i_<item>_<n>` for item ids and versions (digits only: no path can come out of a name).
@@ -308,7 +327,9 @@ fn read_index(dir: &Path) -> BTreeMap<u64, Entry> {
         for e in doc[key].as_array().into_iter().flatten().take(MAX_ENTRIES) {
             let (Some(item), Some(fingerprint)) = (e["id"].as_u64(), e["fingerprint"].as_str()) else { continue };
             let frames = if listed { e["frames"].as_u64().unwrap_or(0) } else { 0 };
-            if listed && frames == 0 {
+            let ver = e["ver"].as_u64().unwrap_or(0);
+            // damaged numbers: the entry is dropped and the item is indexed again
+            if (listed && !(1..=MAX_ITEM_FRAMES).contains(&frames)) || ver > MAX_VER {
                 continue;
             }
             out.insert(
@@ -318,7 +339,7 @@ fn read_index(dir: &Path) -> BTreeMap<u64, Entry> {
                     fingerprint: fingerprint.to_string(),
                     sampling: e["sampling"].as_str().unwrap_or_default().to_string(),
                     frames,
-                    ver: e["ver"].as_u64().unwrap_or(0),
+                    ver,
                     error: e["error"].as_str().map(str::to_string),
                 },
             );
@@ -350,10 +371,17 @@ fn write_index(dir: &Path, entries: &BTreeMap<u64, Entry>) -> std::io::Result<()
     std::fs::rename(tmp, dir.join("index.json"))
 }
 
-/// Delete the `i_*` files `entries` do not name (replaced pairs, items that left the project).
+/// Delete the `i_*` files the manifest does not need: it names each item's current pair, and the pair
+/// before it is kept one more publish for a search that read the older manifest.
 fn sweep(dir: &Path, entries: &BTreeMap<u64, Entry>) {
-    let keep: HashSet<String> =
-        entries.values().filter(|e| e.frames > 0).flat_map(|e| [format!("{}.f16", stem(e.item, e.ver)), format!("{}.json", stem(e.item, e.ver))]).collect();
+    let keep: HashSet<String> = entries
+        .values()
+        .filter(|e| e.frames > 0)
+        .flat_map(|e| {
+            let previous = e.ver.checked_sub(1).filter(|v| *v > 0);
+            [Some(e.ver), previous].into_iter().flatten().flat_map(move |v| [format!("{}.f16", stem(e.item, v)), format!("{}.json", stem(e.item, v))])
+        })
+        .collect();
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for f in rd.flatten().take(100_000) {
         let name = f.file_name().to_string_lossy().to_string();
@@ -375,6 +403,17 @@ fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
 
 // ---------- jobs ----------
 
+/// A newer search replaces every older one, also when it never starts a job of its own (no helper,
+/// no index): the older jobs are stopped and no answer of theirs counts any more.
+fn supersede_searches(s: &mut Session) {
+    for p in s.ai_search.pending.iter().filter(|p| matches!(p.ctx, Ctx::Search { .. })) {
+        if let Some(j) = s.jobs.iter().find(|j| j.id == p.job) {
+            j.progress.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+    s.ai_search.current_search = 0;
+}
+
 /// Start a project-level helper job (no clips, no sequence): the job record, its thread and the
 /// pending entry that [`poll`] swaps in. `work` runs on the job's thread with the job's folder.
 fn start<F>(s: &mut Session, kind: &'static str, label: &str, ctx: Ctx, wait: bool, work: F) -> Result<Value>
@@ -388,14 +427,9 @@ where
     let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
     let ms = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
     let out_dir = project_cache_dir(s, &project)?.join(format!("{kind}-{ms}-{id}"));
-    std::fs::create_dir_all(&out_dir).map_err(|e| EngineError::Other(format!("AI cache {}: {e}", out_dir.display())))?;
     if matches!(ctx, Ctx::Search { .. }) {
-        // a newer search replaces the older one: stop it, and only this one's answer counts
-        for p in s.ai_search.pending.iter().filter(|p| matches!(p.ctx, Ctx::Search { .. })) {
-            if let Some(j) = s.jobs.iter().find(|j| j.id == p.job) {
-                j.progress.cancel.store(true, Ordering::Relaxed);
-            }
-        }
+        // only this search's answer counts
+        supersede_searches(s);
         s.ai_search.current_search = id;
     }
     let keep: Vec<PathBuf> =
@@ -406,6 +440,14 @@ where
     let outcome: Arc<Mutex<Option<Done>>> = Arc::default();
     let (prog, res, out, dir) = (job.progress.clone(), job.result.clone(), outcome.clone(), out_dir.clone());
     let run = move || {
+        // the job's folder is made here, not on the session thread
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            let msg = format!("AI cache {}: {e}", dir.display());
+            *lock(&prog.status) = msg.clone();
+            *lock(&res) = Some(Err(msg));
+            prog.finished.store(true, Ordering::Relaxed);
+            return;
+        }
         let beat = dir.join(HEARTBEAT);
         let _ = std::fs::write(&beat, b"running\n");
         prune_cache(&ai_root, cap, &keep, PRUNE_MIN_AGE);
@@ -505,6 +547,7 @@ struct IndexArgs {
 fn index_work(run: &mut Runner, out_dir: &Path, a: IndexArgs) -> std::result::Result<Done, Stop> {
     let io = |e: std::io::Error| Stop::Msg(format!("{}: {e}", a.dir.display()));
     run.report(0.0, "Reading the index");
+    adopt_legacy_index(&a.dir);
     let mut entries = read_index(&a.dir);
     let sampling = sampling_key(a.interval, a.max_frames);
     let targets = targets_of(&a.cands);
@@ -515,38 +558,39 @@ fn index_work(run: &mut Runner, out_dir: &Path, a: IndexArgs) -> std::result::Re
     // what fits in one job and in the index
     let (mut take, mut skipped, mut job_frames) = (Vec::<&Target>::new(), 0usize, 0u64);
     let mut indexed = entries.values().filter(|e| e.frames > 0).count();
-    let mut index_frames: u64 = entries.values().map(|e| e.frames).sum();
+    let mut index_frames: u64 = entries.values().fold(0u64, |t, e| t.saturating_add(e.frames));
     let mut full = false;
     let mut left = 0usize;
     for t in &stale {
         let est = estimate_frames(t.duration, a.interval, a.max_frames);
         let old = entries.get(&t.item).map_or(0, |e| e.frames);
         let grows = old == 0;
-        if (grows && indexed >= MAX_ENTRIES) || index_frames.saturating_sub(old) + est > MAX_INDEX_FRAMES {
+        if (grows && indexed >= MAX_ENTRIES) || index_frames.saturating_sub(old).saturating_add(est) > MAX_INDEX_FRAMES {
             skipped += 1;
             full = true;
             continue;
         }
-        if take.len() >= ITEMS_PER_JOB || (!take.is_empty() && job_frames + est > JOB_FRAMES) {
+        if take.len() >= ITEMS_PER_JOB || (!take.is_empty() && job_frames.saturating_add(est) > JOB_FRAMES) {
             left += 1;
             continue;
         }
-        job_frames += est;
-        index_frames = index_frames.saturating_sub(old) + est;
+        job_frames = job_frames.saturating_add(est);
+        index_frames = index_frames.saturating_sub(old).saturating_add(est);
         if grows {
             indexed += 1;
         }
         take.push(t);
     }
-    let summary = |entries: &BTreeMap<u64, Entry>, new: usize, remaining: usize, deferred: usize, failed: usize, up_to_date: bool| {
-        let frames: u64 = entries.values().map(|e| e.frames).sum();
-        json!({"indexed": entries.values().filter(|e| e.frames > 0).count(), "new": new, "remaining": remaining, "deferred": deferred, "failed": failed,
-            "skipped": skipped, "full": full, "frames": frames, "bytes": frames * 1024, "upToDate": up_to_date})
-    };
+    let summary =
+        |entries: &BTreeMap<u64, Entry>, new: usize, remaining: usize, deferred: usize, failed: usize, up_to_date: bool, skipped: usize, full: bool| {
+            let frames: u64 = entries.values().fold(0u64, |t, e| t.saturating_add(e.frames));
+            json!({"indexed": entries.values().filter(|e| e.frames > 0).count(), "new": new, "remaining": remaining, "deferred": deferred, "failed": failed,
+            "skipped": skipped, "full": full, "frames": frames, "bytes": frames.saturating_mul(1024), "upToDate": up_to_date})
+        };
     if take.is_empty() {
         write_index(&a.dir, &entries).map_err(io)?;
         sweep(&a.dir, &entries);
-        return Ok(Done::Index(summary(&entries, 0, 0, 0, 0, skipped == 0)));
+        return Ok(Done::Index(summary(&entries, 0, 0, 0, 0, skipped == 0, skipped, full)));
     }
     let req = JobRequest {
         kind: "searchIndex".into(),
@@ -554,7 +598,7 @@ fn index_work(run: &mut Runner, out_dir: &Path, a: IndexArgs) -> std::result::Re
         params: json!({"ids": take.iter().map(|t| t.item).collect::<Vec<_>>(), "intervalSeconds": a.interval, "maxFrames": a.max_frames}),
         out_dir: out_dir.to_string_lossy().into(),
     };
-    let timeout = Duration::from_secs(600 + job_frames / 4);
+    let timeout = Duration::from_secs(600u64.saturating_add(job_frames / 4));
     let (result, files) = run.drive(&req, timeout)?;
     if run.stopped() {
         return Err(Stop::Cancelled);
@@ -562,24 +606,46 @@ fn index_work(run: &mut Runner, out_dir: &Path, a: IndexArgs) -> std::result::Re
     run.report(1.0, "Applying");
     std::fs::create_dir_all(&a.dir).map_err(io)?;
     let find = |name: &str| files.iter().find(|f| f.file_name().is_some_and(|n| n == name));
-    let (mut new, mut failed) = (0usize, 0usize);
+    let (mut new, mut failed, mut unlanded) = (0usize, 0usize, 0usize);
+    // new pairs written by this run: removed again when the run fails (nothing names them yet)
+    let mut written: Vec<PathBuf> = Vec::new();
+    let mut total: u64 = entries.values().fold(0u64, |t, e| t.saturating_add(e.frames));
     for it in result.meta["items"].as_array().into_iter().flatten() {
         let (Some(k), Some(frames)) = (it["index"].as_u64(), it["frames"].as_u64()) else { continue };
         let Some(t) = take.get(k as usize) else { continue };
-        // the file changed while it was indexed: leave it for the next run
-        if fingerprint(&t.path, t.duration).as_ref() != Some(&t.fingerprint) {
+        // a count the helper cannot have made is not taken
+        if !(1..=MAX_ITEM_FRAMES).contains(&frames) {
+            unlanded += 1;
             continue;
         }
-        let (Some(f16), Some(js)) = (find(&format!("idx_{k}.f16")), find(&format!("idx_{k}.json"))) else { continue };
+        // the file changed while it was indexed: leave it for the next run
+        if fingerprint(&t.path, t.duration).as_ref() != Some(&t.fingerprint) {
+            unlanded += 1;
+            continue;
+        }
+        let (Some(f16), Some(js)) = (find(&format!("idx_{k}.f16")), find(&format!("idx_{k}.json"))) else {
+            unlanded += 1;
+            continue;
+        };
+        // the frames the helper really made may be more than the estimate: the index cap is kept
+        let old = entries.get(&t.item).map_or(0, |e| e.frames);
+        if total.saturating_sub(old).saturating_add(frames) > MAX_INDEX_FRAMES {
+            skipped += 1;
+            full = true;
+            continue;
+        }
         // a new pair under a new version; the manifest switches to it below
-        let ver = entries.get(&t.item).map_or(1, |e| e.ver + 1);
+        let ver = entries.get(&t.item).map_or(1, |e| e.ver.saturating_add(1));
         let st = stem(t.item, ver);
         let (to16, tojs) = (a.dir.join(format!("{st}.f16")), a.dir.join(format!("{st}.json")));
+        written.extend([to16.clone(), tojs.clone()]);
         if let Err(e) = move_file(f16, &to16).and_then(|()| move_file(js, &tojs)) {
-            let _ = std::fs::remove_file(&to16);
-            let _ = std::fs::remove_file(&tojs);
+            for w in &written {
+                let _ = std::fs::remove_file(w);
+            }
             return Err(io(e));
         }
+        total = total.saturating_sub(old).saturating_add(frames);
         if entries.get(&t.item).is_none_or(|e| e.frames == 0) {
             new += 1;
         }
@@ -612,9 +678,14 @@ fn index_work(run: &mut Runner, out_dir: &Path, a: IndexArgs) -> std::result::Re
         failed_kept += 1;
         failed_kept <= MAX_ENTRIES
     });
-    write_index(&a.dir, &entries).map_err(io)?;
+    if let Err(e) = write_index(&a.dir, &entries) {
+        for w in &written {
+            let _ = std::fs::remove_file(w);
+        }
+        return Err(io(e));
+    }
     sweep(&a.dir, &entries);
-    Ok(Done::Index(summary(&entries, new, left + deferred, deferred, failed, false)))
+    Ok(Done::Index(summary(&entries, new, left + deferred + unlanded, deferred, failed, false, skipped, full)))
 }
 
 // ---------- applying results ----------
@@ -662,7 +733,7 @@ pub fn poll(s: &mut Session) {
             }
             (Done::Search(sd), Ctx::Search { query, limit, transcript }) => {
                 if cancelled || !current(s, &pj) {
-                    Err("a newer search or another project replaced this one; its answer was dropped".to_string())
+                    Err("replaced by a newer search or another project (its answer was not used)".to_string())
                 } else {
                     apply_search(s, query, *limit, transcript.clone(), sd);
                     Ok(())
@@ -726,6 +797,7 @@ fn search(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(cmd, "`limit` must be between 1 and 100"));
     }
     let limit = limit as usize;
+    supersede_searches(s);
     let transcript = transcript_hits(s, query, limit);
     s.search_results = SearchResults { query: query.to_string(), hits: transcript.clone(), pending: false, note: None, indexed: 0, stale_items: 0 };
     // the picture search needs the helper and an index (a project without an id has none: reading
@@ -762,6 +834,7 @@ fn search(s: &mut Session, p: &Value) -> Result<Value> {
 /// whose files changed.
 fn search_work(run: &mut Runner, out_dir: &Path, dir: &Path, query: &str, limit: usize, snapshot: &[Candidate]) -> std::result::Result<Done, Stop> {
     run.report(0.0, "Reading the index");
+    adopt_legacy_index(dir);
     let entries = read_index(dir);
     let indexed = entries.values().filter(|e| e.frames > 0).count();
     let by_item: BTreeMap<u64, &Candidate> = snapshot.iter().map(|c| (c.item, c)).collect();
