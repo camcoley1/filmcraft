@@ -1161,6 +1161,10 @@ pub struct ProjectSettings {
     /// Project Settings ▸ Scratch Disks. Schema v11.
     #[serde(default)]
     pub scratch: ScratchDisks,
+    /// Generative Extend (a paid AI service) runs without asking first in this project: the user
+    /// chose "Don't ask again for this project". Written only when set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub generative_extend_no_confirm: bool,
 }
 
 fn title_safe_default() -> (f64, f64) {
@@ -1228,6 +1232,7 @@ impl Default for ProjectSettings {
             action_safe: action_safe_default(),
             capture_format: capture_format_default(),
             scratch: ScratchDisks::default(),
+            generative_extend_no_confirm: false,
         }
     }
 }

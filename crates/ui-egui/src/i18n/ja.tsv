@@ -3647,3 +3647,11 @@
 	Safe middle	セーフエリア: 中央
 	Safe bottom	セーフエリア: 下
 	Word animation for captions with word timings (Create Captions from a transcript)	単語タイミング付きキャプションの単語アニメーション (文字起こしからキャプションを作成)
+	Generative Extend	生成拡張
+	FilmCraft sends one frame of the clip “{clip}” and the prompt to fal.ai, which makes the new video with {model}.	FilmCraft はクリップ「{clip}」の 1 フレームとプロンプトを fal.ai に送信し、fal.ai が {model} で新しいビデオを作成します。
+	Estimated cost: about {usd} USD ({rate} USD per second of video as listed by fal.ai on {date}), billed to your fal.ai account.	推定費用: 約 {usd} USD（{date} 時点の fal.ai の掲載料金でビデオ 1 秒あたり {rate} USD）。fal.ai アカウントに請求されます。
+	FilmCraft does not know this model's price; fal.ai bills it to your account at its listed rate.	このモデルの料金は FilmCraft では不明です。fal.ai が掲載料金でアカウントに請求します。
+	After the clip	クリップの後
+	Before the clip	クリップの前
+	Prompt (optional)	プロンプト（任意）
+	Don't ask again for this project	このプロジェクトでは今後確認しない

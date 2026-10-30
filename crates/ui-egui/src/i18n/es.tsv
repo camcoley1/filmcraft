@@ -3648,3 +3648,11 @@
 	Safe middle	Centro (zona segura)
 	Safe bottom	Abajo (zona segura)
 	Word animation for captions with word timings (Create Captions from a transcript)	Animación por palabra para subtítulos con tiempos por palabra (Crear subtítulos desde una transcripción)
+	Generative Extend	Extensión generativa
+	FilmCraft sends one frame of the clip “{clip}” and the prompt to fal.ai, which makes the new video with {model}.	FilmCraft envía un fotograma del clip “{clip}” y la indicación a fal.ai, que crea el vídeo nuevo con {model}.
+	Estimated cost: about {usd} USD ({rate} USD per second of video as listed by fal.ai on {date}), billed to your fal.ai account.	Coste estimado: unos {usd} USD ({rate} USD por segundo de vídeo según la tarifa de fal.ai del {date}), cobrados en tu cuenta de fal.ai.
+	FilmCraft does not know this model's price; fal.ai bills it to your account at its listed rate.	FilmCraft no conoce el precio de este modelo; fal.ai lo cobra en tu cuenta según su tarifa publicada.
+	After the clip	Después del clip
+	Before the clip	Antes del clip
+	Prompt (optional)	Indicación (opcional)
+	Don't ask again for this project	No volver a preguntar en este proyecto

@@ -3606,3 +3606,11 @@
 	Open a sequence to search its graphics	Ouvrez une séquence pour rechercher dans ses graphiques
 	No text graphics in this sequence. Add text with the Type tool.	Aucun graphique avec du texte dans cette séquence. Ajoutez du texte avec l'outil Texte.
 	No matching text.	Aucun texte ne correspond.
+	Generative Extend	Extension générative
+	FilmCraft sends one frame of the clip “{clip}” and the prompt to fal.ai, which makes the new video with {model}.	FilmCraft envoie une image du clip « {clip} » et l’invite à fal.ai, qui crée la nouvelle vidéo avec {model}.
+	Estimated cost: about {usd} USD ({rate} USD per second of video as listed by fal.ai on {date}), billed to your fal.ai account.	Coût estimé : environ {usd} USD ({rate} USD par seconde de vidéo selon le tarif de fal.ai du {date}), facturés sur votre compte fal.ai.
+	FilmCraft does not know this model's price; fal.ai bills it to your account at its listed rate.	FilmCraft ne connaît pas le prix de ce modèle ; fal.ai le facture sur votre compte à son tarif affiché.
+	After the clip	Après le clip
+	Before the clip	Avant le clip
+	Prompt (optional)	Invite (facultative)
+	Don't ask again for this project	Ne plus demander pour ce projet

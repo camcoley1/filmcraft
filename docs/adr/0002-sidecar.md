@@ -92,8 +92,10 @@ AI features run in **`craft-ai`**, a separate Python process installed by craft-
     never put in a project, a job folder, a log or a result; the helper's error messages are fixed
     phrases, scrubbed of anything key-like); the feature is offered only while a key is present.
     A new request runs only with `confirm: true`: without it the command fails with a message
-    saying that it is billed and sends the clip's frame to the provider (the params text says so
-    too). One user action submits at most once: the helper keeps the accepted request id, retries
+    saying that it is billed, sends the clip's frame to the provider, the model and the estimated
+    cost (the params text says so too). From the menu the desktop app shows a dialog with the same
+    facts whose Generate button runs the command with `confirm: true`; "Don't ask again for this
+    project" (`dontAskAgain`) stores the consent in the project's settings. One user action submits at most once: the helper keeps the accepted request id, retries
     only GETs against it, cancels it at the provider on a timeout or a cancel, reports a submit
     whose connection broke as "may have been submitted" without resending it, and `resume: <id>`
     fetches an existing request's result without a new charge. The result is project media

@@ -4,7 +4,9 @@
 //! resolution?, confirm, resume?, wait=false}` continues a clip by a few seconds with a hosted
 //! image-to-video model (fal.ai, called by the `craft-ai` helper, which needs a key). This is a
 //! paid service and sends the frame off this computer, so a new request runs only with
-//! `confirm: true`; without it the command fails with [`DISCLOSURE`] (ADR 0002 item 13). On the
+//! `confirm: true` (or once `dontAskAgain` was given with it in this project: Project Settings
+//! `generative_extend_no_confirm`); without it the command fails with a message naming the model
+//! and the estimated cost ([`quote`]), and the desktop app asks in a dialog (ADR 0002 item 13). On the
 //! job's thread FilmCraft takes the clip's last source frame (first with `side: "start"`; the raw
 //! source frame, before the clip's Motion and effects), scales it to cover the sequence's frame
 //! size (long side at most 1280 pixels) and writes it as a PNG; the helper sends it with the
@@ -48,10 +50,55 @@ const MAX_PROMPT: usize = 1000;
 const BIN: &str = "Generated";
 /// Largest generated video accepted (the helper's own cap).
 const MAX_VIDEO_BYTES: u64 = 300 << 20;
+/// The helper's default model (`craft_ai.extend.DEFAULT_MODEL`).
+pub const DEFAULT_MODEL: &str = "fal-ai/ltx-video-13b-distilled/image-to-video";
+/// When the rates in [`MODELS`] were read from fal.ai's model pages.
+pub const RATES_READ: &str = "2026-10-29";
+/// The models the helper allows: id, name, listed USD per generated second (None: not known
+/// here), and whether the length is a frame count (`8k + 1` frames at 24 fps) or whole seconds.
+const MODELS: &[(&str, &str, Option<f64>, bool)] =
+    &[(DEFAULT_MODEL, "LTX-Video 13B distilled", Some(0.04), true), ("alibaba/wan-3.0-prime/image-to-video", "Wan 3.0 Prime", None, false)];
+
+/// What a new request would cost, as far as FilmCraft knows ([`quote`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Quote {
+    pub model: String,
+    /// The model's name, or its id when it is not one of the helper's.
+    pub name: String,
+    /// Listed USD per generated second, when known.
+    pub rate: Option<f64>,
+    /// Seconds of video the model makes for the request (it rounds the length up).
+    pub billed_seconds: f64,
+    /// `rate x billed_seconds`.
+    pub usd: Option<f64>,
+}
+
+/// The cost of extending by `seconds` with `model` (default [`DEFAULT_MODEL`]) at the rate listed
+/// on [`RATES_READ`]: an estimate for the confirmation, not what fal.ai bills.
+pub fn quote(model: Option<&str>, seconds: f64) -> Quote {
+    let model = model.filter(|m| !m.is_empty()).unwrap_or(DEFAULT_MODEL);
+    let seconds = if seconds.is_finite() { seconds.clamp(1.0, 10.0) } else { 3.0 };
+    let known = MODELS.iter().find(|m| m.0 == model);
+    let billed_seconds = match known {
+        Some((_, _, _, true)) => (8.0 * (seconds * 24.0 / 8.0).ceil() + 1.0) / 24.0,
+        _ => seconds.ceil(),
+    };
+    let rate = known.and_then(|m| m.2);
+    Quote { model: model.to_string(), name: known.map_or(model, |m| m.1).to_string(), rate, billed_seconds, usd: rate.map(|r| r * billed_seconds) }
+}
+
 /// Why a new request needs `confirm: true`.
-pub(crate) const DISCLOSURE: &str = "Generative Extend sends the clip's frame (and the prompt) to fal.ai and is billed to your fal.ai \
-account at the model's price; run it again with `confirm: true` to go ahead (`resume: <request id>` fetches an earlier request's \
-result without a new charge)";
+fn disclosure(q: &Quote) -> String {
+    let cost = match q.usd {
+        Some(usd) => format!("about {usd:.2} USD ({:.2} s at {:.2} USD per second as listed on {RATES_READ})", q.billed_seconds, q.rate.unwrap_or(0.0)),
+        None => "at the model's price (not known to FilmCraft)".into(),
+    };
+    format!(
+        "Generative Extend sends the clip's frame (and the prompt) to fal.ai, made with {}, and is billed to your fal.ai account, {cost}; \
+run it again with `confirm: true` to go ahead (`resume: <request id>` fetches an earlier request's result without a new charge)",
+        q.name
+    )
+}
 
 pub(crate) fn commands() -> Vec<CommandSpec> {
     vec![CommandSpec {
@@ -59,7 +106,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         label: "Generative Extend…",
         menu: &["Clip", "AI"],
         shortcut: None,
-        params: r#"{"clip":id?,"seconds":1..10=3,"side":"end"|"start"="end","prompt":str?,"model":str?,"resolution":"480p"|"720p"?,"confirm":bool=false (true: send the frame to fal.ai, billed),"resume":str? (a fal request id: its result, no new charge),"wait":bool=false}"#,
+        params: r#"{"clip":id?,"seconds":1..10=3,"side":"end"|"start"="end","prompt":str?,"model":str?,"resolution":"480p"|"720p"?,"confirm":bool=false (true: send the frame to fal.ai, billed),"dontAskAgain":bool=false (with confirm: no confirmation needed in this project),"resume":str? (a fal request id: its result, no new charge),"wait":bool=false}"#,
         enabled,
         run,
         journal: true,
@@ -157,9 +204,11 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
         None => None,
         Some(v) => Some(v.as_str().filter(|r| request_id(r)).ok_or_else(|| bad(cmd, "`resume` must be a fal request id (letters, digits, - and _)"))?),
     };
-    // a new request is paid and sends the frame away: never without an explicit yes
-    if resume.is_none() && bool_p(p, "confirm") != Some(true) {
-        return Err(bad(cmd, DISCLOSURE));
+    // a new request is paid and sends the frame away: never without an explicit yes (given for
+    // this project with `dontAskAgain`)
+    let confirmed = bool_p(p, "confirm") == Some(true);
+    if resume.is_none() && !confirmed && !s.project.settings.generative_extend_no_confirm {
+        return Err(bad(cmd, disclosure(&quote(str_p(p, "model"), seconds))));
     }
     let mut params = json!({"seconds": seconds, "side": side});
     if let Some(prompt) = str_p(p, "prompt").map(str::trim).filter(|t| !t.is_empty()) {
@@ -209,6 +258,12 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             Some(prepare)
         }
     };
+    if confirmed && bool_p(p, "dontAskAgain") == Some(true) && !s.project.settings.generative_extend_no_confirm {
+        s.edit("Don't Ask Again: Generative Extend", |pr, _| {
+            pr.settings.generative_extend_no_confirm = true;
+            Ok(())
+        })?;
+    }
     let label = format!("Generative Extend: {name}");
     let spec = JobSpec {
         kind: "generativeExtend",

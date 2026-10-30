@@ -52,6 +52,8 @@ rustix = { version = "1", default-features = false, features = ["std", "time"] }
 cpu-time = "1"
 
 [dev-dependencies]
+# the scripted AI helper for the Generative Extend dialog test (feature `sidecar`)
+filmcraft-sidecar = { workspace = true, features = ["fake"] }
 pollster = "0.4"
 filmcraft-codecs = { workspace = true }
 # the bench registers OS hardware decoders as the desktop app does (dev-dependency only: ui-egui

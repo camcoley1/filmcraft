@@ -3604,3 +3604,11 @@
 	Open a sequence to search its graphics	Buka sekuens untuk mencari di grafisnya
 	No text graphics in this sequence. Add text with the Type tool.	Tidak ada grafis teks di sekuens ini. Tambahkan teks dengan alat Teks.
 	No matching text.	Tidak ada teks yang cocok.
+	Generative Extend	Perpanjangan Generatif
+	FilmCraft sends one frame of the clip “{clip}” and the prompt to fal.ai, which makes the new video with {model}.	FilmCraft mengirim satu bingkai dari klip “{clip}” dan prompt ke fal.ai, yang membuat video baru dengan {model}.
+	Estimated cost: about {usd} USD ({rate} USD per second of video as listed by fal.ai on {date}), billed to your fal.ai account.	Perkiraan biaya: sekitar {usd} USD ({rate} USD per detik video menurut tarif fal.ai pada {date}), ditagihkan ke akun fal.ai Anda.
+	FilmCraft does not know this model's price; fal.ai bills it to your account at its listed rate.	FilmCraft tidak mengetahui harga model ini; fal.ai menagihkannya ke akun Anda sesuai tarif yang tercantum.
+	After the clip	Setelah klip
+	Before the clip	Sebelum klip
+	Prompt (optional)	Prompt (opsional)
+	Don't ask again for this project	Jangan tanya lagi untuk proyek ini

@@ -438,3 +438,30 @@ fn parameters_are_checked_and_the_command_says_why_it_is_disabled() {
     assert_eq!(spec.menu, ["Clip", "AI"]);
     assert!(spec.params.contains("\"confirm\"") && spec.params.contains("\"resume\""));
 }
+
+#[test]
+fn the_quote_and_dont_ask_again_for_this_project() {
+    // LTX makes 8k + 1 frames at 24 fps: 3 s asks for 73 frames, 3.04 s, about 0.12 USD
+    let q = super::quote(None, 3.0);
+    assert_eq!((q.model.as_str(), q.name.as_str(), q.rate), (super::DEFAULT_MODEL, "LTX-Video 13B distilled", Some(0.04)));
+    assert!((q.billed_seconds - 73.0 / 24.0).abs() < 1e-9 && (q.usd.unwrap() - 0.04 * 73.0 / 24.0).abs() < 1e-9);
+    let w = super::quote(Some("alibaba/wan-3.0-prime/image-to-video"), 2.2);
+    assert_eq!((w.name.as_str(), w.rate, w.billed_seconds, w.usd), ("Wan 3.0 Prime", None, 3.0, None));
+    assert_eq!(super::quote(Some("other/model"), f64::NAN).name, "other/model");
+    let mut f = fixture("ext-dont-ask", (160, 90), FrameRate::FPS_24, 1);
+    let e = f.s.execute("ai.generativeExtend", json!({})).unwrap_err().to_string();
+    assert!(e.contains("LTX-Video 13B distilled") && e.contains("about 0.12 USD") && e.contains(super::RATES_READ), "{e}");
+    // `dontAskAgain` without `confirm` changes nothing
+    assert!(f.s.execute("ai.generativeExtend", json!({"dontAskAgain": true})).is_err());
+    assert!(!f.s.project.settings.generative_extend_no_confirm);
+    f.s.execute("ai.generativeExtend", json!({"confirm": true, "dontAskAgain": true, "wait": true})).unwrap();
+    assert!(f.s.project.settings.generative_extend_no_confirm);
+    // the next request in this project needs no `confirm`; the setting is saved with the project
+    f.s.state.selection = vec![f.clip];
+    f.s.execute("ai.generativeExtend", json!({"wait": true})).unwrap();
+    assert_eq!(f.helper.started().len(), 2);
+    let v = serde_json::to_value(&f.s.project.settings).unwrap();
+    assert_eq!(v["generative_extend_no_confirm"], true);
+    let fresh = serde_json::to_value(filmcraft_project::ProjectSettings::default()).unwrap();
+    assert!(fresh.get("generative_extend_no_confirm").is_none(), "not written while off");
+}

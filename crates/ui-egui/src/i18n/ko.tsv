@@ -3625,3 +3625,11 @@
 	Open a sequence to search its graphics	그래픽을 검색하려면 시퀀스를 여세요
 	No text graphics in this sequence. Add text with the Type tool.	이 시퀀스에는 텍스트 그래픽이 없습니다. 문자 도구로 텍스트를 추가하세요.
 	No matching text.	일치하는 텍스트가 없습니다.
+	Generative Extend	생성형 확장
+	FilmCraft sends one frame of the clip “{clip}” and the prompt to fal.ai, which makes the new video with {model}.	FilmCraft는 클립 “{clip}”의 프레임 하나와 프롬프트를 fal.ai로 보내며, fal.ai가 {model}(으)로 새 비디오를 만듭니다.
+	Estimated cost: about {usd} USD ({rate} USD per second of video as listed by fal.ai on {date}), billed to your fal.ai account.	예상 비용: 약 {usd} USD({date} 기준 fal.ai 게시 요금으로 비디오 1초당 {rate} USD), fal.ai 계정으로 청구됩니다.
+	FilmCraft does not know this model's price; fal.ai bills it to your account at its listed rate.	FilmCraft는 이 모델의 가격을 알지 못합니다. fal.ai가 게시된 요금으로 계정에 청구합니다.
+	After the clip	클립 뒤
+	Before the clip	클립 앞
+	Prompt (optional)	프롬프트(선택 사항)
+	Don't ask again for this project	이 프로젝트에서 다시 묻지 않기

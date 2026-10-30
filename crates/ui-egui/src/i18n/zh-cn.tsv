@@ -3623,3 +3623,11 @@
 	Safe middle	安全区域：中间
 	Safe bottom	安全区域：底部
 	Word animation for captions with word timings (Create Captions from a transcript)	为带单词时间的字幕添加逐词动画（从转录创建字幕）
+	Generative Extend	生成式延长
+	FilmCraft sends one frame of the clip “{clip}” and the prompt to fal.ai, which makes the new video with {model}.	FilmCraft 会将剪辑“{clip}”的一帧画面和提示词发送到 fal.ai，由其使用 {model} 生成新视频。
+	Estimated cost: about {usd} USD ({rate} USD per second of video as listed by fal.ai on {date}), billed to your fal.ai account.	预估费用：约 {usd} USD（按 fal.ai 于 {date} 公布的价格，每秒视频 {rate} USD），由你的 fal.ai 账户支付。
+	FilmCraft does not know this model's price; fal.ai bills it to your account at its listed rate.	FilmCraft 不知道此模型的价格；fal.ai 会按其公布的价格向你的账户收费。
+	After the clip	剪辑之后
+	Before the clip	剪辑之前
+	Prompt (optional)	提示词（可选）
+	Don't ask again for this project	此项目不再询问

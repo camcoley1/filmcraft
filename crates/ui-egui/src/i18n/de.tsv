@@ -3635,3 +3635,11 @@
 	Shows the version, community links and credits in a FilmCraft window.	Zeigt Version, Community-Links und Credits in einem FilmCraft-Fenster.
 	Couldn't open your web browser	Dein Webbrowser konnte nicht geöffnet werden
 	Open this address in your browser yourself:	Öffne diese Adresse selbst in deinem Browser:
+	Generative Extend	Generativ verlängern
+	FilmCraft sends one frame of the clip “{clip}” and the prompt to fal.ai, which makes the new video with {model}.	FilmCraft sendet ein Einzelbild des Clips „{clip}“ und den Prompt an fal.ai, das das neue Video mit {model} erstellt.
+	Estimated cost: about {usd} USD ({rate} USD per second of video as listed by fal.ai on {date}), billed to your fal.ai account.	Geschätzte Kosten: etwa {usd} USD ({rate} USD pro Sekunde Video laut fal.ai am {date}), abgerechnet über dein fal.ai-Konto.
+	FilmCraft does not know this model's price; fal.ai bills it to your account at its listed rate.	FilmCraft kennt den Preis dieses Modells nicht; fal.ai rechnet ihn über dein Konto zum angegebenen Tarif ab.
+	After the clip	Nach dem Clip
+	Before the clip	Vor dem Clip
+	Prompt (optional)	Prompt (optional)
+	Don't ask again for this project	Für dieses Projekt nicht mehr fragen

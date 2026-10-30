@@ -26,6 +26,9 @@
 //! - Field Options `fieldOptions.*`: `reverseFieldDominance`, `processing.<none|alwaysDeinterlace|flickerRemoval>`;
 //! - Clip Speed / Duration `speedDuration.*`: `speed`, `reverse`, `ripple`,
 //!   `interpolation.<frameSampling|frameBlending|opticalFlow>`;
+//! - Generative Extend (Clip ▸ AI, a paid hosted service: says what is sent, to whom and the
+//!   estimated cost; OK is labelled Generate and runs the command with `confirm: true`)
+//!   `generativeExtend.*`: `seconds`, `side.<end|start>`, `prompt`, `dontAskAgain`;
 //! - Close Project `closeProject.save`, `closeProject.dontSave`, `closeProject.cancel`;
 //! - Quit (asked when the window is closed with unsaved changes, see [`intercept_quit`])
 //!   `quit.save`, `quit.dontSave`, `quit.cancel`.
@@ -58,6 +61,8 @@ fn meta(command: &str) -> Option<(&'static str, &'static str)> {
         "clip.frameHoldOptions" => (tl!("Frame Hold Options"), "frameHold"),
         "clip.fieldOptions" => (tl!("Field Options"), "fieldOptions"),
         "clip.speedDuration" => (tl!("Clip Speed / Duration"), "speedDuration"),
+        #[cfg(feature = "sidecar")]
+        "ai.generativeExtend" => (tl!("Generative Extend"), "generativeExtend"),
         "file.closeProject" => (tl!("Save Project"), "closeProject"),
         "app.quit" => (tl!("Save Project"), "quit"),
         _ => return None,
@@ -94,6 +99,10 @@ pub fn route(app: &mut FilmcraftApp, id: &str, params: &Value) -> Option<Result<
         return Some(app.file_dialog("file.save", params));
     }
     if (id == "file.closeProject" && !app.session.is_dirty()) || id == "app.quit" {
+        return None;
+    }
+    // "Don't ask again for this project": the command runs straight away
+    if id == "ai.generativeExtend" && app.session.project.settings.generative_extend_no_confirm {
         return None;
     }
     meta(id)?;
@@ -216,6 +225,13 @@ fn defaults(app: &FilmcraftApp, id: &str) -> (Value, Value) {
             (json!({"enabled": enabled, "holdOn": "in", "timecode": tc, "holdFilters": hold_filters}), Value::Null)
         }
         "clip.fieldOptions" => (json!({"reverseFieldDominance": false, "processing": "none"}), Value::Null),
+        "ai.generativeExtend" => {
+            let q = s.active_sequence();
+            let name = q.and_then(|q| {
+                s.state.selection.iter().find_map(|c| q.find_item(*c).filter(|(t, _)| q.video_tracks.iter().any(|v| v.id == *t)).map(|x| x.1.name.clone()))
+            });
+            (json!({"seconds": 3.0, "side": "end", "prompt": "", "dontAskAgain": false}), json!({"clip": name.unwrap_or_default()}))
+        }
         "clip.speedDuration" => {
             // the first selected clip's current speed; its duration at that speed for the readout
             let q = s.active_sequence();
@@ -539,6 +555,11 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
                     }
                 }
             }
+            #[cfg(feature = "sidecar")]
+            "ai.generativeExtend" => {
+                generative_extend(ui, &mut elems, pre, p, &d.info, &d.error, &mut action);
+                return;
+            }
             "file.closeProject" | "app.quit" => {
                 ui.label(tlf!("Save changes to “{project_name}” before closing?", project_name));
                 ui.add_space(8.0);
@@ -654,7 +675,65 @@ fn finish(d: &ClipDialogDraft) -> Value {
         "clip.frameHoldOptions" if !matches!(p["holdOn"].as_str(), Some("sourceTimecode" | "sequenceTime")) => {
             p.as_object_mut().map(|m| m.remove("timecode"));
         }
+        // Generate is the confirmation
+        "ai.generativeExtend" => {
+            p["confirm"] = json!(true);
+            if p["prompt"].as_str().is_some_and(|t| t.trim().is_empty()) {
+                p.as_object_mut().map(|m| m.remove("prompt"));
+            }
+        }
         _ => {}
     }
     p
+}
+
+/// Generative Extend's confirmation: what is sent, to whom, the estimated cost, the length, the
+/// side and the prompt; Cancel / Generate.
+#[cfg(feature = "sidecar")]
+fn generative_extend(ui: &mut egui::Ui, elems: &mut Elems, pre: &str, p: &mut Value, info: &Value, error: &str, action: &mut Option<&'static str>) {
+    let seconds = p.get("seconds").and_then(Value::as_f64).unwrap_or(3.0);
+    let q = filmcraft_engine::ai_extend::quote(p.get("model").and_then(Value::as_str), seconds);
+    let (clip, model) = (info["clip"].as_str().unwrap_or_default().to_string(), q.name.clone());
+    ui.set_max_width(420.0);
+    ui.label(tlf!("FilmCraft sends one frame of the clip “{clip}” and the prompt to fal.ai, which makes the new video with {model}.", clip, model));
+    ui.add_space(4.0);
+    let cost = match (q.usd, q.rate) {
+        (Some(usd), Some(rate)) => tlf!(
+            "Estimated cost: about {usd} USD ({rate} USD per second of video as listed by fal.ai on {date}), billed to your fal.ai account.",
+            usd = format!("{usd:.2}"),
+            rate = format!("{rate:.2}"),
+            date = filmcraft_engine::ai_extend::RATES_READ
+        ),
+        _ => tl!("FilmCraft does not know this model's price; fal.ai bills it to your account at its listed rate.").to_string(),
+    };
+    ui.label(RichText::new(cost).strong());
+    ui.add_space(8.0);
+    number(ui, elems, pre, p, "seconds", tl!("Seconds"), 1.0..=10.0, " s");
+    ui.horizontal(|ui| {
+        for (k, l) in [("end", tl!("After the clip")), ("start", tl!("Before the clip"))] {
+            let r = ui.radio(p["side"].as_str() == Some(k), l);
+            push(elems, format!("{pre}.side.{k}"), &r, l);
+            if r.clicked() {
+                p["side"] = json!(k);
+            }
+        }
+    });
+    text(ui, elems, pre, p, "prompt", tl!("Prompt (optional)"), 260.0);
+    check(ui, elems, pre, p, "dontAskAgain", tl!("Don't ask again for this project"), true);
+    if !error.is_empty() {
+        ui.colored_label(egui::Color32::from_rgb(0xe0, 0x60, 0x60), error);
+    }
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        let r = ui.button(tl!("Cancel"));
+        push(elems, format!("{pre}.cancel"), &r, "Cancel");
+        if r.clicked() {
+            *action = Some("cancel");
+        }
+        let r = ui.button(tl!("Generate"));
+        push(elems, format!("{pre}.ok"), &r, "Generate");
+        if r.clicked() {
+            *action = Some("ok");
+        }
+    });
 }

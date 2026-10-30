@@ -2358,6 +2358,7 @@ dependencies = [
  "filmcraft-project",
  "filmcraft-render",
  "filmcraft-scopes",
+ "filmcraft-sidecar",
  "filmcraft-text",
  "filmcraft-time",
  "filmcraft-tts",
