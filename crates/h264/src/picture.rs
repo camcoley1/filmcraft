@@ -13,8 +13,8 @@ pub trait Pixel: Copy + Default + PartialEq + std::fmt::Debug + Send + Sync + 's
     /// `bd`, so the 8-bit loops keep a constant bound.
     fn clip(v: i32, bd: u32) -> Self;
     /// The rows of `f` if they are stored with this type.
-    fn rows(f: &Frame) -> Option<&[OnceLock<FrameRow<Self>>]>;
-    fn wrap_rows(rows: Box<[OnceLock<FrameRow<Self>>]>) -> Rows;
+    fn rows(f: &Frame) -> Option<&[RowCell<Self>]>;
+    fn wrap_rows(rows: Box<[RowCell<Self>]>) -> Rows;
     /// An output plane of these samples.
     fn plane(v: Vec<Self>) -> Plane;
     /// An empty output buffer with room for `n` samples.
@@ -35,13 +35,13 @@ impl Pixel for u8 {
         v.clamp(0, 255) as u8
     }
     #[inline(always)]
-    fn rows(f: &Frame) -> Option<&[OnceLock<FrameRow<u8>>]> {
+    fn rows(f: &Frame) -> Option<&[RowCell<u8>]> {
         match &f.rows {
             Rows::U8(r) => Some(r),
             Rows::U16(_) => None,
         }
     }
-    fn wrap_rows(rows: Box<[OnceLock<FrameRow<u8>>]>) -> Rows {
+    fn wrap_rows(rows: Box<[RowCell<u8>]>) -> Rows {
         Rows::U8(rows)
     }
     fn plane(v: Vec<u8>) -> Plane {
@@ -66,13 +66,13 @@ impl Pixel for u16 {
         v.clamp(0, (1 << bd) - 1) as u16
     }
     #[inline(always)]
-    fn rows(f: &Frame) -> Option<&[OnceLock<FrameRow<u16>>]> {
+    fn rows(f: &Frame) -> Option<&[RowCell<u16>]> {
         match &f.rows {
             Rows::U16(r) => Some(r),
             Rows::U8(_) => None,
         }
     }
-    fn wrap_rows(rows: Box<[OnceLock<FrameRow<u16>>]>) -> Rows {
+    fn wrap_rows(rows: Box<[RowCell<u16>]>) -> Rows {
         Rows::U16(rows)
     }
     fn plane(v: Vec<u16>) -> Plane {
@@ -255,10 +255,13 @@ pub struct FrameRow<P> {
     pub motion: RowMotion,
 }
 
+/// One published macroblock row: `None` once the frame has failed ([`Frame::publish_failed`]).
+pub type RowCell<P> = OnceLock<Option<FrameRow<P>>>;
+
 /// The macroblock rows of a frame, in its storage type.
 pub enum Rows {
-    U8(Box<[OnceLock<FrameRow<u8>>]>),
-    U16(Box<[OnceLock<FrameRow<u16>>]>),
+    U8(Box<[RowCell<u8>]>),
+    U16(Box<[RowCell<u16>]>),
 }
 
 /// A decoded (or in-progress) frame as stored in the DPB and referenced by later pictures.
@@ -318,7 +321,7 @@ impl Frame {
         match P::rows(self) {
             Some(rows) => {
                 if let Some(cell) = rows.get(r) {
-                    let _ = cell.set(row);
+                    let _ = cell.set(Some(row));
                 }
             }
             None => {
@@ -339,15 +342,15 @@ impl Frame {
     /// the frame stores the other sample type).
     #[inline]
     pub fn row<P: Pixel>(&self, r: usize) -> Option<&FrameRow<P>> {
-        wait(P::rows(self)?.get(r)?)
+        wait(P::rows(self)?.get(r)?)?.as_ref()
     }
 
     /// The motion of MB row `r`, waiting until it has been published.
     #[inline]
     pub fn motion(&self, r: usize) -> Option<&RowMotion> {
         match &self.rows {
-            Rows::U8(rows) => wait(rows.get(r)?).map(|row| &row.motion),
-            Rows::U16(rows) => wait(rows.get(r)?).map(|row| &row.motion),
+            Rows::U8(rows) => wait(rows.get(r)?)?.as_ref().map(|row| &row.motion),
+            Rows::U16(rows) => wait(rows.get(r)?)?.as_ref().map(|row| &row.motion),
         }
     }
 
@@ -435,6 +438,32 @@ impl Frame {
         match &self.rows {
             Rows::U8(_) => copy::<u8>(self, id, poc),
             Rows::U16(_) => copy::<u16>(self, id, poc),
+        }
+    }
+
+    /// Mark every row not published yet as failed, without allocating: readers stop waiting and
+    /// see no row (references read nothing from it, and it is never output). For a picture whose
+    /// buffers could not be allocated, where grey rows would allocate the full picture again.
+    pub fn publish_failed(&self) {
+        fn fail<P>(rows: &[RowCell<P>]) {
+            for cell in rows {
+                let _ = cell.set(None);
+            }
+        }
+        match &self.rows {
+            Rows::U8(r) => fail(r),
+            Rows::U16(r) => fail(r),
+        }
+    }
+
+    /// Whether some row was marked failed (waits for the frame to be complete).
+    pub fn is_failed(&self) -> bool {
+        fn failed<P>(rows: &[RowCell<P>]) -> bool {
+            rows.iter().any(|c| wait(c).is_some_and(|r| r.is_none()))
+        }
+        match &self.rows {
+            Rows::U8(r) => failed(r),
+            Rows::U16(r) => failed(r),
         }
     }
 

@@ -98,10 +98,24 @@ fn picture_bytes(sps: &Sps) -> (u64, u64) {
     (frame, job)
 }
 
+impl Shared {
+    #[cfg(test)]
+    fn alloc_fails(&self) -> bool {
+        self.fail_alloc.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    fn alloc_fails(&self) -> bool {
+        false
+    }
+}
+
 #[derive(Default)]
 struct Shared {
     error: Mutex<Option<Error>>,
     stats: Mutex<DecodeStats>,
+    /// Test hook: reconstruction buffers fail to allocate.
+    #[cfg(test)]
+    fail_alloc: std::sync::atomic::AtomicBool,
 }
 
 /// H.265 / HEVC decoder.
@@ -253,7 +267,7 @@ impl Decoder {
                 break;
             }
             let Some(o) = self.out_queue.pop_front() else { break };
-            pics.push(make_picture(&o));
+            pics.extend(make_picture(&o));
         }
         Ok(pics)
     }
@@ -264,7 +278,7 @@ impl Decoder {
         let mut outs = Vec::new();
         self.dpb.flush(&mut outs);
         self.out_queue.extend(outs);
-        let pics = self.out_queue.drain(..).map(|o| make_picture(&o)).collect();
+        let pics = self.out_queue.drain(..).filter_map(|o| make_picture(&o)).collect();
         while let Some(f) = self.in_flight.pop_front() {
             f.wait_complete();
         }
@@ -283,8 +297,6 @@ impl Decoder {
         }
     }
 
-    /// First error reported by a decoding job since the last call (also returned by
-    /// [`Decoder::decode`]); useful after [`Decoder::flush`].
     /// Draft mode for reduced-resolution playback (off by default): sub-layer non-reference
     /// pictures of the highest temporal sub-layer (pictures nothing predicts from) skip
     /// deblocking and SAO and come out flagged [`Picture::draft`]; every other picture is
@@ -293,8 +305,16 @@ impl Decoder {
         self.draft = on;
     }
 
+    /// First error reported by a decoding job since the last call (also returned by
+    /// [`Decoder::decode`]); useful after [`Decoder::flush`].
     pub fn take_error(&mut self) -> Option<Error> {
         self.shared.error.lock().ok().and_then(|mut e| e.take())
+    }
+
+    /// Test hook: every new reconstruction buffer fails to allocate from now on.
+    #[cfg(test)]
+    pub(crate) fn fail_allocations(&self) {
+        self.shared.fail_alloc.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn handle_nal(&mut self, nal: &[u8], pts: i64) -> Result<()> {
@@ -594,9 +614,9 @@ fn run_job_as<S: Sample>(
     draft: bool,
     shared: &Shared,
 ) {
-    let Some(mut pic) = PicState::<S>::try_new(frame.clone(), sps, pps, layout, scaling) else {
-        // make sure readers never block on this frame
-        frame.publish_gray();
+    let Some(mut pic) = (!shared.alloc_fails()).then(|| PicState::<S>::try_new(frame.clone(), sps, pps, layout, scaling)).flatten() else {
+        // readers must never block on this frame; grey rows would allocate it again
+        frame.publish_failed();
         let msg = format!("out of memory for a {}x{} picture", frame.width, frame.height);
         if let Ok(mut slot) = shared.error.lock() {
             slot.get_or_insert(Error::Unsupported(msg));
@@ -662,13 +682,18 @@ fn output_meta(sps: &Sps, pts: i64, key: bool, draft: bool) -> OutputMeta {
     }
 }
 
-fn make_picture(o: &Output<FrameRef>) -> Picture {
+/// The output picture of `o`; `None` for a frame that failed without samples (its error is
+/// reported by the decode call).
+fn make_picture(o: &Output<FrameRef>) -> Option<Picture> {
+    if o.frame.is_failed() {
+        return None;
+    }
     let (cx, cy, cw, ch) = o.meta.crop;
     let (cx, cy, cw, ch) = (cx as usize, cy as usize, cw as usize, ch as usize);
     let (ccw, cch) = (cw.div_ceil(1 << o.frame.sx), ch.div_ceil(1 << o.frame.sy));
     let bd = o.meta.bit_depth;
     let (y, u, v) = o.frame.cropped_planes((cx, cy, cw, ch), bd <= 8);
-    Picture {
+    Some(Picture {
         width: cw as u32,
         height: ch as u32,
         chroma_width: ccw as u32,
@@ -691,7 +716,7 @@ fn make_picture(o: &Output<FrameRef>) -> Picture {
         },
         sar: o.meta.sar,
         draft: o.meta.draft,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -758,5 +783,18 @@ mod tests {
         // a picture at the cap fits once, but not with 16 worker threads' pipeline
         let e = check_memory_budget(&sps(16384, tallest_within_cap()), 18).unwrap_err().to_string();
         assert!(e.contains("frame too large for software decode: ") && e.contains("pictures in flight"), "{e}");
+    }
+
+    /// A failed frame releases its readers without allocating any row and is never output.
+    #[test]
+    fn failed_frame_has_no_rows_and_no_output() {
+        let s = sps(64, 48);
+        let frame = Arc::new(Frame::new(0, 0, 64, 48, s.log2_ctb, 10, 10, 2));
+        frame.publish_failed();
+        assert!((0..frame.num_rows()).all(|r| frame.is_published(r) && frame.row::<u16>(r).is_none()));
+        assert!(frame.is_failed());
+        frame.wait_complete();
+        let o = Output { frame, poc: 0, meta: Arc::new(output_meta(&s, 0, true, false)) };
+        assert!(make_picture(&o).is_none());
     }
 }

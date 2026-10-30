@@ -9,7 +9,7 @@
 use crate::dpb::{Dpb, Output, OutputMeta, RefMark};
 use crate::error::{Error, Result, ensure, invalid, unsupported};
 use crate::params::{Pps, Sps};
-use crate::picture::{Frame, FrameRef, MbKind, MbState, Pixel, RefPic};
+use crate::picture::{Format, Frame, FrameRef, MbKind, MbState, Pixel, RefPic};
 use crate::slice::{NalHeader, Poc, PocState, SliceHeader, SliceType, is_new_picture, nal_type};
 use crate::slicedec::{PicState, SliceDecoder};
 use crate::transform::LevelScale;
@@ -73,7 +73,7 @@ const MAX_PICTURE_BYTES: u64 = 512 << 20;
 /// Largest total for every picture that can be alive at once (the DPB, the picture being decoded,
 /// the pipelined ones and the recycled reconstruction states).
 const MAX_DECODER_BYTES: u64 = if cfg!(target_pointer_width = "64") { 8 << 30 } else { 1 << 30 };
-/// Recycled reconstruction states kept per sample type.
+/// Recycled reconstruction states kept (all of the active SPS; see `Decoder::admit`).
 const POOL_LEN: usize = 4;
 
 /// Checks what pictures of `sps` need against [`MAX_PICTURE_BYTES`] and [`MAX_DECODER_BYTES`]
@@ -114,9 +114,25 @@ fn picture_bytes(sps: &Sps) -> (u64, u64) {
 struct Shared {
     error: Mutex<Option<Error>>,
     stats: Mutex<DecodeStats>,
-    /// Recycled picture buffers (8-bit and deeper pictures).
+    /// Recycled picture buffers (8-bit and deeper pictures), all of [`Shared::current`].
     pool8: Mutex<Vec<PicState<u8>>>,
     pool16: Mutex<Vec<PicState<u16>>>,
+    /// Size (MBs) and format of the active SPS: only buffers of it are recycled.
+    current: Mutex<Option<(usize, usize, Format)>>,
+    /// Test hook: reconstruction buffers fail to allocate.
+    #[cfg(test)]
+    fail_alloc: std::sync::atomic::AtomicBool,
+}
+
+impl Shared {
+    #[cfg(test)]
+    fn alloc_fails(&self) -> bool {
+        self.fail_alloc.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    fn alloc_fails(&self) -> bool {
+        false
+    }
 }
 
 /// The recycled-buffer pool of a sample type.
@@ -220,6 +236,12 @@ impl Decoder {
         }
     }
 
+    /// Test hook: every new reconstruction buffer fails to allocate from now on.
+    #[cfg(test)]
+    pub(crate) fn fail_allocations(&self) {
+        self.shared.fail_alloc.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Worker threads decoding pictures (1: on the calling thread).
     pub fn threads(&self) -> usize {
         self.threads
@@ -307,7 +329,7 @@ impl Decoder {
                 break;
             }
             let Some(o) = self.out_queue.pop_front() else { break };
-            pics.push(make_picture(&o));
+            pics.extend(make_picture(&o));
         }
         Ok(pics)
     }
@@ -318,7 +340,7 @@ impl Decoder {
         let mut outs = Vec::new();
         self.dpb.flush(&mut outs);
         self.emit(outs);
-        let pics = self.out_queue.drain(..).map(|o| make_picture(&o)).collect();
+        let pics = self.out_queue.drain(..).filter_map(|o| make_picture(&o)).collect();
         while let Some(f) = self.in_flight.pop_front() {
             f.wait_complete();
         }
@@ -460,8 +482,25 @@ impl Decoder {
         Ok(())
     }
 
+    /// Admission of a picture of `sps`: recycled reconstruction buffers of another size or format
+    /// are dropped (the budget of `sps` counts only its own), then the memory budget is checked.
+    fn admit(&self, sps: &Sps) -> Result<()> {
+        let cur = (sps.pic_width_in_mbs as usize, sps.frame_height_in_mbs() as usize, sps.format());
+        if let Ok(mut c) = self.shared.current.lock() {
+            *c = Some(cur);
+        }
+        fn keep<P>(pool: &Mutex<Vec<PicState<P>>>, (mb_w, mb_h, fmt): (usize, usize, Format)) {
+            if let Ok(mut p) = pool.lock() {
+                p.retain(|s| (s.mb_w, s.mb_h, s.fmt) == (mb_w, mb_h, fmt));
+            }
+        }
+        keep(&self.shared.pool8, cur);
+        keep(&self.shared.pool16, cur);
+        check_memory_budget(sps, self.max_in_flight)
+    }
+
     fn start_picture(&mut self, sh: &SliceHeader, sps: &Arc<Sps>, pts: i64) -> Result<()> {
-        check_memory_budget(sps, self.max_in_flight)?;
+        self.admit(sps)?;
         // Activate SPS; a resolution change flushes the DPB.
         let changed = match &self.active_sps {
             None => true,
@@ -574,11 +613,11 @@ fn run_job<P: Pooled>(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared, d
             p.reset(frame.clone());
             p
         }
-        _ => match PicState::try_new(frame.clone()) {
+        _ => match (!shared.alloc_fails()).then(|| PicState::try_new(frame.clone())).flatten() {
             Some(p) => p,
             None => {
-                // Make sure readers never block on this frame.
-                frame.publish_gray();
+                // Readers must never block on this frame; grey rows would allocate it again.
+                frame.publish_failed();
                 let msg = format!("out of memory for a {}x{} picture", frame.width, frame.height);
                 if let Ok(mut slot) = shared.error.lock() {
                     slot.get_or_insert(Error::Unsupported(msg));
@@ -631,9 +670,13 @@ fn run_job<P: Pooled>(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared, d
     if let (Some(e), Ok(mut slot)) = (err, shared.error.lock()) {
         slot.get_or_insert(e);
     }
-    if let Ok(mut p) = P::pool(shared).lock()
+    // Recycle the buffers if they still fit the active SPS, without keeping the frame alive.
+    let current = shared.current.lock().ok().and_then(|c| *c);
+    if current == Some((pic.mb_w, pic.mb_h, pic.fmt))
+        && let Ok(mut p) = P::pool(shared).lock()
         && p.len() < POOL_LEN
     {
+        pic.frame = Arc::new(Frame::new(0, 0, 0, 0, pic.fmt));
         p.push(pic);
     }
 }
@@ -664,14 +707,19 @@ fn output_meta(sps: &Sps, pts: i64, key: bool) -> OutputMeta {
     }
 }
 
-fn make_picture(o: &Output<FrameRef>) -> Picture {
+/// The output picture of `o`; `None` for a frame that failed without samples (its error is
+/// reported by the decode call).
+fn make_picture(o: &Output<FrameRef>) -> Option<Picture> {
+    if o.frame.is_failed() {
+        return None;
+    }
     let (cx, cy, cw, ch) = o.meta.crop;
     let (cx, cy, cw, ch) = (cx as usize, cy as usize, cw as usize, ch as usize);
     let (y, u, v) = o.frame.cropped_planes((cx, cy, cw, ch));
     let fmt = o.frame.fmt;
     let sy = if fmt.chroma_format_idc == 2 { 1 } else { 2 };
     let (ccw, cch) = (cw.div_ceil(2), ch.div_ceil(sy));
-    Picture {
+    Some(Picture {
         width: cw as u32,
         height: ch as u32,
         chroma_width: ccw as u32,
@@ -695,7 +743,7 @@ fn make_picture(o: &Output<FrameRef>) -> Picture {
         },
         sar: o.meta.sar,
         draft: o.meta.draft,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -744,5 +792,60 @@ mod tests {
         // a picture at the cap fits once, but not with 16 worker threads' pipeline
         let e = check_memory_budget(&sps(1024, tallest_within_cap()), 18).unwrap_err().to_string();
         assert!(e.contains("frame too large for software decode: ") && e.contains("pictures in flight"), "{e}");
+    }
+
+    /// A frame whose reconstruction buffers cannot be allocated fails without allocating them
+    /// again: no grey rows, no output picture, no recycled buffers, and a clean error.
+    #[test]
+    fn allocation_failure_publishes_no_rows_and_reports() {
+        let shared = Shared::default();
+        shared.fail_alloc.store(true, std::sync::atomic::Ordering::Relaxed);
+        let fmt = sps(4, 3).format();
+        let frame = Arc::new(Frame::new(0, 0, 4, 3, fmt));
+        run_job_any(frame.clone(), Vec::new(), &shared, false);
+        // every row is released (readers do not block) but none holds samples
+        assert!((0..3).all(|r| frame.is_published(r) && frame.row::<u16>(r).is_none() && frame.motion(r).is_none()));
+        assert!(frame.is_failed());
+        let o = Output { frame: frame.clone(), poc: 0, meta: Arc::new(output_meta(&sps(4, 3), 0, false)) };
+        assert!(make_picture(&o).is_none());
+        assert!(shared.pool16.lock().unwrap().is_empty() && shared.pool8.lock().unwrap().is_empty());
+        let e = shared.error.lock().unwrap().take().map(|e| e.to_string()).unwrap_or_default();
+        assert!(e.contains("out of memory for a 64x48 picture"), "{e}");
+    }
+
+    /// Recycled buffers of another size or format are dropped when an SPS is admitted, and a
+    /// finished picture's buffers are recycled only for the active SPS, without its frame.
+    #[test]
+    fn pools_follow_the_active_sps() {
+        let dec = Decoder::with_threads(1);
+        let s422 = sps(4, 3);
+        let mut s420 = sps(4, 3);
+        (s420.chroma_format_idc, s420.bit_depth_luma, s420.bit_depth_chroma) = (1, 8, 8);
+        let decode_one = |s: &Sps| {
+            let frame = Arc::new(Frame::new(0, 0, 4, 3, s.format()));
+            run_job_any(frame.clone(), Vec::new(), &dec.shared, false);
+            frame
+        };
+        dec.admit(&s420).unwrap();
+        let f = decode_one(&s420);
+        assert_eq!(dec.shared.pool8.lock().unwrap().len(), 1);
+        // the recycled state does not keep its frame alive
+        assert_eq!(Arc::strong_count(&f), 1);
+        // 8-bit 4:2:0 -> 10-bit 4:2:2: the 8-bit buffers go
+        dec.admit(&s422).unwrap();
+        assert!(dec.shared.pool8.lock().unwrap().is_empty());
+        decode_one(&s422);
+        assert_eq!(dec.shared.pool16.lock().unwrap().len(), 1);
+        // a late job of the old SPS does not refill its pool
+        decode_one(&s420);
+        assert!(dec.shared.pool8.lock().unwrap().is_empty());
+        // and back near the cap: the 10-bit buffers go, the budget is that of the new SPS alone
+        let mut big = sps(1024, tallest_within_cap());
+        (big.chroma_format_idc, big.bit_depth_luma, big.bit_depth_chroma) = (1, 8, 8);
+        dec.admit(&big).unwrap();
+        assert!(dec.shared.pool16.lock().unwrap().is_empty() && dec.shared.pool8.lock().unwrap().is_empty());
+        let tall = sps(1024, tallest_within_cap());
+        assert!(dec.admit(&tall).is_ok());
+        assert!(dec.shared.pool8.lock().unwrap().is_empty());
     }
 }

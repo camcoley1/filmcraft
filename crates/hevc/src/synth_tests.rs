@@ -602,6 +602,24 @@ fn run(name: &str, tiles: Tiles, pcm_lf_disabled: bool, segments: Vec<Segment>) 
     }
 }
 
+/// Pictures whose reconstruction buffers cannot be allocated are not output and the error is
+/// reported (single- and frame-threaded); decoding does not retry the allocation for grey rows.
+#[test]
+fn allocation_failure_drops_pictures_with_an_error() {
+    let (stream, expect) = sequence(&None, true, whole(WC * HC));
+    for threads in [1, 4] {
+        assert_eq!(decode_all(&stream, threads).len(), expect.len());
+        let mut dec = Decoder::with_threads(threads);
+        dec.fail_allocations();
+        let first = dec.decode(&stream, 0);
+        let mut pics = first.as_ref().map(|p| p.len()).unwrap_or(0);
+        pics += dec.flush().len();
+        let err = first.err().or_else(|| dec.take_error()).map(|e| e.to_string()).unwrap_or_default();
+        assert_eq!(pics, 0, "threads {threads}");
+        assert!(err.contains("out of memory for a"), "threads {threads}: {err}");
+    }
+}
+
 #[test]
 fn pcm_long_term_refs_list_modification() {
     run("pcm_lt", None, true, whole(WC * HC));

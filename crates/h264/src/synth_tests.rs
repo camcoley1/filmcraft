@@ -609,6 +609,31 @@ fn oversized_picture_is_refused_before_allocation() {
     }
 }
 
+/// A picture whose reconstruction buffers cannot be allocated is not output and its error is
+/// reported (single- and frame-threaded); decoding does not retry the allocation for grey rows.
+#[test]
+fn allocation_failure_drops_the_picture_with_an_error() {
+    let mbs = (0..NMB).map(|_| Some(vec![0x80; 384])).collect();
+    let mut stream = sps_high(1, 8);
+    stream.extend(pps(false, false));
+    stream.extend(slice_nal(&Pic { idr: true, frame_num: 0, ref_idc: 3, mbs, ..Default::default() }, false));
+    for threads in [1, 2] {
+        let mut dec = Decoder::with_threads(threads);
+        // (sanity: the stream decodes without the hook)
+        let mut ok = dec.decode(&stream, 0).unwrap();
+        ok.extend(dec.flush());
+        assert_eq!(ok.len(), 1);
+        let mut dec = Decoder::with_threads(threads);
+        dec.fail_allocations();
+        let first = dec.decode(&stream, 0);
+        let mut pics = first.as_ref().map(|p| p.len()).unwrap_or(0);
+        pics += dec.flush().len();
+        let err = first.err().or_else(|| dec.take_error()).map(|e| e.to_string()).unwrap_or_default();
+        assert_eq!(pics, 0, "threads {threads}");
+        assert!(err.contains("out of memory for a"), "threads {threads}: {err}");
+    }
+}
+
 /// I_PCM at high bit depths (CAVLC and CABAC): an IDR picture of random PCM macroblocks with
 /// samples of `bit_depth` bits decodes to exactly those samples (and ffmpeg agrees).
 pub(crate) fn pcm_high_bit_depth_check(chroma_format_idc: u32, bit_depth: u32) {

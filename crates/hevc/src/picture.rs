@@ -28,8 +28,8 @@ pub trait Sample: Copy + Default + PartialEq + std::fmt::Debug + Send + Sync + '
     /// `v` (a sample value, within the bit depth) in the storage type.
     fn from_u16(v: u16) -> Self;
     /// The rows of `f` if they are stored with this type.
-    fn rows(f: &Frame) -> Option<&[OnceLock<FrameRow<Self>>]>;
-    fn wrap_rows(rows: Box<[OnceLock<FrameRow<Self>>]>) -> Rows;
+    fn rows(f: &Frame) -> Option<&[RowCell<Self>]>;
+    fn wrap_rows(rows: Box<[RowCell<Self>]>) -> Rows;
 }
 
 impl Sample for u8 {
@@ -54,13 +54,13 @@ impl Sample for u8 {
         v as u8
     }
     #[inline(always)]
-    fn rows(f: &Frame) -> Option<&[OnceLock<FrameRow<u8>>]> {
+    fn rows(f: &Frame) -> Option<&[RowCell<u8>]> {
         match &f.rows {
             Rows::U8(r) => Some(r),
             Rows::U16(_) => None,
         }
     }
-    fn wrap_rows(rows: Box<[OnceLock<FrameRow<u8>>]>) -> Rows {
+    fn wrap_rows(rows: Box<[RowCell<u8>]>) -> Rows {
         Rows::U8(rows)
     }
 }
@@ -87,13 +87,13 @@ impl Sample for u16 {
         v
     }
     #[inline(always)]
-    fn rows(f: &Frame) -> Option<&[OnceLock<FrameRow<u16>>]> {
+    fn rows(f: &Frame) -> Option<&[RowCell<u16>]> {
         match &f.rows {
             Rows::U16(r) => Some(r),
             Rows::U8(_) => None,
         }
     }
-    fn wrap_rows(rows: Box<[OnceLock<FrameRow<u16>>]>) -> Rows {
+    fn wrap_rows(rows: Box<[RowCell<u16>]>) -> Rows {
         Rows::U16(rows)
     }
 }
@@ -113,10 +113,13 @@ pub struct FrameRow<S> {
     pub col: Box<[ColMv]>,
 }
 
+/// One published CTB row: `None` once the frame has failed ([`Frame::publish_failed`]).
+pub type RowCell<S> = OnceLock<Option<FrameRow<S>>>;
+
 /// The CTB rows of a frame, in its storage type.
 pub enum Rows {
-    U8(Box<[OnceLock<FrameRow<u8>>]>),
-    U16(Box<[OnceLock<FrameRow<u16>>]>),
+    U8(Box<[RowCell<u8>]>),
+    U16(Box<[RowCell<u16>]>),
 }
 
 /// A decoded (or in-progress) picture as stored in the DPB and referenced by later pictures.
@@ -192,7 +195,7 @@ impl Frame {
     /// Publish CTB row `r` (ignored if already published, or not of the frame's sample type).
     pub fn publish<S: Sample>(&self, r: usize, row: FrameRow<S>) {
         if let Some(cell) = S::rows(self).and_then(|rows| rows.get(r)) {
-            let _ = cell.set(row);
+            let _ = cell.set(Some(row));
         }
     }
 
@@ -212,15 +215,15 @@ impl Frame {
     /// or the frame stores another sample type).
     #[inline]
     pub fn row<S: Sample>(&self, r: usize) -> Option<&FrameRow<S>> {
-        wait(S::rows(self)?.get(r)?)
+        wait(S::rows(self)?.get(r)?)?.as_ref()
     }
 
     /// The motion of CTB row `r`, waiting until it has been published.
     #[inline]
     fn col_row(&self, r: usize) -> Option<&[ColMv]> {
         match &self.rows {
-            Rows::U8(rows) => wait(rows.get(r)?).map(|row| &*row.col),
-            Rows::U16(rows) => wait(rows.get(r)?).map(|row| &*row.col),
+            Rows::U8(rows) => wait(rows.get(r)?)?.as_ref().map(|row| &*row.col),
+            Rows::U16(rows) => wait(rows.get(r)?)?.as_ref().map(|row| &*row.col),
         }
     }
 
@@ -369,6 +372,32 @@ impl Frame {
             put(&mut v, &row.cr, o, ccw);
         }
         (y, u, v)
+    }
+
+    /// Mark every row not published yet as failed, without allocating: readers stop waiting and
+    /// see no row (references read nothing from it, and it is never output). For a picture whose
+    /// buffers could not be allocated, where grey rows would allocate the full picture again.
+    pub fn publish_failed(&self) {
+        fn fail<S>(rows: &[RowCell<S>]) {
+            for cell in rows {
+                let _ = cell.set(None);
+            }
+        }
+        match &self.rows {
+            Rows::U8(r) => fail(r),
+            Rows::U16(r) => fail(r),
+        }
+    }
+
+    /// Whether some row was marked failed (waits for the frame to be complete).
+    pub fn is_failed(&self) -> bool {
+        fn failed<S>(rows: &[RowCell<S>]) -> bool {
+            rows.iter().any(|c| wait(c).is_some_and(|r| r.is_none()))
+        }
+        match &self.rows {
+            Rows::U8(r) => failed(r),
+            Rows::U16(r) => failed(r),
+        }
     }
 
     /// Publish every row not published yet as mid-grey without motion (a missing reference picture,
