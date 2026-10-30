@@ -172,7 +172,7 @@ pub struct MbState {
     pub intra_modes: [u8; 16],
     /// CAVLC: TotalCoeff per luma 4x4 block (raster). CABAC: coded_block_flag.
     pub nnz: [u8; 16],
-    /// Same for chroma AC blocks [Cb, Cr][raster 2x2].
+    /// Same for chroma AC blocks [Cb, Cr].
     /// Raster 2 x (MbHeightC / 4) chroma AC blocks: index row * 2 + column.
     pub nnz_c: [[u8; 8]; 2],
     /// CABAC coded_block_flag of DC blocks: bit0 luma (I16x16), bit1 Cb, bit2 Cr.

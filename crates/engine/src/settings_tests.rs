@@ -574,6 +574,7 @@ fn transcription_without_speech_to_text_says_so() {
 
 #[test]
 fn hardware_decoding_setting_drives_the_decoder_switch() {
+    let _switch = crate::import_422_tests::HW_SWITCH.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut s = Session::default();
     assert_eq!(s.prefs.playback.hardware_decoding, "auto", "Auto by default");
     set(&mut s, "playback.hardwareDecoding", json!("off"));

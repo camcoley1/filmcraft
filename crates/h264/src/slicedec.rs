@@ -173,7 +173,7 @@ pub(crate) struct Scratch<P> {
     pub coef_c: [[i32; 128]; 2],
     /// Luma blocks with coefficients: raster 4x4 bits, or b8 bits in 8x8 mode.
     pub blk_nz: u16,
-    /// Chroma blocks with coefficients (bit per raster 2x2 block).
+    /// Chroma blocks with coefficients (bit per block, raster 2 x MbHeightC / 4).
     pub c_nz: [u8; 2],
     pub pred: [[P; 256]; 2],
     /// Chroma predictions [list][component]: 8 x MbHeightC (stride 8).

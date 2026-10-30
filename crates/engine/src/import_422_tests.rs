@@ -3,6 +3,10 @@
 //! decode, and a frame exported from the Program Monitor is within rounding of ffmpeg's RGB
 //! conversion of the same picture (bilinear chroma upsampling; ffmpeg-made fixtures, skipped
 //! without ffmpeg / the encoder).
+//!
+//! The engine test binary registers no hardware decoder (only `crates/platform` does), so these
+//! decodes are software by construction; switching the setting off keeps that true if one is ever
+//! linked in. The in-app VideoToolbox path is not covered here.
 
 use serde_json::json;
 
@@ -14,8 +18,9 @@ const H: usize = 180;
 /// A smooth picture (blurred test pattern): chroma upsampling choices stay within rounding.
 const SOURCE: &str = "testsrc2=size=320x180:rate=25:duration=1,gblur=sigma=3";
 
-/// The tests switch the process-wide hardware decoding setting off and back on: one at a time.
-static HW_SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Tests that switch the process-wide hardware decoding setting take this lock (here and in
+/// `settings_tests`), so none sees another's value.
+pub(crate) static HW_SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn ffmpeg_run(ffmpeg: &std::path::Path, args: &[&str], out: &std::path::Path) -> bool {
     std::process::Command::new(ffmpeg).args(["-y", "-loglevel", "error"]).args(args).arg(out).status().is_ok_and(|s| s.success())

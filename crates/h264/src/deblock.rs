@@ -394,6 +394,9 @@ pub fn deblock_mb<P: Pixel>(pic: &mut PicState<P>, addr: usize, mb_w: usize) {
     let alpha_off = sq.alpha_offset;
     let beta_off = sq.beta_offset;
     let t8 = q.transform_8x8;
+    // bS of an edge inside an 8x8 transform block: read only by the 4:2:2 horizontal chroma edges
+    let chroma_422 = pic.fmt.mb_height_c() == 16;
+    let skip_edge = |dir: usize, e: usize| t8 && e % 2 == 1 && !(dir == 1 && chroma_422);
     // bS[dir][edge][segment]; dir 0 = vertical edges (x), 1 = horizontal edges (y)
     let mut bs = [[[0u8; 4]; 4]; 2];
     // (bS of the internal edges inside 8x8 transform blocks is derived too: the luma filter skips
@@ -403,7 +406,7 @@ pub fn deblock_mb<P: Pixel>(pic: &mut PicState<P>, addr: usize, mb_w: usize) {
             if (if dir == 0 { left } else { top }).is_some() {
                 bs[dir][0] = [4; 4];
             }
-            for e in 1..4 {
+            for e in (1..4).filter(|&e| !skip_edge(dir, e)) {
                 bs[dir][e] = [3; 4];
             }
         }
@@ -433,7 +436,7 @@ pub fn deblock_mb<P: Pixel>(pic: &mut PicState<P>, addr: usize, mb_w: usize) {
                 // one motion for the whole MB and no coefficients: all internal edges have bS 0
                 continue;
             }
-            for e in 1..4 {
+            for e in (1..4).filter(|&e| !skip_edge(dir, e)) {
                 for k in 0..4 {
                     let (rq, rp) = if dir == 0 { (k * 4 + e, k * 4 + e - 1) } else { (e * 4 + k, e * 4 + k - 4) };
                     bs[dir][e][k] = if (q.nz_mask >> rp) & 1 != 0 || (q.nz_mask >> rq) & 1 != 0 { 2 } else { motion_bs(&qm[rp], &qm[rq]) };
