@@ -153,6 +153,23 @@ pub fn active_nodes(e: &EffectInstance) -> Vec<NodeRef<'_>> {
         .collect()
 }
 
+/// A node as a plain Lumetri Color instance (its parameters, no masks, no graph): what the renderer
+/// evaluates for it.
+pub fn node_instance(n: &NodeRef<'_>) -> EffectInstance {
+    let mut e = find_effect("lumetri").map(|d| d.instance()).unwrap_or_else(|| EffectInstance {
+        effect: "lumetri".into(),
+        enabled: true,
+        params: BTreeMap::new(),
+        masks: Vec::new(),
+        post_fader: false,
+        essential: false,
+        layer: None,
+        color: None,
+    });
+    e.params = n.params.clone();
+    e
+}
+
 /// Whether the effect renders as the single Lumetri of its own parameters (no graph, or a graph
 /// whose active version is one plain node).
 pub fn is_single(e: &EffectInstance) -> bool {

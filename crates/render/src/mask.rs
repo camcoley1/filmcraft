@@ -191,7 +191,15 @@ pub fn apply_effect(img: &mut Image, e: &EffectInstance, cx: &crate::effects::Fx
         crate::effects::apply(img, e, cx);
         return;
     }
-    let Some(cov) = effect_coverage(&e.masks, cx.t, cx.px_scale, img.w, img.h) else {
+    // a Lumetri node graph: the masks its nodes name limit those nodes, not the whole effect
+    let graph_masks;
+    let masks = if e.color.is_some() {
+        graph_masks = filmcraft_project::color_graph::effect_wide_masks(e);
+        &graph_masks
+    } else {
+        &e.masks
+    };
+    let Some(cov) = effect_coverage(masks, cx.t, cx.px_scale, img.w, img.h) else {
         crate::effects::apply(img, e, cx);
         return;
     };

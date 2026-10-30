@@ -212,6 +212,13 @@ pub enum FxOp {
         op: Box<FxOp>,
         masks: Vec<crate::mask::FlatMask>,
     },
+    /// An op mixed with its input: `input + (result − input) × mix` (a colour node's Mix below 1).
+    Blend {
+        op: Box<FxOp>,
+        mix: f32,
+    },
+    /// Ops in order: a Lumetri node graph ([`filmcraft_project::color_graph`]), one op per enabled node.
+    Nodes(Vec<FxOp>),
 }
 
 /// Most mask polygon points (all masks of one effect) the GPU stage takes: its coverage pass tests
@@ -300,6 +307,9 @@ impl FxOp {
     pub fn eval(e: &EffectInstance, cx: &FxCtx, w: usize, h: usize) -> Option<FxOp> {
         if !e.enabled {
             return None;
+        }
+        if e.effect == "lumetri" && !filmcraft_project::color_graph::is_single(e) {
+            return Some(Self::lumetri_graph(e, cx, w, h));
         }
         Some(match e.effect.as_str() {
             "brightness_contrast" => FxOp::BrightnessContrast { br: f(e, "brightness", cx) / 100.0 * 0.4, co: 1.0 + f(e, "contrast", cx) / 100.0 },
@@ -608,10 +618,38 @@ impl FxOp {
         })
     }
 
-    /// [`eval`](Self::eval), limited to the effect's active masks ([`FxOp::Masked`]) when it has any.
+    /// A Lumetri node graph: each enabled node of the active version as its own Lumetri op, limited
+    /// to the effect mask it names ([`FxOp::Masked`]) and mixed with its input below Mix 1
+    /// ([`FxOp::Blend`]), in order. The CPU render (`effects::lumetri_graph`) takes the same steps.
+    fn lumetri_graph(e: &EffectInstance, cx: &FxCtx, w: usize, h: usize) -> FxOp {
+        use filmcraft_project::color_graph;
+        let mut ops = Vec::new();
+        for n in color_graph::active_nodes(e).iter().filter(|n| n.enabled) {
+            let Some(mut op) = Self::eval(&color_graph::node_instance(n), cx, w, h) else { continue };
+            if let Some(m) = n.mask.and_then(|name| e.masks.iter().find(|m| m.name == name)) {
+                let masks = crate::mask::prepare(std::slice::from_ref(m), cx.t, cx.px_scale);
+                if !masks.is_empty() {
+                    op = FxOp::Masked { op: Box::new(op), masks };
+                }
+            }
+            let mix = n.mix.clamp(0.0, 1.0) as f32;
+            if mix < 1.0 {
+                op = FxOp::Blend { op: Box::new(op), mix };
+            }
+            ops.push(op);
+        }
+        FxOp::Nodes(ops)
+    }
+
+    /// [`eval`](Self::eval), limited to the effect's active masks ([`FxOp::Masked`]) when it has any
+    /// (a Lumetri node graph: the masks no node names).
     pub fn eval_masked(e: &EffectInstance, cx: &FxCtx, w: usize, h: usize) -> Option<FxOp> {
         let op = Self::eval(e, cx, w, h)?;
-        let masks = crate::mask::prepare(&e.masks, cx.t, cx.px_scale);
+        let masks = if e.color.is_some() {
+            crate::mask::prepare(&filmcraft_project::color_graph::effect_wide_masks(e), cx.t, cx.px_scale)
+        } else {
+            crate::mask::prepare(&e.masks, cx.t, cx.px_scale)
+        };
         Some(if masks.is_empty() { op } else { FxOp::Masked { op: Box::new(op), masks } })
     }
 
@@ -698,6 +736,8 @@ impl FxOp {
                     && hsl_ok
                     && sharpen.as_ref().is_none_or(|s| s.2.is_finite())
             }
+            FxOp::Blend { op, mix } => mix.is_finite() && op.gpu_ok(),
+            FxOp::Nodes(ops) => ops.len() <= filmcraft_project::color_graph::MAX_NODES && ops.iter().all(FxOp::gpu_ok),
             FxOp::Masked { op, masks } => {
                 // within ±1e7 working pixels: farther, the shader's squared lengths overflow f32 and
                 // its `min` with NaN is not Rust's
@@ -1099,6 +1139,16 @@ impl FxOp {
                 }
                 if let Some((rx, ry, amount)) = sharpen {
                     crate::effects::unsharp_boxes(img, rx, ry, *amount, 0.0);
+                }
+            }
+            FxOp::Blend { op, mix } => {
+                let original = img.clone();
+                op.apply(img);
+                crate::mask::mix(img, &original, &vec![*mix; img.w * img.h]);
+            }
+            FxOp::Nodes(ops) => {
+                for op in ops {
+                    op.apply(img);
                 }
             }
             FxOp::Masked { op, masks } => match crate::mask::coverage(masks, img.w, img.h) {

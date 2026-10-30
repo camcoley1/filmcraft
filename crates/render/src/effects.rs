@@ -125,6 +125,7 @@ pub fn apply(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
         return;
     }
     match e.effect.as_str() {
+        "lumetri" if !filmcraft_project::color_graph::is_single(e) => lumetri_graph(img, e, cx),
         "lumetri" => lumetri(img, e, cx),
         "median" => {
             let r = median_radius(f(e, "radius", cx), cx.px_scale, img.w.max(img.h));
@@ -619,6 +620,31 @@ fn within_unit(v: [f32; 3], hdr: bool, f: impl Fn([f32; 3]) -> [f32; 3]) -> [f32
     let m = v[0].max(v[1]).max(v[2]).max(1.0);
     let o = f(v.map(|q| (q / m).max(0.0)));
     o.map(|q| q * m)
+}
+
+/// A Lumetri node graph on the CPU (grades the GPU stage leaves to it, HDR ones): each enabled node
+/// of the active version as its own Lumetri, inside the effect mask it names, mixed with its input
+/// by its Mix, in order (the steps of `FxOp::lumetri_graph`).
+fn lumetri_graph(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
+    use filmcraft_project::color_graph;
+    for n in color_graph::active_nodes(e).iter().filter(|n| n.enabled) {
+        let node = color_graph::node_instance(n);
+        let mask = n.mask.and_then(|name| e.masks.iter().find(|m| m.name == name));
+        let cov = mask.and_then(|m| crate::mask::effect_coverage(std::slice::from_ref(m), cx.t, cx.px_scale, img.w, img.h));
+        let mix = n.mix.clamp(0.0, 1.0) as f32;
+        if cov.is_none() && mix >= 1.0 {
+            apply(img, &node, cx);
+            continue;
+        }
+        let input = img.clone();
+        apply(img, &node, cx);
+        if let Some(cov) = &cov {
+            crate::mask::mix(img, &input, cov);
+        }
+        if mix < 1.0 {
+            crate::mask::mix(img, &input, &vec![mix; img.w * img.h]);
+        }
+    }
 }
 
 fn lumetri(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {

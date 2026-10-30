@@ -68,6 +68,7 @@ const OP_HSL_KEY: u32 = 33;
 const OP_HSL_MEDIAN: u32 = 34;
 const OP_HSL_APPLY: u32 = 35;
 const OP_MASK_MIX: u32 = 36;
+const OP_BLEND: u32 = 37;
 
 /// An effect's active masks as `fx.wgsl`'s `mask_coverage` reads them: the count, then per mask its
 /// [`MaskInfo`](mask_common.wgsl) fields (start, length, mode, inverted, feather, expansion, opacity,
@@ -302,6 +303,15 @@ fn steps(op: &FxOp) -> Vec<Step> {
             }
         }
         FxOp::Unsharp { rx, ry, amount, threshold } => out.extend(unsharp(rx, ry, *amount, *threshold)),
+        FxOp::Blend { op, mix } => {
+            // the op on a saved copy of its input, then `input + (result − input) × mix`
+            let mut g = steps(op);
+            if !g.is_empty() {
+                g.push(step(OP_BLEND, [0; 4], &[*mix]));
+                out.extend(saving(g));
+            }
+        }
+        FxOp::Nodes(ops) => out.extend(ops.iter().flat_map(steps)),
         FxOp::Masked { op, masks } => {
             // the effect on a saved copy of the image, then the mix with it by the masks' coverage
             let mut g = steps(op);

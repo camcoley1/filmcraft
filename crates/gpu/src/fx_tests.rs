@@ -1436,3 +1436,57 @@ fn empty_masks_are_bounded_and_match_cpu() {
         assert!(fl_diff <= 1.0 / 255.0 && b8 <= 1, "{name}: {fl_diff} / {b8}");
     }
 }
+
+/// Lumetri node graphs (M8d) on the GPU against the CPU: four nodes (one at Mix 50 %, one limited
+/// to a node mask, one bypassed) inside an effect-wide mask, on the chart and the demo scene; a
+/// one-node graph is the same GPU op as the single Lumetri it replaces.
+#[test]
+fn lumetri_node_graphs_match_cpu() {
+    use filmcraft_project::color_graph as cg;
+    use filmcraft_project::{Mask, MaskPath};
+    let Some((dev, q)) = gpu_or_skip("lumetri_node_graphs_match_cpu") else { return };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let set = |e: &mut EffectInstance, params: &[(&str, ParamValue)]| {
+        for (k, v) in params {
+            e.params.get_mut(*k).unwrap().value = v.clone();
+        }
+    };
+    for (picture_name, (w, h), px) in [("chart", (67u32, 41u32), picture(67, 41)), ("demo scene", (320, 180), demo_picture(320, 180))] {
+        let (fw, fh) = (f64::from(w), f64::from(h));
+        let mut e = effect("lumetri", &[("temperature", fl(30.0)), ("curve_luma", ParamValue::Curve(vec![[0.0, 0.05], [1.0, 0.92]]))]);
+        let single = e.clone();
+        cg::add_version(&mut e, None, true).unwrap();
+        let op_graph = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w as usize, h as usize).unwrap();
+        assert_eq!(Some(op_graph), FxOp::eval(&single, &cx(Tick::ZERO, 1.0), w as usize, h as usize), "one node: the single Lumetri");
+        e.masks = vec![
+            Mask::new("left", MaskPath::rect(0.0, 0.0, fw * 0.5, fh)),
+            Mask::new("frame", MaskPath::ellipse(Vec2::new(fw * 0.5, fh * 0.5), Vec2::new(fw * 0.48, fh * 0.48))),
+        ];
+        cg::add_node(&mut e, None, "cool").unwrap();
+        set(
+            &mut e,
+            &[("temperature", fl(-40.0)), ("saturation", fl(160.0)), ("hsl_on", ParamValue::Bool(true)), ("hsl_hue", fl(200.0)), ("hsl_blur", fl(20.0))],
+        );
+        cg::set_mix(&mut e, 1, 0.5).unwrap();
+        cg::add_node(&mut e, None, "left only").unwrap();
+        set(&mut e, &[("exposure", fl(0.6)), ("wheel_shadows", pt(0.3, 0.2))]);
+        cg::set_mask(&mut e, 2, Some("left")).unwrap();
+        cg::add_node(&mut e, None, "off").unwrap();
+        set(&mut e, &[("exposure", fl(-2.0))]);
+        cg::set_enabled(&mut e, 3, false).unwrap();
+        let op = FxOp::eval_masked(&e, &cx(Tick::ZERO, 1.0), w as usize, h as usize).unwrap();
+        assert!(op.gpu_ok(), "{picture_name}: the graph runs on the GPU");
+        let mut cpu = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.clone() };
+        op.apply(&mut cpu);
+        // the CPU render's own path gives the same picture
+        let mut reference = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.clone() };
+        filmcraft_render::mask::apply_effect(&mut reference, &e, &cx(Tick::ZERO, 1.0));
+        let worst = cpu.px.iter().zip(&reference.px).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(worst < 1e-5, "{picture_name}: planned op vs CPU render {worst}");
+        let frame = VideoFrame::rgba_f32(w, h, px.clone());
+        let (_, _, gpu) = c.effect_image(&frame, &LayerFx { size: (w, h), decimation: 1, ops: vec![op] }).expect("effect image");
+        let (fl_diff, b8) = diff_float_and_8bit(&cpu.px, &gpu);
+        eprintln!("{picture_name} / 4-node graph: max float diff {fl_diff:.2e}, max 8-bit diff {b8}");
+        assert!(fl_diff <= 1.0 / 255.0 && b8 <= 1, "{picture_name}: {fl_diff} / {b8}");
+    }
+}

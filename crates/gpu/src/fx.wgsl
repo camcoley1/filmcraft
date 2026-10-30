@@ -57,6 +57,7 @@ const OP_HSL_KEY: u32 = 33u;
 const OP_HSL_MEDIAN: u32 = 34u;
 const OP_HSL_APPLY: u32 = 35u;
 const OP_MASK_MIX: u32 = 36u;
+const OP_BLEND: u32 = 37u;
 
 // Samples per Lumetri curve table (`effects::CURVE_SAMPLES`); the advanced pass's tables hold nine
 // of them, then the look LUT.
@@ -1032,6 +1033,11 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
         }
         case OP_HSL_APPLY: {
             return hsl_apply(p);
+        }
+        case OP_BLEND: {
+            // src: the op's result, aux: its input
+            let o = textureLoad(aux, p, 0);
+            return o + (ld(p) - o) * u.p0.x;
         }
         case OP_MASK_MIX: {
             // src: the effect's result, aux: the image before it
