@@ -372,7 +372,11 @@ fn write_index(dir: &Path, entries: &BTreeMap<u64, Entry>) -> std::io::Result<()
 }
 
 /// Delete the `i_*` files the manifest does not need: it names each item's current pair, and the pair
-/// before it is kept one more publish for a search that read the older manifest.
+/// before it is kept one more publish for a search that read the older manifest. The pairs of items
+/// that left the index (removed or failed) go at once: a search that still has them in its manifest
+/// is safe, because the helper re-reads the manifest when a file is gone, follows an item to its new
+/// pair and leaves out one that is no longer there (`iter_index`, tested between the manifest read
+/// and the size check, and between the size check and the read).
 fn sweep(dir: &Path, entries: &BTreeMap<u64, Entry>) {
     let keep: HashSet<String> = entries
         .values()
