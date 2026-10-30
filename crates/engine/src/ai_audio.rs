@@ -24,6 +24,8 @@ pub(crate) struct AudioTarget {
     pub rate: u32,
     pub offset: i64,
     pub samples: i64,
+    /// The media's end, in samples at `rate` ([`read_chunk`]).
+    pub end: i64,
     /// The source's own rate (results can be resampled back to it).
     pub source_rate: u32,
     pub audio_track: bool,
@@ -65,6 +67,10 @@ pub(crate) fn audio_target(s: &Session, c: ClipId, rate: u32, pad_s: f64, max_s:
     let q = s.active_sequence().ok_or(Refused::Skip)?;
     let (t, it) = q.find_item(c).ok_or(Refused::Skip)?;
     let (_, m, _) = s.project.resolve_media(it.item).ok_or(Refused::Skip)?;
+    // a remix plays pieces from anywhere in the media (absolute times in its plan)
+    if filmcraft_render::remix::is_remixed(it) {
+        return Err(Refused::Hard(format!("{}: the clip is remixed; revert the remix first", it.name)));
+    }
     let MediaRef::File { path } = &m.media else { return Err(Refused::Skip) };
     let stream = it.audio_stream;
     let info = m.info.audio_streams.get(stream).ok_or(Refused::Skip)?;
@@ -75,12 +81,15 @@ pub(crate) fn audio_target(s: &Session, c: ClipId, rate: u32, pad_s: f64, max_s:
     };
     let tps = ticks_per_sample(rate);
     let pad = (pad_s * TICKS_PER_SECOND as f64) as i64;
+    // positions come from the project file: checked arithmetic, never a wrap
+    let out_of_range = || Refused::Hard(format!("{}: the clip's source position is out of range; reset its In and Out points", it.name));
     let (lo, hi) = (it.source_in.0.min(it.source_out().0), it.source_in.0.max(it.source_out().0));
-    let end = m.info.duration.0.max(0);
-    let a = (lo - pad).max(0);
-    let b = if to_end { end } else { (hi + pad).min(end) }.max(a);
+    let duration = m.info.duration.0.max(0);
+    let a = lo.checked_sub(pad).ok_or_else(out_of_range)?.max(0);
+    let b = if to_end { duration } else { hi.checked_add(pad).ok_or_else(out_of_range)?.min(duration) }.max(a);
     let offset = a / tps;
-    let mut samples = (b - offset * tps + tps - 1) / tps;
+    let mut samples = b.checked_sub(offset * tps).and_then(|n| n.checked_add(tps - 1)).map(|n| n / tps).ok_or_else(out_of_range)?;
+    let end = duration / tps + i64::from(duration % tps != 0);
     let max = (max_s * f64::from(rate)) as i64;
     if samples > max {
         if !to_end {
@@ -107,6 +116,7 @@ pub(crate) fn audio_target(s: &Session, c: ClipId, rate: u32, pad_s: f64, max_s:
         rate,
         offset,
         samples,
+        end,
         source_rate: info.sample_rate,
         audio_track,
     })
@@ -137,16 +147,16 @@ pub(crate) fn targets(
 
 /// Write `samples` samples of `src`'s audio stream `stream` from sample `offset` (at `rate`,
 /// resampled by FilmCraft's decoder), as a 32-bit float WAV: the `channels` listed, or, with
-/// `mono`, their average. Ten seconds at a time; stops when `stop` says so. Samples past the end of
-/// the stream are silence.
+/// `mono`, their average. Ten seconds at a time; stops when `stop` says so. A read that comes back
+/// short (the stream ended) is padded with silence; a decode failure is an error naming the stream
+/// and the range ([`read_chunk`]; `end` is the media's end, samples, for messages).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_to_wav(
     src: &dyn filmcraft_media::MediaSource,
     stream: usize,
     channels: &[usize],
     mono: bool,
-    offset: i64,
-    samples: i64,
+    (offset, samples, end): (i64, i64, i64),
     rate: u32,
     path: &std::path::Path,
     stop: &dyn Fn() -> bool,
@@ -186,8 +196,7 @@ pub(crate) fn decode_to_wav(
             return Err("stopped".into());
         }
         let n = step.min(total - done) as usize;
-        // a stream that ends early (camera audio a few ms short) reads as silence
-        let buf = src.audio_stream(stream, offset + done as i64, n, rate).unwrap_or_else(|_| filmcraft_frame::AudioBuffer::silence(rate, picked.len(), n));
+        let buf = read_chunk(src, stream, offset.saturating_add(done as i64), n, rate, end)?;
         let get = |c: usize, i: usize| buf.channels.get(c).or(buf.channels.first()).and_then(|x| x.get(i)).copied().filter(|v| v.is_finite()).unwrap_or(0.0);
         let mut out = Vec::with_capacity(n * ch * 4);
         for i in 0..n {
@@ -207,6 +216,33 @@ pub(crate) fn decode_to_wav(
     w.flush().map_err(|e| e.to_string())
 }
 
+/// `n` samples of audio stream `stream` from sample `pos` at `rate`. FilmCraft's decoders answer
+/// reads past the end of a stream with silence or a short buffer (the stream's own end-of-stream
+/// signal), which callers pad with silence; an error is never taken for the end: it is returned
+/// with the stream and the range (`end`: the media's end, samples). A cancelled read stops.
+pub(crate) fn read_chunk(
+    src: &dyn filmcraft_media::MediaSource,
+    stream: usize,
+    pos: i64,
+    n: usize,
+    rate: u32,
+    end: i64,
+) -> std::result::Result<filmcraft_frame::AudioBuffer, String> {
+    match src.audio_stream(stream, pos, n, rate) {
+        Ok(b) => Ok(b),
+        Err(filmcraft_media::MediaError::Cancelled) => Err("stopped".into()),
+        Err(e) => {
+            let t = |x: i64| x as f64 / f64::from(rate.max(1));
+            Err(format!(
+                "decoding audio stream {stream} failed reading {:.3} to {:.3} s (the media lasts {:.3} s): {e}",
+                t(pos),
+                t(pos.saturating_add(n as i64)),
+                t(end)
+            ))
+        }
+    }
+}
+
 /// The timeline time at which `it` shows media time `mt` (`None` outside the clip). The inverse
 /// of [`TrackItem::source_time_at`] for clips without a frame hold.
 pub(crate) fn timeline_time(it: &TrackItem, mt: Tick) -> Option<Tick> {
@@ -217,7 +253,7 @@ pub(crate) fn timeline_time(it: &TrackItem, mt: Tick) -> Option<Tick> {
     if !(speed.is_finite() && speed > 0.0) {
         return None;
     }
-    let scaled = if it.reverse { it.source_out().0 - 1 - mt.0 } else { mt.0 - it.source_in.0 };
-    let t = Tick(it.start.0 + (scaled as f64 / speed).round() as i64);
+    let scaled = if it.reverse { it.source_out().0.checked_sub(1)?.checked_sub(mt.0)? } else { mt.0.checked_sub(it.source_in.0)? };
+    let t = Tick(it.start.0.checked_add((scaled as f64 / speed).round() as i64)?);
     (t >= it.start && t < it.end()).then_some(t)
 }

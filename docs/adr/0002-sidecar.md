@@ -86,6 +86,14 @@ AI features run in **`craft-ai`**, a separate Python process installed by craft-
     must be permissively licensed (MIT, Apache-2.0, BSD, ISC). Each is listed with both licences in
     `craft-suite/sidecar/LICENSES.md` before it is added; AGPL (Ultralytics YOLO) and
     non-commercial weights are out.
+13. **Copyleft exception (decided 2026-10-30).** LGPL is allowed only inside the separate craft-ai
+    helper process, dynamically loaded, unmodified and replaceable by the user: python-soxr
+    (LGPL-2.1-or-later, pulled in by librosa for beats) and the FFmpeg libraries inside the
+    opencv-python-headless wheel (LGPL-2.1, used to read video). Nothing LGPL is ever linked into
+    FilmCraft, which reaches the helper only over the loopback socket. GPL and AGPL stay banned
+    everywhere, the helper included. Each such component is listed in
+    `craft-suite/sidecar/LICENSES.md` ("Copyleft exception") with its licence, how it is loaded
+    and how to replace it.
 
 13. **A feature may call a hosted service through the helper (M8f, Generative Extend).** Only the
     helper talks to the network, with the user's own key (`FAL_KEY` or `~/.config/craft-ai/fal.env`,

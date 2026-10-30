@@ -8,19 +8,22 @@
 //!   last `seconds`, ending on a bar line, as timeline edits only: it is trimmed, or looped by
 //!   putting further pieces of the same media after it (each from a downbeat to a downbeat), and
 //!   it may start on a later beat of its first bar so the length lands within half a beat of the
-//!   target. Each loop join gets a one-frame Constant Power crossfade
+//!   target. Each loop join gets a one-frame Constant Gain crossfade
 //!   (`sequence.applyAudioTransition`) so it does not click. No new audio file is written. With
 //!   `duck`, the pieces become Music with ducking against Dialogue and
 //!   `essentialSound.generateDucking` writes the ducking keyframes, all in the same undo step
-//!   ("Fit Music"). The clip must play forward at 100 %, without a frame hold, and not be linked to
-//!   video; the track after it must be free for the fitted length.
+//!   ("Fit Music"). The clip's fade-out moves to the fitted end; the copies carry no automation
+//!   keyframes or markers (those stay on the first piece). A fit more than half a beat off the
+//!   target (bars too sparse) or of more than [`MAX_PIECES`] pieces is refused. The clip must
+//!   play forward at 100 %, without a frame hold, not remixed and not linked to video; the track
+//!   after it must be free for the fitted length.
 //!
 //! Beats are found in the clip's used range (`beatGrid`) or from its first source frame to the end
 //! of the media (`musicFit`, which may need what follows), decoded mono at 22.05 kHz on that
 //! rate's sample grid, so beat times map to media time exactly.
 
 use filmcraft_project::essential::{AudioType, EssentialSound};
-use filmcraft_project::{ClipId, Label, Marker, MarkerId, MarkerKind, TrackItem};
+use filmcraft_project::{ClipId, ItemId, Label, Marker, MarkerId, MarkerKind, TrackId, TrackItem};
 use filmcraft_time::{TICKS_PER_SECOND, Tick};
 use serde_json::{Value, json};
 
@@ -41,6 +44,8 @@ const MAX_BEATS: usize = 20_000;
 /// Length of the crossfade on a music fit's loop joins: one frame (the shortest transition), so
 /// about 17 to 21 ms on each side of the cut at 24 to 30 fps.
 const JOIN_FRAMES: i64 = 1;
+/// Most pieces a music fit makes (each join is a crossfade command).
+const MAX_PIECES: usize = 500;
 
 fn target(s: &Session, c: ClipId, to_end: bool) -> std::result::Result<AudioTarget, Refused> {
     audio_target(s, c, RATE, 0.0, MAX_SECONDS, to_end)
@@ -79,13 +84,16 @@ pub(crate) fn fit_enabled(s: &Session) -> std::result::Result<(), String> {
 }
 
 fn beats_per_bar(p: &Value, cmd: &str) -> Result<u64> {
-    let n = u64_p(p, "beatsPerBar").unwrap_or(4);
+    let n = match p.get("beatsPerBar") {
+        None | Some(Value::Null) => 4,
+        Some(_) => u64_p(p, "beatsPerBar").unwrap_or(0),
+    };
     if (1..=16).contains(&n) { Ok(n) } else { Err(crate::commands::bad(cmd, "`beatsPerBar` is 1 to 16")) }
 }
 
 fn start(s: &mut Session, t: AudioTarget, label: &str, bpb: u64, context: Value, wait: bool) -> Result<Value> {
     let src = s.source(t.item).ok_or_else(|| EngineError::Other(format!("{}: the media cannot be read", t.name)))?;
-    let (stream, channels, offset, samples) = (t.stream, t.channels.clone(), t.offset, t.samples);
+    let (stream, channels, offset, samples, end) = (t.stream, t.channels.clone(), t.offset, t.samples, t.end);
     let mut context = context;
     context["offset"] = json!(t.offset_ticks().0);
     let spec = super::JobSpec {
@@ -97,7 +105,7 @@ fn start(s: &mut Session, t: AudioTarget, label: &str, bpb: u64, context: Value,
         timeout: Some(std::time::Duration::from_secs_f64(t.seconds() + 600.0)),
         prepare: Some(Box::new(move |dir: &std::path::Path, stop: &dyn Fn() -> bool, progress: &mut dyn FnMut(f64)| {
             let path = dir.join("source.wav");
-            decode_to_wav(&*src, stream, &channels, true, offset, samples, RATE, &path, stop, progress)?;
+            decode_to_wav(&*src, stream, &channels, true, (offset, samples, end), RATE, &path, stop, progress)?;
             Ok(vec![path.to_string_lossy().to_string()])
         })),
         loose: false,
@@ -264,6 +272,23 @@ fn apply_fit(s: &mut Session, pj: &super::PendingAi, beats: &[Tick], downbeats: 
     let (track, it) = q.find_item(clip).map(|(t, it)| (t, it.clone())).ok_or_else(|| EngineError::Other("the clip is gone".into()))?;
     let plan = fit_plan(beats, downbeats, it.source_in, target).ok_or_else(|| EngineError::Other("not enough bars were found to fit the music".into()))?;
     let total: Tick = plan.iter().fold(Tick::ZERO, |acc, (a, b)| acc + (*b - *a));
+    if plan.len() > MAX_PIECES {
+        return Err(EngineError::Other(format!("fitting this music to that length takes {} loops; at most {MAX_PIECES}", plan.len())));
+    }
+    // the plan ends on a bar line within half a beat of the target, unless the bars found are too
+    // sparse (a wrong meter, or downbeats missing): then it is refused, not applied far off
+    let mut gaps: Vec<i64> = beats.windows(2).map(|w| (w[1] - w[0]).0).filter(|g| *g > 0).collect();
+    gaps.sort_unstable();
+    let beat = gaps.get(gaps.len() / 2).copied().unwrap_or(0);
+    let off = (total - target).0.abs();
+    if beat > 0 && off > beat / 2 + 1 {
+        let sec = |t: i64| t as f64 / TICKS_PER_SECOND as f64;
+        return Err(EngineError::Other(format!(
+            "the nearest fit on a bar line is {:.2} s, {:.2} s from the target (more than half a beat); check beatsPerBar",
+            sec(total.0),
+            sec(off)
+        )));
+    }
     // the fitted clip may only cover the clip itself and empty track
     let tr = q.track(track).ok_or(EngineError::NoSequence)?;
     let end = it.start + total;
@@ -271,58 +296,90 @@ fn apply_fit(s: &mut Session, pj: &super::PendingAi, beats: &[Tick], downbeats: 
         return Err(EngineError::Other("the track is not free for the fitted length".into()));
     }
     let step: super::Step = Box::new(move |s: &mut Session| {
-        let ids = s.edit("Fit Music", move |pr, _| {
-            let new_ids: Vec<u64> = plan.iter().skip(1).map(|_| pr.alloc_id()).collect();
-            let q = pr.sequence_mut(seq).ok_or(EngineError::NoSequence)?;
-            let tr = q.all_tracks_mut().find(|t| t.id == track).ok_or(EngineError::NoSequence)?;
-            let mut at = it.start;
-            let mut ids = Vec::new();
-            for (k, (a, b)) in plan.iter().enumerate() {
-                let piece = if k == 0 {
-                    tr.items.iter_mut().find(|o| o.id == clip).ok_or_else(|| EngineError::Other("the clip is gone".into()))?
-                } else {
-                    let mut c: TrackItem = it.clone();
-                    c.id = ClipId(new_ids[k - 1]);
-                    c.link = None;
-                    c.group = None;
-                    tr.items.push(c);
-                    tr.items.last_mut().ok_or(EngineError::NoSequence)?
-                };
-                piece.start = at;
-                piece.source_in = *a;
-                piece.duration = *b - *a;
-                if duck {
-                    let mut es = piece.essential.clone().unwrap_or_else(|| EssentialSound::new(AudioType::Music));
-                    es.kind = AudioType::Music;
-                    es.ducking.enabled = true;
-                    if !es.ducking.against.contains(&AudioType::Dialogue) {
-                        es.ducking.against.push(AudioType::Dialogue);
-                    }
-                    piece.essential = Some(es);
-                }
-                ids.push(piece.id);
-                at += *b - *a;
-            }
-            tr.items.sort_by_key(|o| o.start);
-            Ok(ids)
-        })?;
-        // a one-frame constant-power crossfade on each loop join, so the cut never clicks; the
-        // joins fall between frames (bar lengths are not whole frames), so the transition is put
-        // on the frame that holds the cut
-        let frame = s.project.sequence(seq).map(|q| q.settings.frame_rate.sane().tick_of(JOIN_FRAMES)).ok_or(EngineError::NoSequence)?;
-        for c in ids.iter().skip(1) {
-            let cut =
-                s.project.sequence(seq).and_then(|q| q.find_item(*c)).map(|(_, it)| it.start).ok_or_else(|| EngineError::Other("a piece is gone".into()))?;
-            let r = s.execute("sequence.applyAudioTransition", json!({"clip": c.0, "edge": "in", "effect": "constant_power", "frames": JOIN_FRAMES}))?;
-            let id = r.get("transition").and_then(Value::as_u64).ok_or_else(|| EngineError::Other("no crossfade was made".into()))?;
-            s.execute("sequence.setTransition", json!({"transition": id, "start": cut.0 - frame.0 / 2}))?;
-        }
-        if duck {
-            s.execute("essentialSound.generateDucking", json!({"clips": ids.iter().map(|c| c.0).collect::<Vec<_>>()}))?;
-        }
-        Ok(())
+        // the follow-up commands work on the active sequence: make it the fitted one meanwhile
+        let active = s.state.active_sequence.replace(seq);
+        let r = fit_step(s, seq, track, clip, &it, &plan, duck);
+        s.state.active_sequence = active;
+        r
     });
     super::apply_atomic(s, "Fit Music", vec![step])
+}
+
+/// The edits of a music fit ([`apply_fit`]): the clip becomes the plan's first piece and copies of
+/// it the others; its fade-out moves to the new end; joins get a crossfade; ducking is generated.
+fn fit_step(s: &mut Session, seq: ItemId, track: TrackId, clip: ClipId, it: &TrackItem, plan: &[(Tick, Tick)], duck: bool) -> Result<()> {
+    let (it, plan) = (it.clone(), plan.to_vec());
+    let ids = s.edit("Fit Music", move |pr, _| {
+        let new_ids: Vec<u64> = plan.iter().skip(1).map(|_| pr.alloc_id()).collect();
+        let q = pr.sequence_mut(seq).ok_or(EngineError::NoSequence)?;
+        let tr = q.all_tracks_mut().find(|t| t.id == track).ok_or(EngineError::NoSequence)?;
+        // the clip's fade-out (a transition to nothing at its end) moves to the fitted end;
+        // left where it was, it would cut a hole into the music or play past the bar line
+        let fade_out: Vec<_> = tr.transitions.iter().filter(|x| x.from == Some(clip) && x.to.is_none()).cloned().collect();
+        tr.transitions.retain(|x| !(x.from == Some(clip) && x.to.is_none()));
+        let mut at = it.start;
+        let mut ids = Vec::new();
+        for (k, (a, b)) in plan.iter().enumerate() {
+            let piece = if k == 0 {
+                tr.items.iter_mut().find(|o| o.id == clip).ok_or_else(|| EngineError::Other("the clip is gone".into()))?
+            } else {
+                let mut c: TrackItem = it.clone();
+                c.id = ClipId(*new_ids.get(k - 1).ok_or(EngineError::NoSequence)?);
+                c.link = None;
+                c.group = None;
+                // a copy plays the bars again: the clip's automation and markers stay on the
+                // first piece (keyframed parameters keep their static value)
+                c.markers.clear();
+                for e in &mut c.effects {
+                    for p in e.params.values_mut() {
+                        p.keyframes.clear();
+                    }
+                }
+                tr.items.push(c);
+                tr.items.last_mut().ok_or(EngineError::NoSequence)?
+            };
+            piece.start = at;
+            piece.source_in = *a;
+            piece.duration = *b - *a;
+            if duck {
+                // a clip already typed (Ambience…) keeps its type
+                let mut es = piece.essential.clone().unwrap_or_else(|| EssentialSound::new(AudioType::Music));
+                es.ducking.enabled = true;
+                if !es.ducking.against.contains(&AudioType::Dialogue) {
+                    es.ducking.against.push(AudioType::Dialogue);
+                }
+                piece.essential = Some(es);
+            }
+            ids.push(piece.id);
+            at += *b - *a;
+        }
+        if let Some(last) = ids.last().and_then(|id| tr.items.iter().find(|o| o.id == *id)).map(|o| (o.id, o.end(), o.duration)) {
+            for mut x in fade_out {
+                x.duration = x.duration.min(last.2);
+                (x.from, x.start) = (Some(last.0), last.1 - x.duration);
+                tr.transitions.push(x);
+            }
+        }
+        tr.items.sort_by_key(|o| o.start);
+        tr.sort();
+        filmcraft_edit::remove_orphan_transitions(tr);
+        Ok(ids)
+    })?;
+    // a one-frame crossfade on each loop join, so the cut never clicks: Constant Gain, since both
+    // sides are the same music at the same bar position (Constant Power would add up to +3 dB in
+    // the middle). The joins fall between frames (bar lengths are not whole frames), so the
+    // transition is put on the frame that holds the cut
+    let frame = s.project.sequence(seq).map(|q| q.settings.frame_rate.sane().tick_of(JOIN_FRAMES)).ok_or(EngineError::NoSequence)?;
+    for c in ids.iter().skip(1) {
+        let cut = s.project.sequence(seq).and_then(|q| q.find_item(*c)).map(|(_, it)| it.start).ok_or_else(|| EngineError::Other("a piece is gone".into()))?;
+        let r = s.execute("sequence.applyAudioTransition", json!({"clip": c.0, "edge": "in", "effect": "constant_gain", "frames": JOIN_FRAMES}))?;
+        let id = r.get("transition").and_then(Value::as_u64).ok_or_else(|| EngineError::Other("no crossfade was made".into()))?;
+        s.execute("sequence.setTransition", json!({"transition": id, "start": cut.0 - frame.0 / 2}))?;
+    }
+    if duck {
+        s.execute("essentialSound.generateDucking", json!({"clips": ids.iter().map(|c| c.0).collect::<Vec<_>>()}))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

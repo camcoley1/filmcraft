@@ -194,7 +194,7 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
 /// resampled), channels `channels`, as a 32-bit float WAV, ten seconds at a time; stops when
 /// `stop` says so. `end` is the media's end (samples, for messages). A read that comes back short
 /// (the stream ended) is padded with silence; a decode failure is an error naming the stream and
-/// the range ([`read_chunk`]).
+/// the range ([`super::audio::read_chunk`]).
 fn decode_to_wav(
     src: &dyn filmcraft_media::MediaSource,
     stream: usize,
@@ -237,7 +237,7 @@ fn decode_to_wav(
             return Err("stopped".into());
         }
         let n = step.min(total - done) as usize;
-        let buf = read_chunk(src, stream, offset.saturating_add(done as i64), n, end)?;
+        let buf = super::audio::read_chunk(src, stream, offset.saturating_add(done as i64), n, RATE, end)?;
         let mut out = Vec::with_capacity(n * ch * 4);
         for i in 0..n {
             for c in channels.iter().take(ch) {
@@ -250,32 +250,6 @@ fn decode_to_wav(
         progress(done as f64 / total.max(1) as f64);
     }
     w.flush().map_err(|e| e.to_string())
-}
-
-/// `n` samples of audio stream `stream` from sample `pos`. FilmCraft's decoders answer reads past
-/// the end of a stream with silence or a short buffer (the stream's own end-of-stream signal),
-/// which is padded with silence; an error is never taken for the end: it fails the job with the
-/// stream and the range. A cancelled read stops.
-fn read_chunk(
-    src: &dyn filmcraft_media::MediaSource,
-    stream: usize,
-    pos: i64,
-    n: usize,
-    end: i64,
-) -> std::result::Result<filmcraft_frame::AudioBuffer, String> {
-    match src.audio_stream(stream, pos, n, RATE) {
-        Ok(b) => Ok(b),
-        Err(filmcraft_media::MediaError::Cancelled) => Err("stopped".into()),
-        Err(e) => {
-            let t = |x: i64| x as f64 / f64::from(RATE);
-            Err(format!(
-                "decoding audio stream {stream} failed reading {:.3} to {:.3} s (the media lasts {:.3} s): {e}",
-                t(pos),
-                t(pos.saturating_add(n as i64)),
-                t(end)
-            ))
-        }
-    }
 }
 
 pub(crate) fn apply(s: &mut Session, pj: &super::PendingAi, files: &[std::path::PathBuf]) -> Result<()> {

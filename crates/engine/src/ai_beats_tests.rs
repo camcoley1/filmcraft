@@ -241,7 +241,7 @@ fn music_fit_loop_joins_do_not_click() {
     assert_eq!(t.transitions.len(), joins.len(), "one crossfade per join");
     let frame = q.settings.frame_rate.tick_of(1);
     for x in &t.transitions {
-        assert_eq!((x.effect.effect.as_str(), x.duration), ("constant_power", frame));
+        assert_eq!((x.effect.effect.as_str(), x.duration), ("constant_gain", frame));
     }
     // a steady sine steps by at most 2 pi f / rate of its amplitude
     let normal = largest_step(&f, t.items[0].start + Tick(S));
@@ -257,4 +257,85 @@ fn music_fit_loop_joins_do_not_click() {
     .unwrap();
     let worst = joins.iter().map(|j| largest_step(&f, *j)).fold(0.0, f32::max);
     assert!(worst > normal * 5.0, "hard cuts jump by {worst} (normal {normal})");
+}
+
+/// The clip's fade-out moves to the fitted end (left where it was, it would cut a hole into the
+/// music); copies carry no automation or markers of the clip (those stay on the first piece).
+#[test]
+fn music_fit_moves_the_fade_out_and_keeps_automation_on_the_first_piece() {
+    let (mut f, clip) = session("bt-fade");
+    let seq = f.s.state.active_sequence.unwrap();
+    f.s.execute("sequence.applyAudioTransition", json!({"clip": clip.0, "edge": "out", "frames": 12})).unwrap();
+    f.s.edit("Automate", |pr, _| {
+        let it = pr.sequence_mut(seq).unwrap().audio_tracks[0].items.iter_mut().find(|i| i.id == clip).unwrap();
+        let src = it.source_in;
+        let level = it.effect_mut("volume").unwrap().param_mut("level").unwrap();
+        level.keyframes = vec![filmcraft_project::Keyframe::new(src + ticks(1.5), filmcraft_project::ParamValue::Float(-20.0))];
+        it.markers.push(filmcraft_project::Marker {
+            id: filmcraft_project::MarkerId(77),
+            start: src + ticks(2.0),
+            duration: Tick::ZERO,
+            name: "hit".into(),
+            comment: String::new(),
+            kind: filmcraft_project::MarkerKind::Comment,
+            color: Label::Green,
+        });
+        Ok(())
+    })
+    .unwrap();
+    let fade = f.s.project.sequence(seq).unwrap().audio_tracks[0].transitions[0].duration;
+    f.s.execute("ai.musicFit", json!({"seconds": 21.0, "wait": true})).unwrap();
+    let q = f.s.project.sequence(seq).unwrap();
+    let t = &q.audio_tracks[0];
+    let pieces: Vec<_> = t.items.iter().filter(|i| i.item == t.items.iter().find(|i| i.id == clip).unwrap().item).collect();
+    let last = pieces.last().unwrap();
+    let outs: Vec<_> = t.transitions.iter().filter(|x| x.to.is_none()).collect();
+    assert_eq!(outs.len(), 1, "{:?}", t.transitions);
+    assert_eq!((outs[0].from, outs[0].start + outs[0].duration, outs[0].duration), (Some(last.id), last.end(), fade), "the fade-out ends the fitted music");
+    for p in &pieces {
+        let keyed = p.effect("volume").unwrap().param("level").unwrap().keyframes.len();
+        assert_eq!((keyed, p.markers.len()), if p.id == clip { (1, 1) } else { (0, 0) }, "piece {:?}", p.id);
+    }
+}
+
+/// Bars too sparse to land within half a beat: refused with a reason, nothing changes.
+#[test]
+fn a_fit_far_from_the_target_is_refused() {
+    fn sparse(_: &JobRequest) -> Vec<(String, Vec<u8>)> {
+        // fast beats at the start, then one bar line 8.5 s later: the only fits are about 8.5 s
+        let v = json!({"tempo": 1200.0, "beats": [0.25, 0.3, 0.35, 8.75], "downbeats": [0.25, 8.75], "beatsPerBar": 4, "downbeatsEstimated": true});
+        vec![("beats.json".into(), serde_json::to_vec(&v).unwrap())]
+    }
+    let (mut f, _, _) = with_audio("bt-sparse", Script { features: vec!["beats".into()], result: ResultMode::Custom(sparse), ..Default::default() }, 48_000);
+    let seq = f.s.state.active_sequence.unwrap();
+    f.s.edit("Unlink", |pr, _| {
+        for t in pr.sequence_mut(seq).unwrap().all_tracks_mut() {
+            for it in &mut t.items {
+                it.link = None;
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    let clip = f.s.project.sequence(seq).unwrap().audio_tracks[0].items[0].id;
+    f.s.state.selection = vec![clip];
+    super::super::ensure_project_id(&mut f.s);
+    let before = snapshot(&f.s);
+    let e = f.s.execute("ai.musicFit", json!({"seconds": 4.0, "wait": true})).unwrap_err().to_string();
+    assert!(e.contains("more than half a beat"), "{e}");
+    assert_eq!(snapshot(&f.s), before);
+}
+
+/// Hostile parameters are refused before any job.
+#[test]
+fn hostile_beat_parameters_are_refused() {
+    let (mut f, _) = session("bt-hostile");
+    for p in [json!({"beatsPerBar": 0}), json!({"beatsPerBar": 17}), json!({"beatsPerBar": "x"}), json!({"beatsPerBar": -3})] {
+        assert!(f.s.execute("ai.beatGrid", p.clone()).is_err(), "{p}");
+    }
+    for p in [json!({"seconds": -1.0}), json!({"seconds": 0.0}), json!({"seconds": 1e300}), json!({"seconds": "x"}), json!({"seconds": 8.0, "beatsPerBar": 0})]
+    {
+        assert!(f.s.execute("ai.musicFit", p.clone()).is_err(), "{p}");
+    }
+    assert!(f.helper.started().is_empty());
 }
