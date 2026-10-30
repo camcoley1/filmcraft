@@ -44,6 +44,10 @@ fn script(hits: Value, steps: u32) -> Script {
 
 /// Two small movies (items a and b), a transcript on b, a connected fake helper.
 fn fixture(name: &str, hits_for: impl Fn(ItemId, ItemId) -> Value, steps: u32) -> Fx {
+    fixture_with(name, hits_for, steps, &|_| {})
+}
+
+fn fixture_with(name: &str, hits_for: impl Fn(ItemId, ItemId) -> Value, steps: u32, tweak: &dyn Fn(&mut Value)) -> Fx {
     let dir = tmp_dir(name);
     let files = [dir.join("a.mp4"), dir.join("b.mp4")];
     make_movie(&files[0], DemoScene::Aurora, 160, 90, 24);
@@ -63,6 +67,7 @@ fn fixture(name: &str, hits_for: impl Fn(ItemId, ItemId) -> Value, steps: u32) -
     if let ResultMode::Files { meta, .. } = &mut sc.result {
         meta["items"][0]["id"] = json!(a.0);
         meta["items"][1]["id"] = json!(b.0);
+        tweak(meta);
     }
     let helper = FakeHelper::start(sc).unwrap();
     s.execute("ai.connect", json!({"port": helper.port()})).unwrap();
@@ -70,7 +75,7 @@ fn fixture(name: &str, hits_for: impl Fn(ItemId, ItemId) -> Value, steps: u32) -
 }
 
 fn visual(a: ItemId, b: ItemId) -> Value {
-    json!([{"id": b.0, "time": 0.5, "score": 0.31}, {"id": a.0, "time": 0.25, "score": 0.27}, {"id": 999_999, "time": 1.0, "score": 0.2}])
+    json!([{"id": b.0, "time": 4.0, "score": 0.31}, {"id": a.0, "time": 0.25, "score": 0.27}, {"id": 999_999, "time": 1.0, "score": 0.2}])
 }
 
 fn index_dir(f: &Fx) -> PathBuf {
@@ -101,11 +106,11 @@ fn indexing_writes_the_index_beside_the_cache_and_is_incremental() {
     let ids: Vec<u64> = doc["items"].as_array().unwrap().iter().map(|e| e["id"].as_u64().unwrap()).collect();
     assert_eq!(ids, [f.a.0, f.b.0]);
     for it in [f.a, f.b] {
-        assert_eq!(std::fs::metadata(dir.join(format!("i_{}.f16", it.0))).unwrap().len(), 2048);
-        assert!(dir.join(format!("i_{}.json", it.0)).is_file());
+        assert_eq!(std::fs::metadata(dir.join(format!("i_{}_1.f16", it.0))).unwrap().len(), 2048);
+        assert!(dir.join(format!("i_{}_1.json", it.0)).is_file());
     }
     // nothing changed: no job
-    let again = f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    let again = f.s.execute("ai.indexProject", json!({"wait": true, "intervalSeconds": 1.5})).unwrap();
     assert_eq!(again["upToDate"], true, "{again}");
     assert_eq!(f.helper.started().len(), 1);
     // one file changes: only it is embedded again
@@ -118,7 +123,7 @@ fn indexing_writes_the_index_beside_the_cache_and_is_incremental() {
         }
         f.s.project = std::sync::Arc::new(p);
     }
-    f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    f.s.execute("ai.indexProject", json!({"wait": true, "intervalSeconds": 1.5})).unwrap();
     let started = f.helper.started();
     assert_eq!(started.len(), 2);
     assert_eq!(started[1].inputs, [f.files[1].to_string_lossy().to_string()]);
@@ -151,7 +156,7 @@ fn search_lists_transcript_hits_first_then_visual_ones_and_marks_stale_media() {
     assert_eq!((hits[0]["kind"].as_str(), hits[0]["item"].as_u64()), (Some("transcript"), Some(f.b.0)));
     assert!((hits[0]["seconds"].as_f64().unwrap() - 1.0).abs() < 1e-6);
     assert_eq!((hits[1]["kind"].as_str(), hits[1]["item"].as_u64()), (Some("visual"), Some(f.b.0)));
-    assert!((hits[1]["seconds"].as_f64().unwrap() - 0.5).abs() < 1e-6);
+    assert!((hits[1]["seconds"].as_f64().unwrap() - 4.0).abs() < 1e-6);
     assert_eq!(hits[2]["item"].as_u64(), Some(f.a.0));
     assert!(hits.iter().all(|h| h["stale"] == false));
     assert_eq!(r["indexed"], 2);
@@ -225,7 +230,7 @@ fn deleted_items_are_removed_from_the_index() {
     let mut f = fixture("gone", visual, 1);
     f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
     let dir = index_dir(&f);
-    assert!(dir.join(format!("i_{}.f16", f.a.0)).exists());
+    assert!(dir.join(format!("i_{}_1.f16", f.a.0)).exists());
     let mut p = (*f.s.project).clone();
     p.items.remove(&f.a);
     f.s.project = std::sync::Arc::new(p);
@@ -233,6 +238,9 @@ fn deleted_items_are_removed_from_the_index() {
     assert_eq!(r["upToDate"], true, "{r}");
     let ids: Vec<u64> = index_json(&f)["items"].as_array().unwrap().iter().map(|e| e["id"].as_u64().unwrap()).collect();
     assert_eq!(ids, [f.b.0]);
+    // and so are their files, in the same run
+    assert!(!dir.join(format!("i_{}_1.f16", f.a.0)).exists() && !dir.join(format!("i_{}_1.json", f.a.0)).exists());
+    assert!(dir.join(format!("i_{}_1.f16", f.b.0)).exists());
 }
 
 #[test]
@@ -241,14 +249,13 @@ fn disabled_states_and_parameters() {
     let mut s = Session::default();
     s.ai.port = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
     let _ = s.execute("ai.status", json!({}));
-    for id in ["ai.indexProject", "ai.search"] {
-        assert_eq!(reason(&s, id), crate::ai::NOT_CONNECTED, "{id}");
-    }
+    assert_eq!(reason(&s, "ai.indexProject"), crate::ai::NOT_CONNECTED);
+    // transcript search needs no helper
+    assert!(s.is_enabled("ai.search"));
     // a helper without the models
     let mut f = fixture("states", visual, 1);
     let other = FakeHelper::start(Script { features: vec!["echo".into()], ..Default::default() }).unwrap();
     f.s.execute("ai.connect", json!({"port": other.port()})).unwrap();
-    assert!(reason(&f.s, "ai.search").contains("does not provide `search`"));
     assert!(reason(&f.s, "ai.indexProject").contains("does not provide `searchIndex`"));
     f.s.execute("ai.connect", json!({"port": f.helper.port()})).unwrap();
     assert!(f.s.is_enabled("ai.search") && f.s.is_enabled("ai.indexProject"));
@@ -281,4 +288,273 @@ fn in_the_app_the_visual_hits_arrive_later() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert_eq!(f.s.search_results.hits.len(), 3);
+}
+
+fn wait_idle(f: &mut Fx) {
+    let t0 = std::time::Instant::now();
+    while !f.s.ai_search.pending_is_empty() {
+        crate::ai::poll(&mut f.s);
+        assert!(t0.elapsed() < Duration::from_secs(20), "jobs did not finish");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn set_duration(f: &mut Fx, item: ItemId, d: Tick) {
+    let mut p = (*f.s.project).clone();
+    if let Some(ItemKind::Media(m)) = p.item_mut(item).map(|i| &mut i.kind) {
+        m.info.duration = d;
+    }
+    f.s.project = std::sync::Arc::new(p);
+}
+
+#[test]
+fn a_changed_file_gets_a_new_file_pair_and_the_old_one_is_removed() {
+    let mut f = fixture("pair", visual, 1);
+    f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    let dir = index_dir(&f);
+    let d = f.s.project.item(f.b).and_then(|i| if let ItemKind::Media(m) = &i.kind { Some(m.info.duration) } else { None }).unwrap();
+    let b = f.b;
+    set_duration(&mut f, b, Tick(d.0 + 1));
+    f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    let doc = index_json(&f);
+    let b = doc["items"].as_array().unwrap().iter().find(|e| e["id"] == f.b.0).unwrap();
+    assert_eq!(b["f16"], format!("i_{}_2.f16", f.b.0), "{doc}");
+    assert!(dir.join(format!("i_{}_2.f16", f.b.0)).is_file() && dir.join(format!("i_{}_2.json", f.b.0)).is_file());
+    assert!(!dir.join(format!("i_{}_1.f16", f.b.0)).exists() && !dir.join(format!("i_{}_1.json", f.b.0)).exists(), "the replaced pair is gone");
+    assert!(dir.join(format!("i_{}_1.f16", f.a.0)).is_file(), "the untouched item keeps its pair");
+    // stray files the manifest does not name go too
+    std::fs::write(dir.join("i_999_7.f16"), b"x").unwrap();
+    f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    assert!(!dir.join("i_999_7.f16").exists());
+}
+
+#[test]
+fn the_fingerprint_sees_subsecond_changes_and_a_new_sampling_rebuilds() {
+    let mut f = fixture("fp", visual, 1);
+    f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    // a rewrite 300 ms later with the same size: the whole-second mtime of before would not see it
+    let file = std::fs::OpenOptions::new().write(true).open(&f.files[0]).unwrap();
+    let m = std::fs::metadata(&f.files[0]).unwrap().modified().unwrap();
+    file.set_modified(m + Duration::from_millis(300)).unwrap();
+    drop(file);
+    f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    let started = f.helper.started();
+    assert_eq!(started.len(), 2);
+    assert_eq!(started[1].inputs, [f.files[0].to_string_lossy().to_string()]);
+    // the same sampling: nothing to do; another interval or frame cap: everything again
+    assert_eq!(f.s.execute("ai.indexProject", json!({"wait": true})).unwrap()["upToDate"], true);
+    f.s.execute("ai.indexProject", json!({"wait": true, "intervalSeconds": 3})).unwrap();
+    assert_eq!(f.helper.started().len(), 3);
+    assert_eq!(f.helper.started()[2].inputs.len(), 2);
+    f.s.execute("ai.indexProject", json!({"wait": true, "intervalSeconds": 3, "maxFrames": 100})).unwrap();
+    assert_eq!(f.helper.started().len(), 4);
+}
+
+#[test]
+fn items_the_helper_puts_off_are_not_recorded_and_are_asked_for_again() {
+    let tweak = |m: &mut Value| {
+        let first = m["items"][0].clone();
+        m["items"] = json!([first]);
+        m["deferred"] = json!([{"index": 1, "id": 0, "error": "the job's limit of 50000 frames would be passed"}]);
+    };
+    let mut f = fixture_with("deferred", visual, 1, &tweak);
+    let r = f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    assert_eq!((r["remaining"].as_u64(), r["deferred"].as_u64(), r["failed"].as_u64()), (Some(1), Some(1), Some(0)), "{r}");
+    let doc = index_json(&f);
+    assert_eq!(doc["items"].as_array().unwrap().len(), 1);
+    assert!(doc["failed"].as_array().unwrap().is_empty(), "put off is not failed: {doc}");
+    // the next run sends only the item that is missing
+    f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    let started = f.helper.started();
+    assert_eq!(started.len(), 2);
+    assert_eq!(started[1].inputs, [f.files[1].to_string_lossy().to_string()]);
+}
+
+#[test]
+fn a_job_stays_within_the_frame_budget() {
+    let mut f = fixture("budget", visual, 1);
+    let mut p = (*f.s.project).clone();
+    let Some(ItemKind::Media(m)) = p.item(f.a).map(|i| i.kind.clone()) else { panic!() };
+    let mut long = m.clone();
+    long.info.duration = Tick(36_000 * TICKS_PER_SECOND);
+    for k in 0..40 {
+        p.add_item(&format!("long {k}"), filmcraft_project::Label::Iris, ItemKind::Media(long.clone()), None);
+    }
+    f.s.project = std::sync::Arc::new(p);
+    // each long item is 1800 frames at the defaults: 27 of them fit in 50 000 beside the two short ones
+    let r = f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    let sent = f.helper.started()[0].inputs.len();
+    assert_eq!(sent, 2 + 27, "{r}");
+    assert_eq!(r["remaining"], 40 - 27);
+}
+
+#[test]
+fn only_one_indexing_job_runs_at_a_time() {
+    let mut f = fixture("one", visual, 100_000);
+    let r = f.s.execute("ai.indexProject", json!({})).unwrap();
+    assert_eq!(r["background"], true);
+    assert!(!f.s.is_enabled("ai.indexProject"));
+    let e = f.s.execute("ai.indexProject", json!({})).unwrap_err().to_string();
+    assert!(e.contains("being indexed"), "{e}");
+    f.s.execute("jobs.cancel", json!({"job": r["job"]})).unwrap();
+    wait_idle(&mut f);
+}
+
+#[test]
+fn enabling_the_index_command_does_not_touch_the_media_files() {
+    let f = fixture("noio", visual, 1);
+    for file in &f.files {
+        std::fs::remove_file(file).unwrap();
+    }
+    // the menu asks every frame: it must not stat the files
+    assert!(f.s.is_enabled("ai.indexProject"));
+}
+
+#[test]
+fn a_newer_search_replaces_an_older_one_whichever_answers_first() {
+    let mut f = fixture("race", visual, 1);
+    f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    f.s.ai.background = true;
+    let a = f.s.execute("ai.search", json!({"query": "dog"})).unwrap();
+    let b = f.s.execute("ai.search", json!({"query": "ocean"})).unwrap();
+    assert_ne!(a["job"], b["job"]);
+    wait_idle(&mut f);
+    // the answer of the first search (finished or not) is not shown; the second one is
+    assert_eq!(f.s.search_results.query, "ocean");
+    assert!(!f.s.search_results.pending && f.s.search_results.note.is_none(), "{:?}", f.s.search_results);
+    assert_eq!(f.s.search_results.hits.len(), 3);
+    // a failing search that is no longer current does not clear the current one's state
+    let mut f = fixture_with("race-fail", visual, 1, &|_| {});
+    f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    f.s.ai.background = true;
+    f.s.execute("ai.search", json!({"query": "dog"})).unwrap();
+    f.helper.cancelled();
+    f.s.execute("ai.search", json!({"query": "ocean"})).unwrap();
+    wait_idle(&mut f);
+    assert_eq!(f.s.search_results.query, "ocean");
+    assert!(f.s.search_results.note.is_none());
+}
+
+#[test]
+fn search_results_do_not_outlive_the_project_they_belong_to() {
+    let mut f = fixture("switch", visual, 1);
+    f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    f.s.execute("ai.search", json!({"query": "ocean", "wait": true})).unwrap();
+    assert!(!f.s.search_results.hits.is_empty());
+    f.s.execute("file.newProject", json!({})).unwrap();
+    assert_eq!(f.s.search_results, Default::default());
+}
+
+#[test]
+fn transcript_search_works_without_the_helper_and_says_why_pictures_are_left_out() {
+    let mut f = fixture("nohelper", visual, 1);
+    let other = FakeHelper::start(Script { features: vec!["echo".into()], ..Default::default() }).unwrap();
+    f.s.execute("ai.connect", json!({"port": other.port()})).unwrap();
+    let r = f.s.execute("ai.search", json!({"query": "ocean", "wait": true})).unwrap();
+    assert_eq!(r["hits"].as_array().unwrap().len(), 1, "{r}");
+    assert!(r["note"].as_str().unwrap().contains("does not provide `search`"), "{r}");
+    assert_eq!(r["pending"], false);
+}
+
+#[test]
+fn a_search_does_not_give_a_project_an_id() {
+    let mut f = fixture("noid", visual, 1);
+    let mut p = (*f.s.project).clone();
+    p.id = String::new();
+    f.s.project = std::sync::Arc::new(p);
+    let r = f.s.execute("ai.search", json!({"query": "ocean", "wait": true})).unwrap();
+    assert_eq!(r["hits"].as_array().unwrap().len(), 1);
+    assert!(r["note"].as_str().unwrap().contains("ai.indexProject"), "{r}");
+    assert!(f.s.project.id.is_empty(), "reading minted an id");
+}
+
+#[test]
+fn copies_of_a_project_keep_their_own_index() {
+    let mut f = fixture("copies", visual, 1);
+    let id = crate::ai::ensure_project_id(&mut f.s);
+    f.s.path = Some("/projects/one.fcraft".into());
+    let one = super::index_dir_of(&f.s, &id).unwrap();
+    f.s.path = Some("/projects/copy of one.fcraft".into());
+    let two = super::index_dir_of(&f.s, &id).unwrap();
+    assert_ne!(one, two);
+    assert_eq!(one.parent(), two.parent());
+    assert!(one.file_name().unwrap().to_string_lossy().starts_with(&id));
+}
+
+#[test]
+fn a_hostile_index_is_read_within_its_bounds() {
+    let f = fixture("hostile", visual, 1);
+    let dir = f.dir.join("hostile-index");
+    std::fs::create_dir_all(&dir).unwrap();
+    // too large: ignored without being read
+    let file = std::fs::File::create(dir.join("index.json")).unwrap();
+    file.set_len(super::MAX_INDEX_JSON + 1).unwrap();
+    assert!(super::read_index(&dir).is_empty());
+    // more entries than the helper reads: the extra ones are not taken
+    let items: Vec<Value> = (0..(super::MAX_ENTRIES as u64 + 500)).map(|i| json!({"id": i, "fingerprint": "x", "frames": 1})).collect();
+    std::fs::write(dir.join("index.json"), serde_json::to_vec(&json!({"version": 1, "items": items, "failed": []})).unwrap()).unwrap();
+    assert_eq!(super::read_index(&dir).len(), super::MAX_ENTRIES);
+    // nonsense
+    std::fs::write(dir.join("index.json"), br#"{"version":1,"items":[7,{"id":"x"},{"id":1}],"failed":"no"}"#).unwrap();
+    assert!(super::read_index(&dir).is_empty());
+}
+
+#[test]
+fn the_helper_and_the_engine_agree_on_the_limits() {
+    assert_eq!(super::MAX_ENTRIES, 4000);
+    assert_eq!(super::MAX_INDEX_FRAMES * 1024, 2 << 30);
+    assert_eq!(super::JOB_FRAMES, 50_000);
+}
+
+#[test]
+fn the_frame_estimate_follows_the_helpers_sampling_rule() {
+    let est = |secs: f64, interval: f64, max: u64| super::estimate_frames(Tick::from_seconds_f64(secs), interval, max);
+    assert_eq!(est(0.0, 2.0, 100), 1);
+    assert_eq!(est(1.0, 2.0, 100), 1);
+    assert_eq!(est(7.0, 2.0, 100), 3); // 1, 3, 5
+    assert_eq!(est(3600.0, 2.0, 1800), 1800);
+    assert_eq!(est(3600.0, 2.0, 100), 100); // the interval grows to fit the cap
+}
+
+fn hit(item: u64, t: f64, kind: &'static str, score: f32) -> crate::search_results::SearchHit {
+    crate::search_results::SearchHit { item: ItemId(item), time: Tick::from_seconds_f64(t), score, kind, stale: false }
+}
+
+#[test]
+fn transcript_hits_cannot_crowd_out_picture_hits_and_duplicates_collapse() {
+    let words: Vec<_> = (0..20).map(|i| hit(1, i as f64 * 10.0, "transcript", 1.0)).collect();
+    let pics: Vec<_> = (0..20).map(|i| hit(2, i as f64 * 10.0, "visual", 0.3)).collect();
+    let merged = super::merge_hits(words.clone(), pics.clone(), 20, 2.0);
+    assert_eq!(merged.len(), 20);
+    assert_eq!(merged.iter().filter(|h| h.kind == "transcript").count(), 10);
+    assert_eq!(merged.iter().filter(|h| h.kind == "visual").count(), 10);
+    // few picture hits: the words fill the rest; few words: the pictures do
+    let merged = super::merge_hits(words.clone(), pics[..3].to_vec(), 20, 2.0);
+    assert_eq!((merged.iter().filter(|h| h.kind == "transcript").count(), merged.len()), (17, 20));
+    let merged = super::merge_hits(words[..2].to_vec(), pics.clone(), 20, 2.0);
+    assert_eq!((merged.iter().filter(|h| h.kind == "visual").count(), merged.len()), (18, 20));
+    // a picture within `dedupe` seconds of a word of the same item is the same place
+    let merged = super::merge_hits(
+        vec![hit(1, 5.0, "transcript", 1.0)],
+        vec![hit(1, 6.0, "visual", 0.3), hit(1, 9.0, "visual", 0.29), hit(2, 5.0, "visual", 0.28)],
+        10,
+        2.0,
+    );
+    let places: Vec<(u64, &str)> = merged.iter().map(|h| (h.item.0, h.kind)).collect();
+    assert_eq!(places, [(1, "transcript"), (1, "visual"), (2, "visual")]);
+    assert!((merged[1].time.seconds() - 9.0).abs() < 1e-9);
+}
+
+#[test]
+fn weak_pictures_are_left_out_and_the_rest_come_best_first() {
+    let mut f = fixture(
+        "floor",
+        |a, b| json!([{"id": a.0, "time": 0.1, "score": 0.25}, {"id": b.0, "time": 0.3, "score": 0.4}, {"id": a.0, "time": 0.9, "score": 0.15}]),
+        1,
+    );
+    f.s.execute("ai.indexProject", json!({"wait": true})).unwrap();
+    let r = f.s.execute("ai.search", json!({"query": "nothing in the transcript", "wait": true})).unwrap();
+    let scores: Vec<f64> = r["hits"].as_array().unwrap().iter().map(|h| h["score"].as_f64().unwrap()).collect();
+    assert_eq!(scores.len(), 2, "{r}");
+    assert!((scores[0] - 0.4).abs() < 1e-6 && (scores[1] - 0.25).abs() < 1e-6, "{scores:?}");
 }

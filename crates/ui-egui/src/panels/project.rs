@@ -164,10 +164,6 @@ pub fn shown_inst(app: &FilmcraftApp) -> Inst {
 }
 
 /// Text size of the panel (Font Size).
-fn fs_of(app: &FilmcraftApp) -> f32 {
-    font(app)
-}
-
 pub fn font(app: &FilmcraftApp) -> f32 {
     app.session.prefs.project_panel.view.font_size.points()
 }
@@ -443,7 +439,7 @@ fn body(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, v: &View, actions
     if ai_on || air.hovered() {
         ui.painter().rect_filled(ai, 3.0, if ai_on { t.field_border } else { t.hover });
     }
-    ui.painter().text(ai.center(), Align2::CENTER_CENTER, "AI", Tokens::ui(fs_of(app) - 1.0), t.icon);
+    ui.painter().text(ai.center(), Align2::CENTER_CENTER, "AI", Tokens::ui(font(app) - 1.0), t.icon);
     if air.clicked() {
         let q = app.ui.project_search.clone();
         app.ui.project_search = if ai_on { crate::panels::project_ai_search::question(&q).to_string() } else { format!("?{q}") };

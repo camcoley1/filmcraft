@@ -68,32 +68,41 @@ pub fn results(app: &mut FilmcraftApp, ui: &mut egui::Ui, content: Rect, pre: &s
         note(ui, y + 10.0, tl!("No matches"));
         return;
     }
-    for (n, h) in res.hits.iter().enumerate() {
-        let row = Rect::from_min_size(pos2(content.min.x + 4.0, y), vec2(content.width() - 8.0, 22.0));
-        y += 22.0;
-        if row.min.y > content.max.y {
-            break;
-        }
-        let name = app.session.project.item(h.item).map(|i| i.name.clone()).unwrap_or_default();
-        let selected = app.session.state.project_selection.contains(&h.item);
-        let resp = ui.interact(row, egui::Id::new((pre, "aiHit", n)), Sense::click());
-        if selected || resp.hovered() {
-            ui.painter().rect_filled(row, 3.0, t.hover);
-        }
-        let secs = h.time.seconds();
-        let what = if h.kind == "transcript" { tl!("Words") } else { tl!("Picture") };
-        let stale = if h.stale { format!(" ({})", tl!("changed since indexed")) } else { String::new() };
-        ui.painter().text(pos2(row.min.x + 8.0, row.center().y), Align2::LEFT_CENTER, &name, Tokens::ui(fs), t.text);
-        let detail = format!("{}  {}{}", clock(secs), what, stale);
-        ui.painter().text(pos2(row.max.x - 8.0, row.center().y), Align2::RIGHT_CENTER, &detail, Tokens::ui(fs - 0.5), t.text_dim);
-        app.auto.add(&format!("{pre}.aiHit.{n}"), row, &format!("{name} {}", clock(secs)));
-        if resp.clicked() {
-            actions.push(("project.select".into(), json!({"items": [h.item.0]})));
-        }
-        if resp.double_clicked() {
-            open_at(h.item, h.time.0, actions);
-        }
+    // the hits scroll: a long list is reachable by wheel and scroll bar
+    let area = Rect::from_min_max(pos2(content.min.x, y), content.max);
+    if area.height() < 22.0 {
+        return;
     }
+    let mut bui = ui.new_child(egui::UiBuilder::new().max_rect(area).id_salt((pre, "aiHits")));
+    bui.set_clip_rect(area.intersect(ui.clip_rect()));
+    egui::ScrollArea::vertical().id_salt((pre, "ai-scroll")).auto_shrink([false, false]).show(&mut bui, |ui| {
+        for (n, h) in res.hits.iter().enumerate() {
+            let (row, resp) = ui.allocate_exact_size(vec2((area.width() - 12.0).max(40.0), 22.0), Sense::click());
+            if !ui.is_rect_visible(row) {
+                continue;
+            }
+            let name = app.session.project.item(h.item).map(|i| i.name.clone()).unwrap_or_default();
+            let selected = app.session.state.project_selection.contains(&h.item);
+            if selected {
+                ui.painter().rect_filled(row, 3.0, t.row_selected);
+            } else if resp.hovered() {
+                ui.painter().rect_filled(row, 3.0, t.hover);
+            }
+            let secs = h.time.seconds();
+            let what = if h.kind == "transcript" { tl!("Words").to_string() } else { format!("{} {:.2}", tl!("Picture"), h.score) };
+            let stale = if h.stale { format!(" ({})", tl!("changed since indexed")) } else { String::new() };
+            ui.painter().text(pos2(row.min.x + 8.0, row.center().y), Align2::LEFT_CENTER, &name, Tokens::ui(fs), t.text);
+            let detail = format!("{}  {}{}", clock(secs), what, stale);
+            ui.painter().text(pos2(row.max.x - 8.0, row.center().y), Align2::RIGHT_CENTER, &detail, Tokens::ui(fs - 0.5), t.text_dim);
+            app.auto.add(&format!("{pre}.aiHit.{n}"), row, &format!("{name} {}", clock(secs)));
+            if resp.clicked() {
+                actions.push(("project.select".into(), json!({"items": [h.item.0]})));
+            }
+            if resp.double_clicked() {
+                open_at(h.item, h.time.0, actions);
+            }
+        }
+    });
 }
 
 /// Open the item in the Source monitor with the playhead on the hit.

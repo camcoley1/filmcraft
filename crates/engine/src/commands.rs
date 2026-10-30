@@ -1142,6 +1142,7 @@ fn build() -> Vec<CommandSpec> {
             s.project = std::sync::Arc::new(filmcraft_project::Project::new(&name));
             s.history = Default::default();
             s.project_generation += 1;
+            s.search_results = Default::default();
             s.history.limit = 200;
             s.state = crate::Session::default().state;
             if s.path.take().is_some() {
@@ -1157,6 +1158,7 @@ fn build() -> Vec<CommandSpec> {
             s.project = std::sync::Arc::new(p);
             s.history = Default::default();
             s.project_generation += 1;
+            s.search_results = Default::default();
             s.history.limit = 200;
             s.state = crate::Session::default().state;
             s.state.active_sequence = Some(seq);
@@ -4420,6 +4422,7 @@ fn install_project(s: &mut Session, proj: filmcraft_project::Project, path: Opti
     s.project = std::sync::Arc::new(proj);
     s.history = Default::default();
     s.project_generation += 1;
+    s.search_results = Default::default();
     s.history.limit = 200;
     s.state = crate::Session::default().state;
     s.state.active_sequence = first;
