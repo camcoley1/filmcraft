@@ -21,6 +21,7 @@ pub mod autosave;
 pub mod captions;
 pub mod clip_ops;
 pub mod color;
+pub mod color_nodes;
 pub mod commands;
 pub mod demo;
 pub mod doc_path;
@@ -335,6 +336,9 @@ pub struct EditorState {
     /// Timeline clipboard (serialized track items with their relative track index).
     #[serde(skip)]
     pub clipboard: Vec<(TrackKind, usize, filmcraft_project::TrackItem)>,
+    /// Copy Grade / Paste Grade: the copied Lumetri grade (its nodes).
+    #[serde(skip)]
+    pub grade_clipboard: Option<filmcraft_project::color_graph::GradeVersion>,
     pub default_video_transition: String,
     pub default_audio_transition: String,
     /// Selected edit points (trim mode).
@@ -1299,6 +1303,8 @@ mod autosave_tests;
 mod avi_import_tests;
 #[cfg(test)]
 mod clip_ops_tests;
+#[cfg(test)]
+mod color_nodes_tests;
 #[cfg(test)]
 mod color_tests;
 #[cfg(test)]
