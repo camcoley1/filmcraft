@@ -144,11 +144,11 @@ fn the_ai_commands_sit_in_existing_menus() {
 
 #[test]
 fn handshake_reports_the_helper_and_features_wait_for_their_milestone() {
-    let mut f = fixture("hello", Script { features: vec!["echo".into(), "upscale".into()], ..Default::default() });
+    let mut f = fixture("hello", Script { features: vec!["echo".into(), "search".into()], ..Default::default() });
     let st = f.s.execute("ai.status", json!({})).unwrap();
     assert_eq!(st["connected"], true, "{st}");
-    assert_eq!(st["features"], json!(["echo", "upscale"]));
-    assert_eq!(reason(&f.s, "ai.upscale"), "not built yet (arrives in M6f)");
+    assert_eq!(st["features"], json!(["echo", "search"]));
+    assert_eq!(reason(&f.s, "ai.search"), "not built yet (arrives in M6e)");
     assert!(reason(&f.s, "ai.stems").contains("does not provide `stems`"));
     assert!(f.s.is_enabled("ai.echo"));
     f.s.state.selection.clear();

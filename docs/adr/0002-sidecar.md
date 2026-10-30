@@ -112,3 +112,9 @@ AI features run in **`craft-ai`**, a separate Python process installed by craft-
 - Each feature (M6a reframe, M6b stems, M6c speech enhance, M6d beat grid and music fit, M6e search,
   M6f upscale and interpolate) is its own sub-milestone with its own acceptance tests against a
   scripted fake helper (`filmcraft_sidecar::fake`) and a real-helper smoke script.
+- M6f upscale ships without a learned model: no super-resolution model with permissively licensed
+  weights and training data was found (Real-ESRGAN and the DIV2K-trained family are rejected for
+  now, see `craft-suite/sidecar/LICENSES.md`), so `ai.upscale` runs a classical scaler in the
+  helper (Lanczos-3, edge-aware unsharp, clamped) and says so in its label, "High-Quality Upscale
+  (not AI-enhanced)". The helper's `backend` parameter takes a learned model later without engine
+  changes.

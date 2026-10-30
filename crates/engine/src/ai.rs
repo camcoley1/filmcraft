@@ -6,7 +6,9 @@
 //! | `ai.connect {port=9877}` | Clip ▸ AI | connects to the helper on another port |
 //! | `ai.reframe` | Clip ▸ AI | M6a: [`reframe`] |
 //! | `ai.stems` | Clip ▸ AI | M6b: [`stems`] |
-//! | `ai.enhanceSpeech` `ai.upscale` `ai.interpolate` | Clip ▸ AI | M6c to M6f |
+//! | `ai.upscale` | Clip ▸ AI | M6f: [`upscale`] (a classical scaler, not AI-enhanced, for now) |
+//! | `ai.interpolate` | Clip ▸ AI | M6f: [`interpolate`] |
+//! | `ai.enhanceSpeech` | Clip ▸ AI | M6c |
 //! | `ai.generativeExtend` | Clip ▸ AI | M8f, in [`crate::ai_extend`] |
 //! | `ai.beatGrid` `ai.musicFit` | Sequence ▸ AI | M6d |
 //! | `ai.indexProject` `ai.search {query}` | Clip ▸ AI / (Project panel search) | M6e, in [`crate::ai_search`] |
@@ -239,6 +241,8 @@ pub(crate) fn helper_ready(s: &Session, feature: &str) -> std::result::Result<()
         Some(Err(why)) => Err(why.clone()),
         Some(Ok(h)) if !h.has(feature) => Err(match h.states.get(feature) {
             Some(st) if st.state == "checking" => format!("the AI helper is checking the {feature} model…"),
+            // a locally made model: the reason says how to make it
+            Some(st) if st.state == "needs model" => format!("{feature} needs its model: {}", st.reason.as_deref().unwrap_or("see the helper's log")),
             Some(st) => format!("{feature} is unavailable in the AI helper: {}", st.reason.as_deref().unwrap_or(&st.state)),
             None => format!("the AI helper (version {}) does not provide `{feature}` yet", h.version),
         }),
@@ -324,16 +328,26 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             run: stems::run,
             journal: true,
         },
-        feature!("ai.upscale", "Upscale…", ["Clip", "AI"], "upscale", "M6f", Needs::Clips, r#"{"clips":[id]?,"factor":2|4=2,"wait":bool=false}"#),
-        feature!(
-            "ai.interpolate",
-            "Interpolate Frames…",
-            ["Clip", "AI"],
-            "interpolate",
-            "M6f",
-            Needs::Clips,
-            r#"{"clips":[id]?,"factor":2|4=2,"wait":bool=false}"#
-        ),
+        CommandSpec {
+            id: "ai.upscale",
+            label: "High-Quality Upscale (not AI-enhanced)…",
+            menu: &["Clip", "AI"],
+            shortcut: None,
+            params: upscale::PARAMS,
+            enabled: upscale::enabled,
+            run: upscale::run,
+            journal: true,
+        },
+        CommandSpec {
+            id: "ai.interpolate",
+            label: "Interpolate Frames…",
+            menu: &["Clip", "AI"],
+            shortcut: None,
+            params: interpolate::PARAMS,
+            enabled: interpolate::enabled,
+            run: interpolate::run,
+            journal: true,
+        },
         feature!("ai.beatGrid", "Add Beat Markers", ["Sequence", "AI"], "beatGrid", "M6d", Needs::Clips, r#"{"clips":[id]?,"wait":bool=false}"#),
         feature!(
             "ai.musicFit",
@@ -1085,6 +1099,8 @@ fn apply(s: &mut Session, pj: &PendingAi, result: &JobResult, files: &[PathBuf])
         "reframe" => reframe::apply(s, pj, files),
         "stems" => stems::apply(s, pj, files),
         "generativeExtend" => crate::ai_extend::apply(s, pj, result, files),
+        "upscale" => upscale::apply(s, pj, files),
+        "interpolate" => interpolate::apply(s, pj, files),
         k => Err(EngineError::Other(format!("results of `{k}` jobs cannot be applied yet"))),
     }
 }
@@ -1149,10 +1165,16 @@ fn apply_echo(s: &mut Session, fp: &Fingerprint, result: &JobResult, files: &[Pa
     apply_atomic(s, "AI Echo", vec![mark, note])
 }
 
+#[path = "ai_interpolate.rs"]
+pub mod interpolate;
 #[path = "ai_reframe.rs"]
 pub mod reframe;
 #[path = "ai_stems.rs"]
 pub mod stems;
+#[path = "ai_upscale.rs"]
+pub mod upscale;
+#[path = "ai_video.rs"]
+pub(crate) mod video;
 
 #[cfg(test)]
 #[path = "ai_tests.rs"]
