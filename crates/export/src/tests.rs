@@ -42,7 +42,7 @@ pub(crate) fn project() -> (Arc<Project>, ItemId, SourceMap) {
     (Arc::new(p), seq, m)
 }
 
-fn tmp(name: &str) -> String {
+pub(crate) fn tmp(name: &str) -> String {
     let d = std::env::temp_dir().join(format!("fc-export-{}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     d.join(name).to_string_lossy().to_string()

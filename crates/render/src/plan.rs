@@ -6,8 +6,9 @@
 //! clip whose enabled standard effects all have a GPU implementation ([`crate::gpufx`]) carries
 //! them as a [`LayerFx`]: their parameters evaluated at the frame's time, run by the GPU on the
 //! clip's working image before Motion places it, in the CPU's order (effects → Motion → Opacity /
-//! blend). Anything the shaders don't cover yet — other standard effects, masks, adjustment
-//! layers, nested sequences, transitions other than dissolves, dips and Push — is rendered on the CPU
+//! blend); effect masks travel with their effect ([`crate::gpufx::FxOp::Masked`]). Anything the
+//! shaders don't cover yet (other standard effects, opacity masks, adjustment
+//! layers, nested sequences, transitions other than dissolves, dips and Push) is rendered on the CPU
 //! for that layer (or the whole frame) and handed over as a pre-composited image, so the GPU path
 //! is always exact with respect to the CPU reference.
 //!
@@ -167,8 +168,8 @@ fn simple_transition(id: &str) -> bool {
 }
 
 /// The standard effects of a media clip if the GPU can draw it (any blend mode, no opacity masks,
-/// every enabled standard effect unmasked and with a GPU implementation; empty without effects or
-/// with effects off). None: the clip is rendered on the CPU.
+/// every enabled standard effect with a GPU implementation, masked or not; empty without effects
+/// or with effects off). None: the clip is rendered on the CPU.
 fn gpu_chain<'a>(project: &Project, item: &'a TrackItem, opts: RenderOptions) -> Option<Vec<&'a filmcraft_project::EffectInstance>> {
     let is_media = project.item(item.item).is_some_and(|p| matches!(p.kind, ItemKind::Media(_) | ItemKind::Subclip { .. }));
     if !is_media || item.has_opacity_masks() {
@@ -182,8 +183,8 @@ fn gpu_chain<'a>(project: &Project, item: &'a TrackItem, opts: RenderOptions) ->
         if !e.enabled {
             continue;
         }
-        let masked = e.masks.iter().any(|m| m.mode != filmcraft_project::MaskMode::None);
-        if masked || !crate::gpufx::GPU_EFFECTS.contains(&e.effect.as_str()) {
+        // masked effects too: `FxOp::eval_masked` limits them to their masks on the GPU
+        if !crate::gpufx::GPU_EFFECTS.contains(&e.effect.as_str()) {
             return None;
         }
         chain.push(e);
@@ -441,7 +442,7 @@ fn push_item(
                 frame_rate: seq.settings.frame_rate.as_f64(),
                 working: seq.settings.color.working,
             };
-            let ops: Option<Vec<FxOp>> = chain.iter().map(|e| FxOp::eval(e, &cx, lw, lh).filter(FxOp::gpu_ok)).collect();
+            let ops: Option<Vec<FxOp>> = chain.iter().map(|e| FxOp::eval_masked(e, &cx, lw, lh).filter(FxOp::gpu_ok)).collect();
             if let Some(ops) = ops {
                 let m = Affine::scale(opts.scale as f64, opts.scale as f64)
                     .then_apply(&motion)

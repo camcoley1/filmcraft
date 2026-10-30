@@ -770,6 +770,7 @@ pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
                     bytes,
                     render_fps: 0.0,
                     extra_files: Vec::new(),
+                    warnings: Vec::new(),
                 };
                 *lock(&out) = Some(Ready { result, files, report });
                 return;

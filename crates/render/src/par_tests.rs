@@ -268,3 +268,32 @@ fn hostile_pixel_aspect_ratios_render_square_without_panicking() {
         assert!(img.px.iter().all(|v| v.is_finite()), "{src:?} {par:?}");
     }
 }
+
+/// A clip whose Lumetri (curves, wheels, HSL Secondary, Sharpen) is limited to a mask is still
+/// planned for the GPU effect stage, as a masked op, and the plan's CPU execution matches the
+/// CPU render.
+#[test]
+fn a_masked_lumetri_clip_stays_on_the_gpu_plan() {
+    use filmcraft_project::{Mask, MaskPath, ParamValue, find_effect};
+    let (mut p, seq, _, map) = project((144, 108), (1, 1), (144, 108), (1, 1), false);
+    let mut e = find_effect("lumetri").unwrap().instance();
+    for (k, v) in [
+        ("curve_luma", ParamValue::Curve(vec![[0.0, 0.1], [1.0, 0.9]])),
+        ("wheel_shadows", ParamValue::Vec2(filmcraft_geom::Vec2::new(0.4, 0.1))),
+        ("hsl_on", ParamValue::Bool(true)),
+        ("hsl_blur", ParamValue::Float(30.0)),
+        ("sharpen", ParamValue::Float(40.0)),
+    ] {
+        e.params.get_mut(k).unwrap().value = v;
+    }
+    e.masks.push(Mask::new("m", MaskPath::ellipse(filmcraft_geom::Vec2::new(72.0, 54.0), filmcraft_geom::Vec2::new(40.0, 30.0))));
+    p.sequence_mut(seq).unwrap().video_tracks[0].items[0].effects.push(e);
+    let plan = plan::plan_frame(&p, seq, Tick::ZERO, RenderOptions::default(), &map);
+    let plan::FramePlan::Layers { layers, .. } = &plan else { panic!("a layer plan") };
+    let fx = layers.iter().find_map(|l| l.fx.as_ref()).expect("the clip goes through the GPU effect stage");
+    assert!(fx.ops.iter().any(|o| matches!(o, crate::gpufx::FxOp::Masked { .. })), "{:?}", fx.ops.len());
+    let want = render_sequence(&p, seq, Tick::ZERO, RenderOptions::default(), &map);
+    let got = plan::execute_cpu(&plan);
+    let worst = want.px.iter().zip(&got.px).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    assert!(worst < 1e-4, "{worst}");
+}

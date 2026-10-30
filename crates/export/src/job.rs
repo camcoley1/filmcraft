@@ -180,6 +180,10 @@ pub struct Exporter {
     seq: ItemId,
     project: Arc<Project>,
     vt: usize,
+    /// The video track's edit list start as opened (the encoder's declared B-frame delay).
+    media_start: Option<i64>,
+    /// What the export did differently from what was asked (for the report).
+    warnings: Vec<String>,
     at: Option<usize>,
     t0: web_time::Instant,
 }
@@ -228,7 +232,8 @@ impl Exporter {
         // HDR sequences export HDR (H.264 / ProRes / DNxHR / APV, and H.265 where a registered encoder
         // writes Main 10) unless SDR is asked for; elsewhere H.265 is tone-mapped 8-bit SDR
         let pipe = q.settings.color;
-        let hdr_out = hdr_output(pipe.working.is_hdr(), settings.sdr, settings.video_format(), crate::hdr_available);
+        let pipe_working_hdr = pipe.working.is_hdr();
+        let mut hdr_out = hdr_output(pipe_working_hdr, settings.sdr, settings.video_format(), crate::hdr_available);
         let mut settings = settings.clone();
         settings.signal = match (hdr_out, pipe.working) {
             (true, filmcraft_color::WorkingSpace::Rec2100Pq) => ColorSignal::PQ,
@@ -244,14 +249,37 @@ impl Exporter {
         let two_pass = settings.video_format() == Format::H264 && settings.bitrate_mode == BitrateMode::Vbr2Pass;
         settings.h264_pass = if two_pass { H264Pass::First } else { H264Pass::Single };
         let range = export_range(&project, seq, &settings)?;
-        let pipe = Arc::new(Pipeline::new(project.clone(), seq, &settings, hdr_out)?);
+        let mut pipe = Arc::new(Pipeline::new(project.clone(), seq, &settings, hdr_out)?);
+        let mut warnings = Vec::new();
+        // an HDR sequence H.265 cannot write as HDR on this machine (no 10-bit encoder): tone-mapped SDR,
+        // which the report says, unless SDR was asked for
+        if pipe_working_hdr && !settings.sdr && !hdr_out && settings.video_format() == Format::Hevc {
+            let why = crate::hdr_unavailable_reason(Format::Hevc).unwrap_or_else(|| "no 10-bit H.265 encoder on this machine".into());
+            warnings.push(format!("HDR H.265 is not available here ({why}): exported as tone-mapped SDR (Rec. 709)"));
+        }
+        let venc = match make_venc(&settings, pipe.w, pipe.h, pipe.rate) {
+            Ok(v) => v,
+            // H.265 HDR depends on the machine's 10-bit encoder taking this export (its size, a free
+            // session...); where it does not, the export is tone-mapped SDR, as before Main 10 existed
+            Err(why) if hdr_out && settings.video_format() == Format::Hevc => {
+                let warning = format!("HDR H.265 is not available for this export ({why}): exported as tone-mapped SDR (Rec. 709)");
+                hdr_out = false;
+                settings.sdr = true;
+                settings.signal = ColorSignal::default();
+                pipe = Arc::new(Pipeline::new(project.clone(), seq, &settings, hdr_out)?);
+                let venc = make_venc(&settings, pipe.w, pipe.h, pipe.rate)
+                    .map_err(|e| ExportError::Unsupported(format!("H.265: HDR (Main 10) declined ({why}), and tone-mapped SDR too ({e})")))?;
+                warnings.push(warning);
+                venc
+            }
+            Err(e) => return Err(e),
+        };
         let (f0, f1) = frame_span(pipe.rate, range);
         let nframes = (f1 - f0) as u64;
         if !settings.part_of_batch {
             progress.total.store(nframes * if two_pass { 2 } else { 1 }, Ordering::Relaxed);
             progress.set_status(format!("Exporting {} frames ({})", nframes, settings.format.label()));
         }
-        let venc = make_venc(&settings, pipe.w, pipe.h, pipe.rate)?;
         let brand = if settings.format.is_mp4_with(settings.multiplexer) { Brand::Mp4 } else { Brand::Mov };
         let audio = if settings.has_audio() { Some(AudioOut::new(project.clone(), seq, &settings, range)?) } else { None };
         let aenc: Option<Box<dyn AudioEncoder>> = match (&audio, settings.audio_codec()) {
@@ -286,6 +314,8 @@ impl Exporter {
             seq,
             project: project.clone(),
             vt: 0,
+            media_start: None,
+            warnings,
             at: None,
             t0: web_time::Instant::now(),
             settings,
@@ -409,9 +439,18 @@ impl Exporter {
         let file = Out::create(&self.settings)?;
         let mut opts = WriterOptions::new(self.brand);
         opts.metadata = self.settings.metadata.udta();
+        let media_start = self.venc.media_start();
+        let ts = self.venc.timescale();
+        if media_start.is_some() && ts > 0 {
+            // the B-frame edit list's duration exact in frames: in milliseconds, 45 frames at 29.97
+            // (1501.5 ms) would round down to less than 45 frames. The smallest multiple of the video
+            // timescale that is at least 1000, so 24 fps does not round the audio to 1/24 s either.
+            opts.movie_timescale = ts.checked_mul(1000u32.div_ceil(ts)).unwrap_or(ts);
+        }
+        self.media_start = media_start;
         let mut mux = Mp4Writer::new(file, opts).map_err(|e| ExportError::Io(e.to_string()))?;
         let mut vcfg = TrackConfig::new(self.venc.sample_entry(), self.venc.timescale());
-        vcfg.media_start = self.venc.media_start();
+        vcfg.media_start = media_start;
         self.vt = mux.add_track(vcfg).map_err(|e| ExportError::Io(e.to_string()))?;
         self.at = match (&self.audio, &self.aenc) {
             (None, _) => None,
@@ -486,6 +525,16 @@ impl Exporter {
         let mut tail = std::mem::take(&mut self.queued);
         tail.extend(self.venc.flush()?);
         self.write_video(tail)?;
+        // a B-frame encoder that wrote its offsets against a declared reorder depth knows the depth
+        // it used now: the presentation moves back to it (players that ignore edit lists are then
+        // late by the real reorder delay only)
+        let used = self.venc.media_start();
+        if used != self.media_start
+            && let Some(mux) = self.mux.as_mut()
+        {
+            let shift = self.media_start.unwrap_or(0).saturating_sub(used.unwrap_or(0));
+            mux.rebase_composition(self.vt, shift, used).map_err(|e| ExportError::Io(e.to_string()))?;
+        }
         self.write_audio(mixed)?;
         if let (Some(at), Some(a)) = (self.at, self.aenc.as_mut()) {
             let mux = self.mux.as_mut().ok_or_else(|| ExportError::Encode("internal: the container writer was not created".into()))?;
@@ -522,6 +571,7 @@ impl Exporter {
             bytes,
             render_fps: nframes as f64 / secs.max(1e-6),
             extra_files,
+            warnings: std::mem::take(&mut self.warnings),
         }))
     }
 

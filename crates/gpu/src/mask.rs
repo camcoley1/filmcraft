@@ -27,7 +27,7 @@ impl GpuMask {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("filmcraft-mask"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("mask.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(concat!(include_str!("mask_common.wgsl"), include_str!("mask.wgsl")).into()),
         });
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("mask"),

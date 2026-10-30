@@ -439,6 +439,7 @@
 	Show finished jobs	显示已完成的任务
 	Cancelled	已取消
 	Failed: {e}	失败：{e}
+	Done: {w}	已完成：{w}
 	Done	已完成
 	No background jobs.	无后台任务。
 	Recover Unsaved Changes	恢复未保存的更改
@@ -2914,6 +2915,9 @@
 	Maximum Bitrate	最大码率
 	Quality (CRF)	质量 (CRF)
 	Key Frame Distance	关键帧间隔
+	B-Frames	B 帧
+	Let the hardware encoder use B-frames	允许硬件编码器使用 B 帧
+	Smaller files at the same quality. Off keeps the frames in display order and lands closer to the target bitrate.	同等画质下文件更小。关闭时帧保持显示顺序，码率更接近目标。
 	Quality	质量
 	Render at Maximum Depth	以最大深度渲染
 	Use Maximum Render Quality	使用最大渲染质量

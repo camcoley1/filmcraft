@@ -450,6 +450,7 @@
 	Show finished jobs	Afficher les tâches terminées
 	Cancelled	Annulée
 	Failed: {e}	Échec : {e}
+	Done: {w}	Terminée : {w}
 	Done	Terminée
 	No background jobs.	Aucune tâche en arrière-plan.
 	Recover Unsaved Changes	Récupérer les modifications non enregistrées
@@ -2931,6 +2932,9 @@
 	Maximum Bitrate	Débit maximal
 	Quality (CRF)	Qualité (CRF)
 	Key Frame Distance	Intervalle entre images clés
+	B-Frames	Images B
+	Let the hardware encoder use B-frames	Autoriser l'encodeur matériel à utiliser des images B
+	Smaller files at the same quality. Off keeps the frames in display order and lands closer to the target bitrate.	Fichiers plus petits à qualité égale. Désactivé, les images restent dans l'ordre d'affichage et le débit est plus proche de la cible.
 	Quality	Qualité
 	Render at Maximum Depth	Rendu à la profondeur maximale
 	Use Maximum Render Quality	Utiliser la qualité de rendu maximale

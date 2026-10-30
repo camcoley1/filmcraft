@@ -374,6 +374,10 @@ pub struct ExportSettings {
     /// byte-reproducible like the built-in encoder's (`determinism_tests`).
     #[serde(default)]
     pub hardware_encoding: HardwareEncoding,
+    /// Let the hardware encoder reorder frames (B-frames) where it supports them (VideoToolbox H.264
+    /// and H.265 on macOS). Off by default: off, every frame is decoded in presentation order.
+    #[serde(default)]
+    pub hardware_b_frames: bool,
     /// Composite the exported frames on the GPU instead of the CPU reference renderer (Export ▸
     /// GPU rendering: Auto / Off, Off by default). Off = the CPU reference renderer exactly.
     #[serde(default)]
@@ -574,6 +578,7 @@ impl Default for ExportSettings {
             bitrate_mode: BitrateMode::default(),
             crf: DEFAULT_CRF,
             hardware_encoding: HardwareEncoding::default(),
+            hardware_b_frames: false,
             gpu_rendering: GpuRendering::Off,
             max_bitrate_kbps: None,
             adaptive_bitrate: None,
@@ -702,7 +707,7 @@ impl Progress {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Report {
     pub path: String,
     pub frames: u64,
@@ -712,6 +717,10 @@ pub struct Report {
     /// Further files written besides `path` (MXF OP-Atom audio files).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub extra_files: Vec<String>,
+    /// What the export did differently from what was asked, for the user (an HDR H.265 export
+    /// this machine could only write as tone-mapped SDR).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// A packet produced by a video encoder.
@@ -1033,6 +1042,30 @@ pub fn register_hdr_probe(format: Format, probe: fn() -> bool) {
     if !g.iter().any(|(f, p)| *f == format && std::ptr::fn_addr_eq(*p, probe)) {
         g.push((format, probe));
     }
+}
+
+type ReasonProbe = (Format, fn() -> Option<String>);
+
+fn hdr_reasons() -> &'static RwLock<Vec<ReasonProbe>> {
+    static P: OnceLock<RwLock<Vec<ReasonProbe>>> = OnceLock::new();
+    P.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Say how to find out why the registered encoder of `format` cannot write HDR here, when its
+/// [`register_hdr_probe`] probe says so (the export's warning then names it). Registering the same
+/// function twice is harmless.
+pub fn register_hdr_unavailable_reason(format: Format, reason: fn() -> Option<String>) {
+    let mut g = hdr_reasons().write().unwrap_or_else(|e| e.into_inner());
+    if !g.iter().any(|(f, r)| *f == format && std::ptr::fn_addr_eq(*r, reason)) {
+        g.push((format, reason));
+    }
+}
+
+/// Why `format` cannot write HDR here, if a registered encoder says (None: no reason known).
+pub fn hdr_unavailable_reason(format: Format) -> Option<String> {
+    let reasons: Vec<fn() -> Option<String>> =
+        hdr_reasons().read().unwrap_or_else(|e| e.into_inner()).iter().filter(|(f, _)| *f == format).map(|(_, r)| *r).collect();
+    reasons.into_iter().find_map(|r| r())
 }
 
 /// Whether a registered probe says the encoder of `format` writes HDR here (false without one).
@@ -1994,7 +2027,15 @@ pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, so
         progress.finished.store(true, Ordering::Relaxed);
         progress.set_status(format!("Done in {secs:.1}s"));
     }
-    Ok(Report { path: settings.path.clone(), frames: nframes, seconds: secs, bytes, render_fps: nframes as f64 / secs.max(1e-6), extra_files: Vec::new() })
+    Ok(Report {
+        path: settings.path.clone(),
+        frames: nframes,
+        seconds: secs,
+        bytes,
+        render_fps: nframes as f64 / secs.max(1e-6),
+        extra_files: Vec::new(),
+        warnings: Vec::new(),
+    })
 }
 
 #[cfg(test)]

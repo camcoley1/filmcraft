@@ -17,7 +17,7 @@ use filmcraft_isobmff::{CodecConfig, SampleEntry};
 use filmcraft_media::generators::GeneratorSource;
 use filmcraft_media::{DemoScene, MediaSource};
 use filmcraft_platform::hardware_encode::{config_for, hevc_available, videotoolbox_encoder_factory};
-use filmcraft_platform::videotoolbox_encode::{VtConfig, VtEncoder, VtProfile, VtRate};
+use filmcraft_platform::videotoolbox_encode::{VtColor, VtConfig, VtEncoder, VtProfile, VtRate};
 use filmcraft_project::{ItemKind, Label, MediaClip, MediaRef, Project, SequenceSettings, TrackKind};
 use filmcraft_render::SourceMap;
 use filmcraft_time::{FrameRate, Tick, TimeRange};
@@ -292,6 +292,8 @@ fn hostile_configurations_give_errors_not_crashes() {
         keyframe_interval: 30,
         profile: VtProfile::High,
         rate: VtRate::Vbr { target_kbps: 8000, max_kbps: 12_000 },
+        b_frames: false,
+        color: VtColor::Bt709,
     };
     let variants: Vec<(&str, VtConfig)> = vec![
         ("zero width", VtConfig { width: 0, ..base.clone() }),
@@ -466,7 +468,9 @@ fn hevc_declines_what_the_hardware_path_does_not_take() {
     assert_eq!((config.profile, config.keyframe_interval, config.rate), (VtProfile::HevcMain, 30, VtRate::Vbr { target_kbps: 6000, max_kbps: 9000 }));
     let declined = |s: &ExportSettings, what: &str| assert!(config_for(W, H, FPS, s).is_err(), "{what} must not use the hardware encoder");
     declined(&ExportSettings { bitrate_mode: BitrateMode::Vbr2Pass, ..ok.clone() }, "two-pass VBR");
-    declined(&ExportSettings { signal: filmcraft_export::ColorSignal::PQ, ..ok.clone() }, "HDR");
+    // HDR is Main 10 (BT.2020 + PQ / HLG); another HDR description is not written
+    declined(&ExportSettings { signal: filmcraft_export::ColorSignal { primaries: 1, transfer: 16, matrix: 1 }, ..ok.clone() }, "PQ outside BT.2020");
+    assert_eq!(config_for(W, H, FPS, &ExportSettings { signal: filmcraft_export::ColorSignal::PQ, ..ok.clone() }).unwrap().profile, VtProfile::HevcMain10);
     declined(&ExportSettings { pixel_aspect: Some((4, 3)), ..ok.clone() }, "non-square pixels");
     assert!(config_for(321, 181, FPS, &ok).is_err() && config_for(640, 361, FPS, &ok).is_err(), "odd sizes");
     assert!(config_for(W, H, FrameRate { num: 0, den: 1 }, &ok).is_err());
@@ -583,6 +587,8 @@ fn hevc_hostile_configurations_give_errors_not_crashes() {
         keyframe_interval: 30,
         profile: VtProfile::HevcMain,
         rate: VtRate::Vbr { target_kbps: 6000, max_kbps: 9000 },
+        b_frames: false,
+        color: VtColor::Bt709,
     };
     let variants: Vec<(&str, VtConfig)> = vec![
         ("zero width", VtConfig { width: 0, ..base.clone() }),
@@ -723,6 +729,8 @@ fn the_sessions_run_on_the_hardware_encoder() {
         keyframe_interval: 30,
         profile,
         rate: VtRate::Vbr { target_kbps: 6000, max_kbps: 9000 },
+        b_frames: false,
+        color: VtColor::Bt709,
     };
     for (name, profile) in [("H.264", VtProfile::High), ("HEVC", VtProfile::HevcMain)] {
         match VtEncoder::new(config(profile)) {

@@ -22,6 +22,17 @@ pub(crate) const FX_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Flo
 /// Box radii up to this many pixels are summed per output pixel; larger ones as a running sum.
 pub const BOX_PER_PIXEL_MAX: u32 = 32;
 
+/// Most pixels one dispatch of a per-pixel pass covers: larger images run a pass as several
+/// dispatches over bands of rows, so no single dispatch keeps the GPU busy for long (integrated
+/// GPUs, whose watchdog ends a dispatch that runs too long, run 4K grades as four bands).
+pub const BAND_PIXELS: u32 = 1 << 21;
+
+/// Most bytes of working textures one layer's effects may hold (Rgba32Float, the image read, the
+/// one written, and the saved ones). Beyond it the layer's effects render on the CPU instead of
+/// asking the device for more (integrated GPUs share system memory: a 4K masked grade needs four
+/// textures, about 530 MB; an 8K one would need 2 GB).
+pub const FX_TEXTURE_BUDGET: u64 = 1 << 30;
+
 const OP_BRIGHTNESS_CONTRAST: u32 = 1;
 const OP_PROC_AMP: u32 = 2;
 const OP_TINT: u32 = 3;
@@ -52,22 +63,89 @@ const OP_MIRROR: u32 = 28;
 const OP_OFFSET: u32 = 29;
 const OP_VIDEO_LIMITER: u32 = 30;
 const OP_LUMETRI: u32 = 31;
+const OP_LUMETRI_ADVANCED: u32 = 32;
+const OP_HSL_KEY: u32 = 33;
+const OP_HSL_MEDIAN: u32 = 34;
+const OP_HSL_APPLY: u32 = 35;
+const OP_MASK_MIX: u32 = 36;
+
+/// An effect's active masks as `fx.wgsl`'s `mask_coverage` reads them: the count, then per mask its
+/// [`MaskInfo`](mask_common.wgsl) fields (start, length, mode, inverted, feather, expansion, opacity,
+/// 0) and bounding box (min x, min y, max x, max y), then every polygon point (x, y).
+fn mask_data(masks: &[filmcraft_render::mask::FlatMask]) -> Vec<f32> {
+    let active: Vec<_> = masks.iter().filter(|m| m.mode.index() != 0).collect();
+    let mut head = vec![active.len() as f32, 0.0, 0.0, 0.0];
+    let mut pts: Vec<f32> = Vec::new();
+    for m in &active {
+        let start = pts.len() / 2;
+        let (mut lo, mut hi) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+        for p in &m.pts {
+            for k in 0..2 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        if m.pts.is_empty() {
+            (lo, hi) = ([0.0; 2], [0.0; 2]);
+        }
+        head.extend([start as f32, m.pts.len() as f32, m.mode.index() as f32, f32::from(u8::from(m.inverted)), m.feather, m.expansion, m.opacity, 0.0]);
+        head.extend([lo[0], lo[1], hi[0], hi[1]]);
+        pts.extend(m.pts.iter().flatten());
+    }
+    head.extend(pts);
+    head
+}
+
+/// Where the advanced pass's look LUT starts in its tables (after nine curves; `fx.wgsl`'s
+/// `LOOK_LUT_BASE`).
+const LOOK_LUT_BASE: usize = 9 * filmcraft_render::effects::CURVE_SAMPLES;
+
+/// A LUT as `fx.wgsl`'s `lut_apply` reads it: a header (shaper size, cube size, then the shaper's
+/// and the cube's domain min / max, each padded to four), the shaper's entries, the cube's entries
+/// (red fastest), three floats each.
+fn lut_data(lut: &filmcraft_color::Lut) -> Vec<f32> {
+    let sn = lut.shaper.as_ref().map_or(0, |s| s.data.len());
+    let cn = lut.cube.as_ref().map_or(0, |c| c.size);
+    let pad = |v: [f32; 3]| [v[0], v[1], v[2], 0.0];
+    let mut d = vec![sn as f32, cn as f32, 0.0, 0.0];
+    let (smin, smax) = lut.shaper.as_ref().map_or(([0.0; 3], [1.0; 3]), |s| (s.domain_min, s.domain_max));
+    let (cmin, cmax) = lut.cube.as_ref().map_or(([0.0; 3], [1.0; 3]), |c| (c.domain_min, c.domain_max));
+    for v in [smin, smax, cmin, cmax] {
+        d.extend(pad(v));
+    }
+    if let Some(s) = &lut.shaper {
+        d.extend(s.data.iter().flatten());
+    }
+    if let Some(c) = &lut.cube {
+        d.extend(c.data.iter().flatten());
+    }
+    d
+}
 
 type Target = (wgpu::Texture, wgpu::TextureView);
 
 pub(crate) struct FxStage {
     px: wgpu::ComputePipeline,
     run: wgpu::ComputePipeline,
+    median: wgpu::ComputePipeline,
     bgl: wgpu::BindGroupLayout,
     /// Draws a layer's source into a working texture (`composite.wgsl` `fs`, no blending).
     source: wgpu::RenderPipeline,
     pool: HashMap<(u32, u32), Vec<Target>>,
     used: HashSet<(u32, u32)>,
+    /// Working-texture bytes one layer may hold ([`FX_TEXTURE_BUDGET`]).
+    pub(crate) budget: u64,
+    /// Tests: refuse the next reserve (as an out-of-memory device would) / the next job.
+    #[cfg(test)]
+    pub(crate) fail_reserve: bool,
+    #[cfg(test)]
+    pub(crate) fail_job: bool,
 }
 
 /// One compute pass of a job.
 struct Dispatch {
     run: bool,
+    median: bool,
     bg: wgpu::BindGroup,
     groups: (u32, u32),
 }
@@ -84,15 +162,28 @@ pub(crate) struct FxJob {
 }
 
 /// One pass before texture routing: entry point, op code, integer and float parameters.
+///
+/// Passes that need an earlier image again (Unsharp's combine needs the image before its blur)
+/// use a stack of saved images: `save` keeps the image this pass reads until a later `restore`
+/// pass, which reads it as `aux` and lets it go. Saved images are never overwritten meanwhile,
+/// and saves nest.
 struct Step {
     run: bool,
+    /// HSL Denoise: its own entry point (`fx_median`), so the window's private array does not
+    /// weigh on every other per-pixel pass.
+    median: bool,
+    /// Work per pixel relative to a plain pass: the band of rows one dispatch covers shrinks by it.
+    cost: u32,
     code: u32,
     i1: [u32; 4],
     p: [f32; 24],
-    /// Unsharp combine: reads the blurred image and the original.
-    combine: bool,
-    /// A blur pass of Unsharp Mask (the original stays untouched until the combine).
-    unsharp_blur: bool,
+    /// Save the image this pass reads (before running it), this many times (nested groups that
+    /// start on the same pass each save it).
+    saves: u32,
+    /// Read the most recently saved image as `aux`, then drop it.
+    restore: bool,
+    /// Tables the pass reads (`data` in the shader: curve LUTs, 3D LUTs...); empty for most.
+    data: Vec<f32>,
 }
 
 fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
@@ -100,7 +191,19 @@ fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
     for (d, s) in q.iter_mut().zip(p) {
         *d = *s;
     }
-    Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false }
+    Step { run: false, median: false, cost: 1, code, i1, p: q, saves: 0, restore: false, data: Vec::new() }
+}
+
+/// Mark `group` (the passes of one op, in order) as working on a saved copy of its input: the
+/// first pass saves the image it reads, the last restores it.
+fn saving(mut group: Vec<Step>) -> Vec<Step> {
+    if let Some(first) = group.first_mut() {
+        first.saves += 1;
+    }
+    if let Some(last) = group.last_mut() {
+        last.restore = true;
+    }
+    group
 }
 
 /// Box passes along x (vertical = false) or y for the radii (radius 0 is a no-op on the CPU).
@@ -110,6 +213,61 @@ fn boxes(radii: &[u32], vertical: bool, repeat: bool, out: &mut Vec<Step>) {
         s.run = r > BOX_PER_PIXEL_MAX;
         out.push(s);
     }
+}
+
+/// Unsharp Mask: blur passes on a saved copy of the image, then the combine (blurred image as
+/// `src`, the original as `aux`). Without blur passes (radius 0) the combine compares the image
+/// with itself.
+fn unsharp(rx: &[u32], ry: &[u32], amount: f32, threshold: f32) -> Vec<Step> {
+    let mut g = Vec::new();
+    boxes(rx, false, true, &mut g);
+    boxes(ry, true, true, &mut g);
+    g.push(step(OP_UNSHARP, [0; 4], &[amount, threshold]));
+    saving(g)
+}
+
+/// Lumetri's look, Color Wheels and Curves in one pass: the curves' tables (unused slots stay 0)
+/// and the look LUT in `data`, which curves are on as bits of `i1.x`.
+fn advanced_step(a: &filmcraft_render::effects::LumetriAdvanced) -> Step {
+    let n = filmcraft_render::effects::CURVE_SAMPLES;
+    let mut data = vec![0.0f32; LOOK_LUT_BASE];
+    let mut bits = 0u32;
+    for (k, c) in a.curves.iter().enumerate() {
+        if let Some(c) = c.as_ref().filter(|c| c.len() == n) {
+            bits |= 1 << k;
+            data[k * n..(k + 1) * n].copy_from_slice(c);
+        }
+    }
+    if let Some(l) = &a.look_lut {
+        data.extend(lut_data(l));
+    }
+    let (w, on) = match &a.wheels {
+        Some(w) => (w.clone(), 1),
+        None => (filmcraft_render::effects::Wheels { rgb: [[0.0; 3]; 3], light: [0.0; 3] }, 0),
+    };
+    let [ws, wm, wh] = w.rgb;
+    let p = [a.look_k, ws[0], ws[1], ws[2], wm[0], wm[1], wm[2], wh[0], wh[1], wh[2], w.light[0], w.light[1], w.light[2]];
+    let mut s = step(OP_LUMETRI_ADVANCED, [bits, a.look, a.look_lut.is_some() as u32, on], &p);
+    s.data = data;
+    s
+}
+
+/// HSL Secondary on a saved copy of the image: the key, Denoise (median), Blur (box passes along
+/// rows, then columns, edges repeated) on the key, then the correction (key as `src`, image as `aux`).
+fn hsl_steps(h: &filmcraft_render::effects::HslSecondary) -> Vec<Step> {
+    let mut g = vec![step(OP_HSL_KEY, [0; 4], &[h.hc, h.hr, h.smin, h.lmin, h.lmax, h.soft])];
+    if let Some(r) = h.median_radius() {
+        let mut m = step(OP_HSL_MEDIAN, [r as u32, 0, 0, 0], &[h.denoise.min(1.0)]);
+        m.median = true;
+        // a (2r+1)² window sorted per pixel
+        m.cost = ((2 * r as u32 + 1).pow(2) / 16).max(1);
+        g.push(m);
+    }
+    let radii: Vec<u32> = h.blur_radii().into_iter().map(|r| r.min(u32::MAX as usize) as u32).collect();
+    boxes(&radii, false, true, &mut g);
+    boxes(&radii, true, true, &mut g);
+    g.push(step(OP_HSL_APPLY, [h.show_mask, 0, 0, 0], &[0.0, 0.0, 0.0, 0.0, h.htemp, h.htint, h.hsat, h.hshift]));
+    saving(g)
 }
 
 /// The passes of an op (empty: no-op). Unsharp's blur passes come first, then the combine.
@@ -143,15 +301,18 @@ fn steps(op: &FxOp) -> Vec<Step> {
                 out.push(step(OP_DIRECTIONAL, [*steps, 0, 0, 0], &[*dx, *dy]));
             }
         }
-        FxOp::Unsharp { rx, ry, amount, threshold } => {
-            boxes(rx, false, true, &mut out);
-            boxes(ry, true, true, &mut out);
-            for s in &mut out {
-                s.unsharp_blur = true;
+        FxOp::Unsharp { rx, ry, amount, threshold } => out.extend(unsharp(rx, ry, *amount, *threshold)),
+        FxOp::Masked { op, masks } => {
+            // the effect on a saved copy of the image, then the mix with it by the masks' coverage
+            let mut g = steps(op);
+            if !g.is_empty() {
+                let mut mix = step(OP_MASK_MIX, [0; 4], &[]);
+                mix.data = mask_data(masks);
+                // every edge of every mask, for the pixels near one
+                mix.cost = (masks.iter().map(|m| m.pts.len() as u32).sum::<u32>() / 64).max(1);
+                g.push(mix);
+                out.extend(saving(g));
             }
-            let mut s = step(OP_UNSHARP, [0; 4], &[*amount, *threshold]);
-            s.combine = true;
-            out.push(s);
         }
         FxOp::Crop { x0, x1, y0, y1, feather } => out.push(step(OP_CROP, [0; 4], &[*x0, *x1, *y0, *y1, *feather])),
         FxOp::Resample(r) => {
@@ -206,6 +367,10 @@ fn steps(op: &FxOp) -> Vec<Step> {
             vround,
             vfeather,
             aspect,
+            input_lut,
+            advanced,
+            hsl,
+            sharpen,
             ..
         } => {
             let ge = [gains[0] * exposure, gains[1] * exposure, gains[2] * exposure];
@@ -243,10 +408,60 @@ fn steps(op: &FxOp) -> Vec<Step> {
                 ht_k[2],
                 0.0,
             ];
-            out.push(step(OP_LUMETRI, [*creative_on as u32, *vignette_on as u32, 0, 0], &p));
+            let mut basic = step(OP_LUMETRI, [*creative_on as u32, *vignette_on as u32, input_lut.is_some() as u32, 0], &p);
+            if let Some(l) = input_lut {
+                basic.data = lut_data(l);
+            }
+            out.push(basic);
+            if let Some(a) = advanced {
+                out.push(advanced_step(a));
+            }
+            if let Some(h) = hsl {
+                out.extend(hsl_steps(h));
+            }
+            if let Some((rx, ry, amount)) = sharpen {
+                out.extend(unsharp(rx, ry, *amount, 0.0));
+            }
         }
     }
     out
+}
+
+/// A layer's effect passes, checked against the device: built once per frame by the compositor's
+/// pre-check ([`prepare`]), which sends the layer to the CPU when they do not fit, then recorded.
+pub(crate) struct Prepared {
+    steps: Vec<Step>,
+    /// Working textures: the one read, the one written, and the deepest nesting of saved images.
+    pub(crate) n: usize,
+    size: (u32, u32),
+}
+
+/// The passes of `fx` if the GPU stage can run them on `device`: the working image fits in a
+/// texture, its working textures within `budget` bytes ([`FX_TEXTURE_BUDGET`]), every table within
+/// a storage binding. None: render the layer's effects on the CPU.
+pub(crate) fn prepare(device: &wgpu::Device, fx: &LayerFx, budget: u64) -> Option<Prepared> {
+    let (w, h) = (fx.size.0.max(1), fx.size.1.max(1));
+    let limits = device.limits();
+    if w > limits.max_texture_dimension_2d || h > limits.max_texture_dimension_2d {
+        return None;
+    }
+    let steps: Vec<Step> = fx.ops.iter().flat_map(steps).collect();
+    let mut depth = 0usize;
+    let mut deepest = 0usize;
+    for s in &steps {
+        depth += s.saves as usize;
+        deepest = deepest.max(depth);
+        depth = depth.checked_sub(usize::from(s.restore))?;
+    }
+    let n = deepest + 2;
+    let bytes = (n as u64).saturating_mul(u64::from(w)).saturating_mul(u64::from(h)).saturating_mul(16);
+    if bytes > budget {
+        return None;
+    }
+    if steps.iter().any(|s| (s.data.len() as u64).saturating_mul(4) > limits.max_storage_buffer_binding_size) {
+        return None;
+    }
+    Some(Prepared { steps, n, size: (w, h) })
 }
 
 impl FxStage {
@@ -255,6 +470,7 @@ impl FxStage {
     pub(crate) fn supported(device: &wgpu::Device) -> bool {
         let l = device.limits();
         l.max_storage_textures_per_shader_stage >= 1
+            && l.max_storage_buffers_per_shader_stage >= 1
             && l.max_compute_invocations_per_workgroup >= 256
             && l.max_compute_workgroup_size_x >= 64
             && l.max_compute_workgroup_size_y >= 16
@@ -264,7 +480,7 @@ impl FxStage {
     pub(crate) fn new(device: &wgpu::Device, composite: &wgpu::ShaderModule, layer_bgl: &wgpu::BindGroupLayout) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("filmcraft-fx"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("fx.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(concat!(include_str!("fx.wgsl"), include_str!("mask_common.wgsl")).into()),
         });
         let tex = |binding| wgpu::BindGroupLayoutEntry {
             binding,
@@ -297,6 +513,16 @@ impl FxStage {
                     count: None,
                 },
                 tex(3),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("fx"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
@@ -331,7 +557,20 @@ impl FxStage {
             multiview_mask: None,
             cache: None,
         });
-        Self { px: compute("fx_px"), run: compute("fx_run"), bgl, source, pool: HashMap::new(), used: HashSet::new() }
+        Self {
+            px: compute("fx_px"),
+            run: compute("fx_run"),
+            median: compute("fx_median"),
+            bgl,
+            source,
+            pool: HashMap::new(),
+            used: HashSet::new(),
+            budget: FX_TEXTURE_BUDGET,
+            #[cfg(test)]
+            fail_reserve: false,
+            #[cfg(test)]
+            fail_job: false,
+        }
     }
 
     /// Start a frame: pooled textures of sizes no layer uses by [`end_frame`](Self::end_frame)
@@ -378,72 +617,120 @@ impl FxStage {
     /// uniforms map the frame onto the working image). None when the working image does not fit
     /// in a texture (the layer is then drawn without its effects — never larger than the source
     /// frame, which would not have uploaded either).
+    /// Reserve the working textures of `p` (pooled for the frame), with an out-of-memory error
+    /// scope around the allocation: false when the device refuses, and the caller renders the
+    /// layer's effects on the CPU instead (the session's GPU compositing carries on).
+    pub(crate) fn reserve(&mut self, device: &wgpu::Device, p: &Prepared) -> bool {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_reserve) {
+            return false;
+        }
+        let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let got = self.targets(device, p.size, p.n).len();
+        match crate::poll_now(scope.pop()) {
+            Some(None) => got >= p.n,
+            Some(Some(e)) => {
+                log::warn!("GPU effects of a {}x{} layer need more memory than the device has, rendering them on the CPU: {e}", p.size.0, p.size.1);
+                // let the failed textures go, so a later frame does not reuse them
+                self.pool.remove(&p.size);
+                false
+            }
+            None => false,
+        }
+    }
+
     pub(crate) fn job(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        fx: &LayerFx,
+        p: &Prepared,
         source_bg: wgpu::BindGroup,
         dummy: &wgpu::TextureView,
     ) -> Option<FxJob> {
-        let (w, h) = (fx.size.0.max(1), fx.size.1.max(1));
-        let max = device.limits().max_texture_dimension_2d;
-        if w > max || h > max {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_job) {
             return None;
         }
-        let all: Vec<Step> = fx.ops.iter().flat_map(steps).collect();
-        let n = if all.iter().any(|s| s.combine) { 3 } else { 2 };
+        let (w, h) = p.size;
+        let (all, n) = (&p.steps, p.n);
         let targets = self.targets(device, (w, h), n);
         let views: Vec<wgpu::TextureView> = targets.iter().map(|t| t.1.clone()).collect();
+        // passes without tables share one (the binding needs a buffer)
+        let empty = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fx-data-empty"),
+            size: 16,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         let mut dispatches = Vec::with_capacity(all.len());
         let mut cur = 0usize;
-        // Unsharp: the image its blur started from (kept while its blur passes run)
-        let mut orig: Option<usize> = None;
-        for s in &all {
-            // (an Unsharp without blur passes, radius 0, combines the original with itself)
-            if (s.unsharp_blur || s.combine) && orig.is_none() {
-                orig = Some(cur);
+        let mut saved: Vec<usize> = Vec::new();
+        for s in all {
+            for _ in 0..s.saves {
+                saved.push(cur);
             }
-            let keep = if s.unsharp_blur || s.combine { orig } else { None };
-            let dst = (0..n).find(|k| *k != cur && Some(*k) != keep)?;
-            let aux = match (s.combine, orig) {
-                (true, Some(o)) => views.get(o)?,
-                _ => dummy,
-            };
-            let mut bytes = Vec::with_capacity(128);
-            for v in [s.code, w, h, 0].iter().chain(&s.i1) {
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
-            for v in &s.p {
-                bytes.extend_from_slice(&v.to_le_bytes());
-            }
-            let buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fx-u"),
-                size: bytes.len() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            queue.write_buffer(&buf, 0, &bytes);
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("fx"),
-                layout: &self.bgl,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(views.get(cur)?) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(views.get(dst)?) },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(aux) },
-                ],
-            });
-            let groups = if s.run {
-                let lines = if s.i1[2] != 0 { w } else { h };
-                (lines.div_ceil(64), 1)
+            let dst = (0..n).find(|k| *k != cur && !saved.contains(k))?;
+            let aux = if s.restore { views.get(*saved.last()?)? } else { dummy };
+            let data = if s.data.is_empty() {
+                empty.clone()
             } else {
-                (w.div_ceil(16), h.div_ceil(16))
+                let size = (s.data.len() * 4) as u64;
+                if size > device.limits().max_storage_buffer_binding_size {
+                    return None;
+                }
+                let d = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("fx-data"),
+                    size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let raw: Vec<u8> = s.data.iter().flat_map(|v| v.to_le_bytes()).collect();
+                queue.write_buffer(&d, 0, &raw);
+                d
             };
-            dispatches.push(Dispatch { run: s.run, bg, groups });
+            // per-pixel passes over bands of rows (`BAND_PIXELS`); a running-sum pass is one
+            // invocation per line already
+            let band = if s.run { h } else { (BAND_PIXELS / s.cost.max(1) / w).max(16).next_multiple_of(16).min(h) };
+            let mut y0 = 0;
+            while y0 < h {
+                let rows = band.min(h - y0);
+                let mut bytes = Vec::with_capacity(128);
+                for v in [s.code, w, h, y0].iter().chain(&s.i1) {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                for v in &s.p {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("fx-u"),
+                    size: bytes.len() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                queue.write_buffer(&buf, 0, &bytes);
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("fx"),
+                    layout: &self.bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(views.get(cur)?) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(views.get(dst)?) },
+                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(aux) },
+                        wgpu::BindGroupEntry { binding: 4, resource: data.as_entire_binding() },
+                    ],
+                });
+                let groups = if s.run {
+                    let lines = if s.i1[2] != 0 { w } else { h };
+                    (lines.div_ceil(64), 1)
+                } else {
+                    (w.div_ceil(16), rows.div_ceil(16))
+                };
+                dispatches.push(Dispatch { run: s.run, median: s.median, bg, groups });
+                y0 += rows;
+            }
             cur = dst;
-            if s.combine {
-                orig = None;
+            if s.restore {
+                saved.pop();
             }
         }
         Some(FxJob {
@@ -480,7 +767,13 @@ impl FxStage {
         }
         let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("fx"), timestamp_writes: None });
         for d in &job.dispatches {
-            pass.set_pipeline(if d.run { &self.run } else { &self.px });
+            pass.set_pipeline(if d.run {
+                &self.run
+            } else if d.median {
+                &self.median
+            } else {
+                &self.px
+            });
             pass.set_bind_group(0, &d.bg, &[]);
             pass.dispatch_workgroups(d.groups.0, d.groups.1, 1);
         }

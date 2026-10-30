@@ -1110,6 +1110,7 @@
 	Faded Print	바랜 인화
 	Fades	페이드
 	Failed: {e}	실패: {e}
+	Done: {w}	완료: {w}
 	Falloff	감쇠
 	Far Away	먼 거리
 	Fast	빠름
@@ -1591,6 +1592,9 @@
 	Key	키
 	Key Color	키 색상
 	Key Frame Distance	키프레임 간격
+	B-Frames	B 프레임
+	Let the hardware encoder use B-frames	하드웨어 인코더에서 B 프레임 사용
+	Smaller files at the same quality. Off keeps the frames in display order and lands closer to the target bitrate.	같은 화질에서 파일이 작아집니다. 끄면 프레임이 표시 순서대로 유지되고 비트 전송률이 목표에 더 가까워집니다.
 	Key:	키:
 	Keyboard Shortcuts	키보드 단축키
 	Keyboard Shortcuts…	키보드 단축키…
