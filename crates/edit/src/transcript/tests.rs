@@ -623,3 +623,76 @@ fn fan_out_of_nested_sequences_is_bounded() {
     assert!(start.elapsed().as_secs() < 20, "{:?}", start.elapsed());
     assert!(!words.is_empty());
 }
+
+fn key(w: &SeqWord) -> (i64, i64, String, usize) {
+    (w.start.0, w.end.0, w.text.clone(), w.track)
+}
+
+/// A small budget is spent only on words that can be heard: words under a higher track's clip are
+/// dropped before they are counted, so a cap equal to the audible words keeps every one of them.
+#[test]
+fn covered_duplicates_do_not_use_up_the_budget_of_later_speech() {
+    let tr = transcripts();
+    let (mut p, inner, outer) = nest(0.0, 0.0, 10.0);
+    // A1: the interview directly for the first 5 s; A2: the same audio through a nest for 10 s,
+    // which the clip above hides for its first 5 s
+    p.sequence_mut(outer).unwrap().audio_tracks[0].items.push(clip(10, 0.0, 5.0, 0.0));
+    p.sequence_mut(outer).unwrap().audio_tracks[1].items.push(nested_clip(11, inner, 0.0, 10.0, 0.0));
+    let find = |id: ItemId| p.sequence(id);
+    let seq = p.sequence(outer).unwrap();
+    let all = sequence_words_budget(seq, &tr, Some(&find), MAX_SEQ_WORDS);
+    // what is audible: A1's words in the first 5 s, A2's words after them
+    assert!(all.iter().any(|w| w.track == 0) && all.iter().any(|w| w.track == 1));
+    assert!(all.iter().filter(|w| w.track == 1).all(|w| w.start >= s(4.0)), "A2 is heard only where A1 is silent");
+    let n = all.len();
+    let exact = sequence_words_budget(seq, &tr, Some(&find), n);
+    assert_eq!(exact.iter().map(key).collect::<Vec<_>>(), all.iter().map(key).collect::<Vec<_>>(), "a cap equal to the audible words loses none");
+    // one word less: exactly one is left out, never a covered one taking its place
+    let short = sequence_words_budget(seq, &tr, Some(&find), n - 1);
+    assert_eq!(short.len(), n - 1);
+    assert!(short.iter().all(|w| all.iter().any(|a| key(a) == key(w))), "only audible words survive");
+}
+
+/// Trims of the nests above are intersected before anything is counted: a grandchild sequence read
+/// through two trims yields exactly the words inside both, and a cap of that many keeps them all.
+#[test]
+fn nested_trims_are_intersected_before_the_budget_is_spent() {
+    let tr = transcripts();
+    let mut p = Project::new("t");
+    let settings = SequenceSettings { frame_rate: R, ..Default::default() };
+    let g = p.new_sequence("g", settings.clone(), 1, 1, None);
+    let m = p.new_sequence("m", settings.clone(), 1, 1, None);
+    let outer = p.new_sequence("outer", settings, 1, 1, None);
+    // g: the interview from 0; m: g from its 1 s on for 8 s (so m time t is g time t + 1);
+    // outer: m from its 3 s on for 4 s, at 20 s (so m time 3..7 is outer 20..24)
+    p.sequence_mut(g).unwrap().audio_tracks[0].items.push(clip(1, 0.0, 10.0, 0.0));
+    p.sequence_mut(m).unwrap().audio_tracks[0].items.push(nested_clip(2, g, 0.0, 8.0, 1.0));
+    p.sequence_mut(outer).unwrap().audio_tracks[0].items.push(nested_clip(3, m, 20.0, 4.0, 3.0));
+    let find = |id: ItemId| p.sequence(id);
+    let seq = p.sequence(outer).unwrap();
+    let all = sequence_words_budget(seq, &tr, Some(&find), MAX_SEQ_WORDS);
+    // the words whose middle falls in media time 4..8 (m time 3..7 is g time 4..8)
+    let t = fixture();
+    let expect: Vec<usize> = t
+        .words
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| Tick(w.start.0 + (w.end.0 - w.start.0) / 2) >= s(4.0) && Tick(w.start.0 + (w.end.0 - w.start.0) / 2) < s(8.0))
+        .map(|(i, _)| i)
+        .collect();
+    let mut got: Vec<usize> = all.iter().map(|w| w.index).collect();
+    got.sort();
+    assert!(!expect.is_empty() && expect.len() < t.words.len());
+    assert_eq!(got, expect);
+    // outer time = media time + 16 for words inside both trims
+    for w in &all {
+        let src = &t.words[w.index];
+        if src.start >= s(4.0) && src.end <= s(8.0) {
+            assert_eq!((w.start, w.end), (src.start + s(16.0), src.end + s(16.0)), "word {}", w.index);
+        }
+        assert!(w.start >= s(20.0) && w.end <= s(24.0));
+    }
+    let exact = sequence_words_budget(seq, &tr, Some(&find), all.len());
+    assert_eq!(exact.iter().map(|w| w.index).collect::<Vec<_>>(), all.iter().map(|w| w.index).collect::<Vec<_>>());
+    assert_eq!(sequence_words_budget(seq, &tr, Some(&find), all.len() - 1).len(), all.len() - 1);
+}

@@ -86,9 +86,11 @@ fn target(s: &Session, p: &Value) -> Result<Target> {
     let (track, clip) = anchor;
     let items = &q.track(track).ok_or(EngineError::NoSequence)?.items;
     let at = items.iter().position(|i| i.id == clip.id).ok_or(EngineError::NoSequence)?;
-    // a piece of the run: plain speed, and it picks up exactly where the one before it stopped
+    // a piece of the run: enabled, plain speed, and it picks up exactly where the one before it stopped (both ends are checked, so the run grows neither way into a disabled or changed piece)
     let plain = |i: &TrackItem| (i.speed - 1.0).abs() <= 1e-9 && !i.reverse && i.frame_hold.is_none();
-    let follows = |a: &TrackItem, b: &TrackItem| a.item == b.item && usable(b) && plain(b) && a.end() == b.start && a.source_out() == b.source_in;
+    let follows = |a: &TrackItem, b: &TrackItem| {
+        a.item == b.item && usable(a) && plain(a) && usable(b) && plain(b) && a.end() == b.start && a.source_out() == b.source_in
+    };
     if !plain(&clip) {
         return Err(bad(cmd, format!("clip {} has a speed change, reverse or frame hold: reset it first", clip.id.0)));
     }

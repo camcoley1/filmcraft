@@ -96,19 +96,53 @@ fn sequence_words_budget<'a>(seq: &'a Sequence, transcripts: &Transcripts, neste
     out
 }
 
-/// The words of `seq` whose time overlaps `window` (all, with `None`).
+/// Whether `t` is inside one of `vis` (everywhere, with `None`).
+fn visible(vis: Option<&[(Tick, Tick)]>, t: Tick) -> bool {
+    vis.is_none_or(|v| v.iter().any(|(a, b)| *a <= t && t < *b))
+}
+
+/// The parts of `r` that are inside `vis` (all of it, with `None`) and not under a claimed range.
+fn visible_parts(r: (Tick, Tick), vis: Option<&[(Tick, Tick)]>, claimed: &[TimeRange]) -> Vec<(Tick, Tick)> {
+    let mut parts: Vec<(Tick, Tick)> = match vis {
+        None => vec![r],
+        Some(v) => v.iter().map(|(a, b)| ((*a).max(r.0), (*b).min(r.1))).filter(|(a, b)| a < b).collect(),
+    };
+    for c in claimed {
+        let (cs, ce) = (c.start, c.end());
+        parts = parts
+            .into_iter()
+            .flat_map(|(s, e)| {
+                if ce <= s || cs >= e {
+                    return vec![(s, e)];
+                }
+                let mut out = Vec::new();
+                if s < cs {
+                    out.push((s, cs));
+                }
+                if ce < e {
+                    out.push((ce, e));
+                }
+                out
+            })
+            .collect();
+    }
+    parts
+}
+
+/// The words of `seq` whose midpoint is inside `vis` (everywhere, with `None`): the places a word
+/// can still be heard, in this sequence's time, after every ancestor's track precedence and trims.
+/// A word that is not visible is dropped before it is counted against the budget.
 fn collect_words<'a>(
     seq: &'a Sequence,
     transcripts: &Transcripts,
     nested: Option<Nested<'a>>,
     depth: usize,
     budget: &mut Budget,
-    window: Option<(Tick, Tick)>,
+    vis: Option<&[(Tick, Tick)]>,
 ) -> Vec<SeqWord> {
     let mut out: Vec<SeqWord> = Vec::new();
     // timeline ranges already served by a higher track's transcribed clips
     let mut claimed: Vec<TimeRange> = Vec::new();
-    let outside = |a: Tick, b: Tick| window.is_some_and(|(w0, w1)| b <= w0 || a >= w1);
     for (ti, track) in seq.audio_tracks.iter().enumerate() {
         let mut mine = Vec::new();
         for it in &track.items {
@@ -124,7 +158,7 @@ fn collect_words<'a>(
                     let w = &tr.words[wi];
                     let (a, b) = (to_tl(w.start), to_tl(w.end.max(w.start)));
                     let mid = Tick(a.0 + (b.0 - a.0) / 2);
-                    if mid < it.start || mid >= it.end() || claimed.iter().any(|r| r.contains(mid)) || outside(a, b) {
+                    if mid < it.start || mid >= it.end() || claimed.iter().any(|r| r.contains(mid)) || !visible(vis, mid) {
                         continue;
                     }
                     if budget.words == 0 {
@@ -146,16 +180,23 @@ fn collect_words<'a>(
             } else if let Some(find) = nested
                 && depth < MAX_NEST_DEPTH
                 && budget.reads > 0
-                && !outside(it.start, it.end())
                 && let Some(inner) = find(it.item)
             {
+                // where this clip can still be heard (its range, the ancestors' trims, the tracks
+                // above), carried into the nested sequence's own time
+                let parts = visible_parts((it.start, it.end()), vis, &claimed);
+                if parts.is_empty() {
+                    continue;
+                }
                 budget.reads -= 1;
-                let inner_words = collect_words(inner, transcripts, nested, depth + 1, budget, Some((it.source_in, media_end)));
+                let into_inner = |t: Tick| it.source_in + ticks((t - it.start).0 as f64 * speed);
+                let inner_vis: Vec<(Tick, Tick)> = parts.iter().map(|(s, e)| (into_inner(*s), into_inner(*e))).collect();
+                let inner_words = collect_words(inner, transcripts, nested, depth + 1, budget, Some(&inner_vis));
                 let mut served = false;
                 for w in inner_words {
                     let (a, b) = (to_tl(w.start.max(it.source_in)), to_tl(w.end.min(media_end)));
                     let mid = Tick(a.0 + (b.0 - a.0) / 2);
-                    if mid < it.start || mid >= it.end() || claimed.iter().any(|r| r.contains(mid)) || outside(a, b) {
+                    if mid < it.start || mid >= it.end() {
                         continue;
                     }
                     served = true;

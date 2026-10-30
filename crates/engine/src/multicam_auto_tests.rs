@@ -474,3 +474,40 @@ fn a_run_stops_at_gaps_source_jumps_disabled_and_changed_pieces() {
     let e = pieces_after(|v| v[1].speed = 2.0, 1).unwrap_err();
     assert!(e.contains("speed change"), "{e}");
 }
+
+/// Pieces the run refuses to take stay exactly as they were, before the anchor as well as after it.
+fn run_leaves_alone(mutate: impl FnOnce(&mut Vec<filmcraft_project::TrackItem>), anchor: usize, excluded: &[usize], pieces: u64) {
+    let (mut s, items, _, _) = mc_session("camera1");
+    set_transcript(&mut s, items[0], &[(0.0, 0.5, 0), (0.6, 1.0, 0), (1.5, 2.0, 1), (2.1, 2.5, 1), (3.0, 3.5, 0)]);
+    s.execute("multicam.autoSwitch", json!({"minShotSeconds": 0.5, "leadSeconds": LEAD})).unwrap();
+    let seq = s.state.active_sequence.unwrap();
+    let mut p = (*s.project).clone();
+    mutate(&mut p.sequence_mut(seq).unwrap().video_tracks[0].items);
+    let before = p.sequence(seq).unwrap().video_tracks[0].items.clone();
+    let id = before[anchor].id.0;
+    s.project = std::sync::Arc::new(p);
+    // a different transcript, so the run would change every piece it takes
+    set_transcript(&mut s, items[0], &[(0.0, 0.9, 1), (1.5, 2.0, 0), (2.1, 3.9, 1)]);
+    let r = s.execute("multicam.autoSwitch", json!({"clip": id, "minShotSeconds": 0.5, "leadSeconds": LEAD})).unwrap();
+    assert_eq!(r["pieces"].as_u64(), Some(pieces), "{r}");
+    let after = &s.active_sequence().unwrap().video_tracks[0].items;
+    for &k in excluded {
+        let b = &before[k];
+        let a = after.iter().find(|c| c.id == b.id).expect("the piece is still there");
+        assert_eq!((a.start, a.duration, a.multicam, a.enabled, a.speed), (b.start, b.duration, b.multicam, b.enabled, b.speed), "piece {k} was changed");
+    }
+}
+
+#[test]
+fn pieces_before_the_anchor_are_checked_like_the_ones_after_it() {
+    let frame = FrameRate::FPS_24.frame_duration();
+    // a disabled predecessor is not taken into the run (the anchor is piece 1: the run is 1..=2)
+    run_leaves_alone(|v| v[0].enabled = false, 1, &[0], 2);
+    // a predecessor with a speed change, and one that does not continue the source
+    run_leaves_alone(|v| v[0].speed = 2.0, 1, &[0], 2);
+    run_leaves_alone(|v| v[1].source_in += frame, 2, &[0, 1], 1);
+    // a disabled piece two back stops the run there; the one next to the anchor is taken
+    run_leaves_alone(|v| v[0].enabled = false, 2, &[0], 2);
+    // the other way round still works: a disabled successor is left alone
+    run_leaves_alone(|v| v[2].enabled = false, 0, &[2], 2);
+}

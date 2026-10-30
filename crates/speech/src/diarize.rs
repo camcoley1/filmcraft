@@ -400,6 +400,9 @@ pub fn diarize_report(audio: &[f32], t: &mut Transcript, p: &Params, cancel: &dy
     if cl.live == 1 {
         return if cancel() { None } else { one(t) };
     }
+    if cancel() {
+        return None;
+    }
     // number speakers by first appearance
     let mut label = vec![0usize; n];
     for c in (0..n).filter(|&c| cl.active[c]) {
@@ -624,6 +627,15 @@ mod tests {
         let mut t = base.clone();
         assert!(diarize_with(&noise(16_000, 1), &mut t, &Params::default(), &|| true).is_none());
         assert_eq!(t, base);
+        // the entry check says no, the check before the single-chunk commit says yes
+        let calls = std::cell::Cell::new(0usize);
+        let mut t = base.clone();
+        let r = diarize_with(&noise(16_000, 1), &mut t, &Params::default(), &|| {
+            calls.set(calls.get() + 1);
+            calls.get() > 1
+        });
+        assert!(r.is_none() && calls.get() == 2, "{r:?} after {} checks", calls.get());
+        assert_eq!(t, base);
         let mut t = base.clone();
         assert_eq!(diarize_with(&noise(16_000, 1), &mut t, &Params::default(), &|| false), Some(1));
 
@@ -758,5 +770,51 @@ mod tests {
         let t0 = std::time::Instant::now();
         let n = diarize_with(&audio, &mut t, &Params::default(), &|| false).unwrap();
         eprintln!("{hours} h: {} words, {n} speakers, {:.1} s", t.words.len(), t0.elapsed().as_secs_f64());
+    }
+
+    /// With several speakers left, the last check comes before the labels are written: cancelling
+    /// there changes nothing.
+    #[test]
+    fn cancelling_just_before_the_labels_are_written_changes_nothing() {
+        let a = |s| voice(110.0, [(600.0, 90.0), (1100.0, 120.0)], 2.0, s);
+        let b = |s| voice(230.0, [(400.0, 80.0), (2600.0, 150.0)], 2.0, s);
+        let mut audio = Vec::new();
+        let mut words = Vec::new();
+        for k in 0..6u32 {
+            let t0 = audio.len() as f64 / 16_000.0;
+            audio.extend(if k % 2 == 0 { a(k) } else { b(k) });
+            words.push(Word::new(format!("w{k}"), seconds_tick(t0), seconds_tick(t0 + 1.8)));
+            audio.extend(vec![0f32; 8000]);
+        }
+        let base = Transcript { words, ..Default::default() };
+        let calls = std::cell::Cell::new(0usize);
+        let mut full = base.clone();
+        let n = diarize_with(&audio, &mut full, &Params::default(), &|| {
+            calls.set(calls.get() + 1);
+            false
+        });
+        assert_eq!(n, Some(2), "two speakers survive");
+        let total = calls.get();
+        for at in [total - 1, total - 2] {
+            let seen = std::cell::Cell::new(0usize);
+            let mut t = base.clone();
+            let r = diarize_with(&audio, &mut t, &Params::default(), &|| {
+                seen.set(seen.get() + 1);
+                seen.get() > at
+            });
+            assert!(r.is_none(), "cancelled at check {at} of {total}");
+            assert_eq!(t, base, "nothing was written");
+        }
+        // and one check later nothing is cancelled any more
+        let mut t = base.clone();
+        let seen = std::cell::Cell::new(0usize);
+        assert_eq!(
+            diarize_with(&audio, &mut t, &Params::default(), &|| {
+                seen.set(seen.get() + 1);
+                seen.get() > total
+            }),
+            Some(2)
+        );
+        assert_eq!(t, full);
     }
 }
