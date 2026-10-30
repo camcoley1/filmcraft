@@ -764,7 +764,8 @@ impl GpuCompositor {
                 continue;
             }
             prepared.push(None);
-            let img = filmcraft_render::plan::effect_image(&l.frame, lfx);
+            // with the layer's input transform (HDR / wide-gamut sources), as the CPU reference
+            let img = filmcraft_render::plan::effect_image_with(&l.frame, lfx, l.input.as_deref());
             cpu_fx.push(Some(PlanLayer::new(Arc::new(VideoFrame::rgba_f32(img.w as u32, img.h as u32, img.px)), l.matrix, l.opacity, l.blend)));
         }
         let resolved: Vec<&PlanLayer> = layers.iter().zip(&cpu_fx).map(|(l, c)| c.as_ref().unwrap_or(l)).collect();
@@ -877,7 +878,7 @@ impl GpuCompositor {
             if let Some(l) = again.get_mut(i)
                 && let Some(lfx) = l.fx.take()
             {
-                let img = filmcraft_render::plan::effect_image(&l.frame, &lfx);
+                let img = filmcraft_render::plan::effect_image_with(&l.frame, &lfx, l.input.as_deref());
                 *l = PlanLayer::new(Arc::new(VideoFrame::rgba_f32(img.w as u32, img.h as u32, img.px)), l.matrix, l.opacity, l.blend);
             }
             return self.render_plan(&FramePlan::Layers { width: w as usize, height: h as usize, layers: again }, None, clear, resolve);

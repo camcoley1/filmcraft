@@ -1332,56 +1332,73 @@ fn no_preparation_failure_drops_a_grade() {
         e.masks = effect_masks(f64::from(lw), f64::from(lh));
         FxOp::eval_masked(&e, &cx(Tick::ZERO, 1.0), lw as usize, lh as usize).unwrap()
     };
-    let plan = FramePlan::Layers {
-        width: w,
-        height: h,
-        layers: vec![PlanLayer {
-            frame: yuv_frame(320, 180),
+    // an 8-bit SDR layer, and a 10-bit PQ layer whose input transform (HDR to the SDR working
+    // space) the CPU fallback must apply too
+    let pq = {
+        use filmcraft_color::{ColorInfo, ColorPipeline, ColorSpace, InputTransform, Primaries};
+        let n = w * h;
+        let y: Vec<u16> = (0..n).map(|i| (64 + (i % w) * 876 / w) as u16).collect();
+        let cb: Vec<u16> = (0..n).map(|i| (300 + (i / w) * 400 / h) as u16).collect();
+        let cr: Vec<u16> = (0..n).map(|i| (700 - (i % w) * 300 / w) as u16).collect();
+        let color = ColorInfo { matrix: Matrix::Bt2020Ncl, transfer: Transfer::Pq, primaries: Primaries::Bt2020, range: Range::Limited };
+        let data = PixelData::Yuv16 { planes: [Arc::new(y), Arc::new(cb), Arc::new(cr)], chroma: Chroma::C444, bits: 10, alpha: None };
+        let frame = Arc::new(VideoFrame { width: w as u32, height: h as u32, data, color, par: (1, 1), pts: Default::default() });
+        let t = Arc::new(InputTransform::new(ColorSpace::from_info(&color), color.range, &ColorPipeline::REC709, None));
+        (frame, Some(t))
+    };
+    for (kind, (frame, input)) in [("SDR 8-bit", (yuv_frame(320, 180), None)), ("PQ 10-bit with an input transform", pq)] {
+        let layer = PlanLayer {
+            frame,
             matrix: Affine::IDENTITY,
             opacity: 1.0,
             blend: Blend::Normal,
             fx: Some(Arc::new(LayerFx { size: (320, 180), decimation: 1, ops: vec![grade(320, 180)] })),
-            input: None,
-        }],
-    };
-    let cpu = execute_cpu(&plan).over_black_rgba8();
-    let FramePlan::Layers { layers, .. } = &plan else { unreachable!() };
-    let bare = FramePlan::Layers { width: w, height: h, layers: vec![PlanLayer { fx: None, ..layers[0].clone() }] };
-    let ungraded = execute_cpu(&bare).over_black_rgba8();
-    let all = vec![true; w * h];
-    let (_, graded_mean, _) = stats8(&cpu, &ungraded, &all);
-    assert!(graded_mean > 5.0, "the grade changes the picture: {graded_mean}");
-    let check = |what: &str, c: &mut GpuCompositor| {
-        c.composite(&plan);
-        let (_, _, gpu) = c.read_output().expect("readback");
-        let (p99, mean, _) = stats8(&cpu, &gpu, &all);
-        eprintln!("{what}: against the CPU render p99 {p99} mean {mean:.3}");
-        assert!(p99 <= 6 && mean < 1.5, "{what}: p99 {p99} mean {mean}: not the graded picture");
-    };
-    let mut c = GpuCompositor::new(&dev, &q);
-    check("GPU stage", &mut c);
-    c.fx.as_mut().unwrap().budget = 1;
-    check("working textures over the budget (CPU)", &mut c);
-    c.fx.as_mut().unwrap().budget = fx::FX_TEXTURE_BUDGET;
-    c.fx.as_mut().unwrap().fail_reserve = true;
-    check("device refuses the working textures (CPU)", &mut c);
-    c.fx.as_mut().unwrap().fail_job = true;
-    check("recording the passes fails (frame rendered again, layer on the CPU)", &mut c);
-    assert!(!c.fx.as_ref().unwrap().fail_job, "the forced failure was reached");
-    check("GPU stage again", &mut c);
-    // a device whose storage bindings cannot hold the grade's tables (the curves alone are 36 KB)
-    let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).expect("the adapter of `device()`");
-    let limits = wgpu::Limits { max_storage_buffer_binding_size: 16 * 1024, ..wgpu::Limits::downlevel_defaults() }.using_resolution(adapter.limits());
-    let small = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() }));
-    match small {
-        Ok((sdev, sq)) => {
-            assert!(sdev.limits().max_storage_buffer_binding_size <= 16 * 1024);
-            assert!(fx::prepare(&sdev, &LayerFx { size: (320, 180), decimation: 1, ops: vec![grade(320, 180)] }, fx::FX_TEXTURE_BUDGET).is_none());
-            let mut c = GpuCompositor::new(&sdev, &sq);
-            check("tables over the storage binding (CPU)", &mut c);
+            input,
+        };
+        let plan = FramePlan::Layers { width: w, height: h, layers: vec![layer.clone()] };
+        let cpu = execute_cpu(&plan).over_black_rgba8();
+        let all = vec![true; w * h];
+        let ungraded = execute_cpu(&FramePlan::Layers { width: w, height: h, layers: vec![PlanLayer { fx: None, ..layer.clone() }] }).over_black_rgba8();
+        let (_, graded_mean, _) = stats8(&cpu, &ungraded, &all);
+        assert!(graded_mean > 5.0, "{kind}: the grade changes the picture: {graded_mean}");
+        if layer.input.is_some() {
+            // and the input transform matters: without it the same layer is far off
+            let raw = execute_cpu(&FramePlan::Layers { width: w, height: h, layers: vec![PlanLayer { input: None, ..layer.clone() }] }).over_black_rgba8();
+            let (_, off, _) = stats8(&cpu, &raw, &all);
+            assert!(off > 5.0, "{kind}: the input transform changes the picture: {off}");
         }
-        Err(e) => eprintln!("SKIPPED the small-binding device: {e}"),
+        let check = |what: &str, c: &mut GpuCompositor| {
+            c.composite(&plan);
+            let (_, _, gpu) = c.read_output().expect("readback");
+            let (p99, mean, _) = stats8(&cpu, &gpu, &all);
+            eprintln!("{kind} / {what}: against the CPU render p99 {p99} mean {mean:.3}");
+            assert!(p99 <= 6 && mean < 1.5, "{kind} / {what}: p99 {p99} mean {mean}: not the graded picture");
+        };
+        let mut c = GpuCompositor::new(&dev, &q);
+        check("GPU stage", &mut c);
+        c.fx.as_mut().unwrap().budget = 1;
+        check("working textures over the budget (CPU)", &mut c);
+        c.fx.as_mut().unwrap().budget = fx::FX_TEXTURE_BUDGET;
+        c.fx.as_mut().unwrap().fail_reserve = true;
+        check("device refuses the working textures (CPU)", &mut c);
+        c.fx.as_mut().unwrap().fail_job = true;
+        check("recording the passes fails (frame rendered again, layer on the CPU)", &mut c);
+        assert!(!c.fx.as_ref().unwrap().fail_job, "the forced failure was reached");
+        check("GPU stage again", &mut c);
+        // a device whose storage bindings cannot hold the grade's tables (the curves alone are 36 KB)
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).expect("the adapter of `device()`");
+        let limits = wgpu::Limits { max_storage_buffer_binding_size: 16 * 1024, ..wgpu::Limits::downlevel_defaults() }.using_resolution(adapter.limits());
+        let small = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() }));
+        match small {
+            Ok((sdev, sq)) => {
+                assert!(sdev.limits().max_storage_buffer_binding_size <= 16 * 1024);
+                assert!(fx::prepare(&sdev, &LayerFx { size: (320, 180), decimation: 1, ops: vec![grade(320, 180)] }, fx::FX_TEXTURE_BUDGET).is_none());
+                let mut c = GpuCompositor::new(&sdev, &sq);
+                check("tables over the storage binding (CPU)", &mut c);
+            }
+            Err(e) => eprintln!("SKIPPED the small-binding device: {e}"),
+        }
     }
 }
 
