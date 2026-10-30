@@ -37,6 +37,8 @@ pub const PAD_S: f64 = 1.0;
 pub const MAX_SECONDS: f64 = 1200.0;
 const MAX_RESULT_BYTES: u64 = 2 << 30;
 const LENGTH_SLACK_S: f64 = 0.05;
+/// Most distinct ranges in one job (the helper's limit).
+pub const MAX_INPUTS: usize = 64;
 /// Result rates the helper makes (each divides [`TICKS_PER_SECOND`], so the result's samples fall
 /// on exact ticks); any other source rate gets 48 kHz back.
 pub const OUT_RATES: [u32; 12] = [8_000, 11_025, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
@@ -62,6 +64,9 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let groups = targets(s, clips_p(s, p), target)?;
     if groups.is_empty() {
         return Err(EngineError::Other("select an audio clip in the timeline".into()));
+    }
+    if groups.len() > MAX_INPUTS {
+        return Err(EngineError::Other(format!("{} distinct ranges selected; at most {MAX_INPUTS} are enhanced at once", groups.len())));
     }
     // one job for the whole selection (one input per distinct range), applied in one undo step
     let (mut inputs, mut parts, mut clips, mut rates) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());

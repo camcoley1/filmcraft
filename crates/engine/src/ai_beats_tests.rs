@@ -259,18 +259,17 @@ fn music_fit_loop_joins_do_not_click() {
     assert!(worst > normal * 5.0, "hard cuts jump by {worst} (normal {normal})");
 }
 
-/// The clip's fade-out moves to the fitted end (left where it was, it would cut a hole into the
-/// music); copies carry no automation or markers of the clip (those stay on the first piece).
+/// The clip's fade-out moves to the fitted end (End at Cut); the level is continuous across every
+/// join (the copies carry the clip's own Volume); markers stay on the first piece.
 #[test]
-fn music_fit_moves_the_fade_out_and_keeps_automation_on_the_first_piece() {
+fn music_fit_moves_the_fade_out_and_keeps_the_level_across_joins() {
     let (mut f, clip) = session("bt-fade");
     let seq = f.s.state.active_sequence.unwrap();
     f.s.execute("sequence.applyAudioTransition", json!({"clip": clip.0, "edge": "out", "frames": 12})).unwrap();
-    f.s.edit("Automate", |pr, _| {
+    f.s.edit("Level", |pr, _| {
         let it = pr.sequence_mut(seq).unwrap().audio_tracks[0].items.iter_mut().find(|i| i.id == clip).unwrap();
         let src = it.source_in;
-        let level = it.effect_mut("volume").unwrap().param_mut("level").unwrap();
-        level.keyframes = vec![filmcraft_project::Keyframe::new(src + ticks(1.5), filmcraft_project::ParamValue::Float(-20.0))];
+        it.effect_mut("volume").unwrap().param_mut("level").unwrap().value = filmcraft_project::ParamValue::Float(-6.0);
         it.markers.push(filmcraft_project::Marker {
             id: filmcraft_project::MarkerId(77),
             start: src + ticks(2.0),
@@ -287,15 +286,120 @@ fn music_fit_moves_the_fade_out_and_keeps_automation_on_the_first_piece() {
     f.s.execute("ai.musicFit", json!({"seconds": 21.0, "wait": true})).unwrap();
     let q = f.s.project.sequence(seq).unwrap();
     let t = &q.audio_tracks[0];
-    let pieces: Vec<_> = t.items.iter().filter(|i| i.item == t.items.iter().find(|i| i.id == clip).unwrap().item).collect();
+    let media = t.items.iter().find(|i| i.id == clip).unwrap().item;
+    let pieces: Vec<_> = t.items.iter().filter(|i| i.item == media).collect();
+    assert!(pieces.len() >= 2);
     let last = pieces.last().unwrap();
     let outs: Vec<_> = t.transitions.iter().filter(|x| x.to.is_none()).collect();
     assert_eq!(outs.len(), 1, "{:?}", t.transitions);
     assert_eq!((outs[0].from, outs[0].start + outs[0].duration, outs[0].duration), (Some(last.id), last.end(), fade), "the fade-out ends the fitted music");
-    for p in &pieces {
-        let keyed = p.effect("volume").unwrap().param("level").unwrap().keyframes.len();
-        assert_eq!((keyed, p.markers.len()), if p.id == clip { (1, 1) } else { (0, 0) }, "piece {:?}", p.id);
+    assert_eq!(outs[0].align, filmcraft_project::TransitionAlign::EndAtCut);
+    let level = |p: &filmcraft_project::TrackItem, at: Tick| p.effect("volume").unwrap().f64_at("level", p.source_time_at(at));
+    for w in pieces.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        assert_eq!(a.end(), b.start);
+        assert_eq!(level(a, a.end() - Tick(1)), level(b, b.start), "level jumps at the join at {:?}", b.start);
+        assert_eq!(level(b, b.start), -6.0);
     }
+    for p in &pieces {
+        assert_eq!(p.markers.len(), usize::from(p.id == clip), "piece {:?}", p.id);
+    }
+}
+
+/// Keyframed automation: a fit that loops is refused with the reason (copies cannot carry
+/// media-time automation); a trim keeps the keys and the level curve unchanged.
+#[test]
+fn keyframed_clips_are_trimmed_but_not_looped() {
+    let (mut f, clip) = session("bt-keys");
+    let seq = f.s.state.active_sequence.unwrap();
+    f.s.edit("Automate", |pr, _| {
+        let it = pr.sequence_mut(seq).unwrap().audio_tracks[0].items.iter_mut().find(|i| i.id == clip).unwrap();
+        let src = it.source_in;
+        it.effect_mut("volume").unwrap().param_mut("level").unwrap().keyframes = vec![
+            filmcraft_project::Keyframe::new(src + ticks(0.5), filmcraft_project::ParamValue::Float(0.0)),
+            filmcraft_project::Keyframe::new(src + ticks(1.5), filmcraft_project::ParamValue::Float(-30.0)),
+        ];
+        Ok(())
+    })
+    .unwrap();
+    super::super::ensure_project_id(&mut f.s);
+    let before = snapshot(&f.s);
+    let e = f.s.execute("ai.musicFit", json!({"seconds": 21.0, "wait": true})).unwrap_err().to_string();
+    assert!(e.contains("keyframed automation (volume level)"), "{e}");
+    assert_eq!(snapshot(&f.s), before);
+    let old = f.s.active_sequence().unwrap().find_item(clip).unwrap().1.clone();
+    f.s.execute("ai.musicFit", json!({"seconds": 2.0, "wait": true})).unwrap();
+    let new = f.s.active_sequence().unwrap().find_item(clip).unwrap().1.clone();
+    assert!(new.duration < old.duration);
+    assert_eq!(new.effect("volume").unwrap().param("level").unwrap().keyframes.len(), 2);
+    for k in 0..20 {
+        let at = new.start + Tick(new.duration.0 * k / 20);
+        let lv = |p: &filmcraft_project::TrackItem| p.effect("volume").unwrap().f64_at("level", p.source_time_at(at));
+        if new.source_time_at(at) == old.source_time_at(at) {
+            assert_eq!(lv(&new), lv(&old), "at {at:?}");
+        }
+    }
+}
+
+/// A trim leaves a crossfade from the clip into its neighbour at the old cut: dropped.
+#[test]
+fn a_trim_drops_the_crossfade_into_the_neighbour() {
+    let (mut f, clip) = session("bt-xfade");
+    let seq = f.s.state.active_sequence.unwrap();
+    f.s.edit("Neighbour", |pr, _| {
+        let q = pr.sequence_mut(seq).unwrap();
+        let mut n = q.audio_tracks[0].items.iter().find(|i| i.id == clip).unwrap().clone();
+        n.id = ClipId(9_999);
+        n.start = n.end();
+        q.audio_tracks[0].items.push(n);
+        Ok(())
+    })
+    .unwrap();
+    f.s.execute("sequence.applyAudioTransition", json!({"clip": 9_999, "edge": "in", "frames": 12})).unwrap();
+    assert_eq!(f.s.project.sequence(seq).unwrap().audio_tracks[0].transitions.len(), 1);
+    f.s.execute("ai.musicFit", json!({"seconds": 2.0, "wait": true})).unwrap();
+    let t = &f.s.project.sequence(seq).unwrap().audio_tracks[0];
+    assert!(t.transitions.iter().all(|x| x.from != Some(clip)), "{:?}", t.transitions);
+}
+
+/// More than 500 pieces is refused before any edit.
+#[test]
+fn a_fit_of_more_than_500_pieces_is_refused() {
+    let (mut f, _) = session("bt-cap");
+    super::super::ensure_project_id(&mut f.s);
+    let before = snapshot(&f.s);
+    let e = f.s.execute("ai.musicFit", json!({"seconds": 4500.0, "wait": true})).unwrap_err().to_string();
+    assert!(e.contains("at most 500"), "{e}");
+    assert_eq!(snapshot(&f.s), before);
+}
+
+/// The user switches to another sequence while the fit runs: it lands in the clip's sequence, and
+/// the user's active sequence is kept.
+#[test]
+fn a_fit_lands_in_its_sequence_when_another_is_active() {
+    let (mut f, clip, _) =
+        with_audio("bt-switch", Script { features: vec!["beats".into()], steps: 3, result: ResultMode::Custom(grid), ..Default::default() }, 48_000);
+    let seq = f.s.state.active_sequence.unwrap();
+    f.s.edit("Unlink", |pr, _| {
+        for t in pr.sequence_mut(seq).unwrap().all_tracks_mut() {
+            for it in &mut t.items {
+                it.link = None;
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    f.s.state.selection = vec![clip];
+    let id = f.s.execute("ai.musicFit", json!({"seconds": 12.0})).unwrap()["job"].as_u64().unwrap();
+    let other = filmcraft_project::ItemId(f.s.execute("file.newSequence", json!({"name": "Other"})).unwrap()["sequence"].as_u64().unwrap());
+    f.s.state.active_sequence = Some(other);
+    super::super::tests::finish(&mut f.s, id);
+    assert!(super::super::tests::job_error(&f.s, id).is_none(), "{:?}", super::super::tests::job_error(&f.s, id));
+    assert_eq!(f.s.state.active_sequence, Some(other), "the user's sequence stays active");
+    let q = f.s.project.sequence(seq).unwrap();
+    let media = q.find_item(clip).unwrap().1.item;
+    assert!(q.audio_tracks[0].items.iter().filter(|i| i.item == media).count() >= 2, "looped in the clip's sequence");
+    assert!(!q.audio_tracks[0].transitions.is_empty(), "with its join crossfades");
 }
 
 /// Bars too sparse to land within half a beat: refused with a reason, nothing changes.

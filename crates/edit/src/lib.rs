@@ -177,7 +177,7 @@ pub fn track_range_empty(track: &Track, range: TimeRange) -> bool {
     !track.items.iter().any(|i| i.range().overlaps(&range))
 }
 
-/// Drop transitions whose clips no longer exist or are no longer adjacent to them.
+/// Drop transitions whose clips no longer exist (adjacency is not checked).
 pub fn remove_orphan_transitions(track: &mut Track) {
     let ids: HashMap<ClipId, (Tick, Tick)> = track.items.iter().map(|i| (i.id, (i.start, i.end()))).collect();
     track.transitions.retain(|tr| {

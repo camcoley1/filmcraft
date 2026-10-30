@@ -357,3 +357,49 @@ fn enhance_needs_the_feature_and_an_audio_clip() {
     let (g, _, _) = with_audio("en-gate2", Script::default(), 48_000);
     assert!(reason(&g.s, "ai.enhanceSpeech").contains("does not provide `enhance`"));
 }
+
+/// A clip listed twice is one target: relinked once (not shifted by twice the offset).
+#[test]
+fn a_clip_listed_twice_is_relinked_once() {
+    let (mut f, clip, _) =
+        with_audio("en-twice", Script { features: vec!["enhance".into()], result: ResultMode::Custom(identity), ..Default::default() }, 48_000);
+    let seq = f.s.state.active_sequence.unwrap();
+    f.s.edit("Later", |pr, _| {
+        pr.sequence_mut(seq).unwrap().audio_tracks[0].items.iter_mut().find(|i| i.id == clip).unwrap().source_in = Tick(3 * TICKS_PER_SECOND);
+        Ok(())
+    })
+    .unwrap();
+    f.s.execute("ai.enhanceSpeech", json!({"clips": [clip.0, clip.0], "wait": true})).unwrap();
+    assert_eq!(f.helper.started()[0].inputs.len(), 1);
+    // the decoded range starts 1 s before the In: the new In is 1 s, not -1 s
+    assert_eq!(audio_clip(&f, clip).source_in, Tick(TICKS_PER_SECOND));
+}
+
+/// Source positions at the ends of the tick range are refused by every audio command, never
+/// wrapped.
+#[test]
+fn extreme_source_positions_are_refused() {
+    for at in [i64::MIN, i64::MIN + 1, i64::MAX - 1, i64::MAX] {
+        let (mut f, clip, _) = with_audio("en-extreme", Script { features: vec!["enhance".into(), "beats".into()], ..Default::default() }, 48_000);
+        let seq = f.s.state.active_sequence.unwrap();
+        f.s.edit("Hostile", |pr, _| {
+            let q = pr.sequence_mut(seq).unwrap();
+            for t in q.all_tracks_mut() {
+                for it in &mut t.items {
+                    it.link = None;
+                }
+            }
+            q.audio_tracks[0].items.iter_mut().find(|i| i.id == clip).unwrap().source_in = Tick(at);
+            Ok(())
+        })
+        .unwrap();
+        f.s.state.selection = vec![clip];
+        for (cmd, p) in
+            [("ai.enhanceSpeech", json!({"wait": true})), ("ai.beatGrid", json!({"wait": true})), ("ai.musicFit", json!({"seconds": 8.0, "wait": true}))]
+        {
+            let e = f.s.execute(cmd, p).unwrap_err().to_string();
+            assert!(e.contains("out of range"), "{cmd} at {at}: {e}");
+        }
+        assert!(f.helper.started().is_empty());
+    }
+}

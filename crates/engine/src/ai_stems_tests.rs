@@ -523,7 +523,8 @@ fn decode_failures_are_errors_and_only_a_stream_end_is_silence() {
 /// Source positions at the ends of the tick range are refused with a reason, never wrapped.
 #[test]
 fn extreme_source_positions_are_refused() {
-    for at in [i64::MIN, i64::MIN + 1, i64::MAX - 1, i64::MAX] {
+    // also a range wholly past the media's end (2 s long), which no arithmetic refuses
+    for at in [i64::MIN, i64::MIN + 1, i64::MAX - 1, i64::MAX, 5 * TICKS_PER_SECOND] {
         let mut f = helper("st-extreme", stems);
         let seq = f.s.state.active_sequence.unwrap();
         let clip = f.clip;

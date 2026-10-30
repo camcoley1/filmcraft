@@ -110,6 +110,10 @@ fn target_or(s: &Session, c: ClipId) -> std::result::Result<Target, (bool, Strin
     let out_of_range = || (true, format!("{}: the clip's source position is out of range; reset its In and Out points", it.name));
     let (lo, hi) = (it.source_in.0.min(it.source_out().0), it.source_in.0.max(it.source_out().0));
     let duration = m.info.duration.0.max(0);
+    // a clip that plays none of its media (its range wholly before 0 or past the end)
+    if lo >= duration || hi <= 0 {
+        return Err(out_of_range());
+    }
     let a = lo.checked_sub(pad).ok_or_else(out_of_range)?.max(0);
     let b = hi.checked_add(pad).ok_or_else(out_of_range)?.min(duration).max(a);
     let offset = a / TICKS_PER_SAMPLE;

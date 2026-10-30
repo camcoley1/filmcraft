@@ -12,8 +12,10 @@
 //!   (`sequence.applyAudioTransition`) so it does not click. No new audio file is written. With
 //!   `duck`, the pieces become Music with ducking against Dialogue and
 //!   `essentialSound.generateDucking` writes the ducking keyframes, all in the same undo step
-//!   ("Fit Music"). The clip's fade-out moves to the fitted end; the copies carry no automation
-//!   keyframes or markers (those stay on the first piece). A fit more than half a beat off the
+//!   ("Fit Music"). The clip's fade-out moves to the fitted end and a crossfade into a neighbour
+//!   the trimmed clip no longer touches is dropped; a clip with keyframed automation is refused
+//!   when the fit loops (the copies cannot carry media-time automation); markers stay on the
+//!   first piece. A fit more than half a beat off the
 //!   target (bars too sparse) or of more than [`MAX_PIECES`] pieces is refused. The clip must
 //!   play forward at 100 %, without a frame hold, not remixed and not linked to video; the track
 //!   after it must be free for the fitted length.
@@ -23,7 +25,7 @@
 //! rate's sample grid, so beat times map to media time exactly.
 
 use filmcraft_project::essential::{AudioType, EssentialSound};
-use filmcraft_project::{ClipId, ItemId, Label, Marker, MarkerId, MarkerKind, TrackId, TrackItem};
+use filmcraft_project::{ClipId, ItemId, Label, Marker, MarkerId, MarkerKind, TrackId, TrackItem, TransitionAlign};
 use filmcraft_time::{TICKS_PER_SECOND, Tick};
 use serde_json::{Value, json};
 
@@ -289,6 +291,19 @@ fn apply_fit(s: &mut Session, pj: &super::PendingAi, beats: &[Tick], downbeats: 
             sec(off)
         )));
     }
+    // a loop plays copies of the clip: automation is in media time, so a fade or a level change
+    // would replay (or hold its last value) on every loop and jump at the joins; refused
+    if plan.len() > 1 {
+        let keyed: Vec<String> =
+            it.effects.iter().flat_map(|e| e.params.iter().filter(|(_, p)| !p.keyframes.is_empty()).map(move |(k, _)| format!("{} {k}", e.effect))).collect();
+        if !keyed.is_empty() {
+            return Err(EngineError::Other(format!(
+                "{}: the clip has keyframed automation ({}); fitting it loops copies of the clip, which cannot carry it: remove the keyframes, or fit first and automate afterwards",
+                it.name,
+                keyed.join(", ")
+            )));
+        }
+    }
     // the fitted clip may only cover the clip itself and empty track
     let tr = q.track(track).ok_or(EngineError::NoSequence)?;
     let end = it.start + total;
@@ -327,14 +342,9 @@ fn fit_step(s: &mut Session, seq: ItemId, track: TrackId, clip: ClipId, it: &Tra
                 c.id = ClipId(*new_ids.get(k - 1).ok_or(EngineError::NoSequence)?);
                 c.link = None;
                 c.group = None;
-                // a copy plays the bars again: the clip's automation and markers stay on the
-                // first piece (keyframed parameters keep their static value)
+                // a copy plays the bars again with the clip's own settings (a looped clip has no
+                // keyframes: see apply_fit); its markers stay on the first piece
                 c.markers.clear();
-                for e in &mut c.effects {
-                    for p in e.params.values_mut() {
-                        p.keyframes.clear();
-                    }
-                }
                 tr.items.push(c);
                 tr.items.last_mut().ok_or(EngineError::NoSequence)?
             };
@@ -356,10 +366,18 @@ fn fit_step(s: &mut Session, seq: ItemId, track: TrackId, clip: ClipId, it: &Tra
         if let Some(last) = ids.last().and_then(|id| tr.items.iter().find(|o| o.id == *id)).map(|o| (o.id, o.end(), o.duration)) {
             for mut x in fade_out {
                 x.duration = x.duration.min(last.2);
-                (x.from, x.start) = (Some(last.0), last.1 - x.duration);
+                (x.from, x.start, x.align) = (Some(last.0), last.1 - x.duration, TransitionAlign::EndAtCut);
                 tr.transitions.push(x);
             }
         }
+        // a crossfade from the clip into a neighbour that no longer starts where the clip now
+        // ends (a trim) would play the music past the bar line: dropped
+        let clip_end = tr.items.iter().find(|o| o.id == clip).map(|o| o.end());
+        let starts: Vec<(ClipId, Tick)> = tr.items.iter().map(|o| (o.id, o.start)).collect();
+        tr.transitions.retain(|x| match (x.from, x.to) {
+            (Some(f), Some(t)) if f == clip => starts.iter().any(|(id, st)| *id == t && Some(*st) == clip_end),
+            _ => true,
+        });
         tr.items.sort_by_key(|o| o.start);
         tr.sort();
         filmcraft_edit::remove_orphan_transitions(tr);

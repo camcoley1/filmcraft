@@ -85,6 +85,10 @@ pub(crate) fn audio_target(s: &Session, c: ClipId, rate: u32, pad_s: f64, max_s:
     let out_of_range = || Refused::Hard(format!("{}: the clip's source position is out of range; reset its In and Out points", it.name));
     let (lo, hi) = (it.source_in.0.min(it.source_out().0), it.source_in.0.max(it.source_out().0));
     let duration = m.info.duration.0.max(0);
+    // a clip that plays none of its media (its range wholly before 0 or past the end)
+    if lo >= duration || hi <= 0 {
+        return Err(out_of_range());
+    }
     let a = lo.checked_sub(pad).ok_or_else(out_of_range)?.max(0);
     let b = if to_end { duration } else { hi.checked_add(pad).ok_or_else(out_of_range)?.min(duration) }.max(a);
     let offset = a / tps;
@@ -129,7 +133,13 @@ pub(crate) fn targets(
     clips: Vec<ClipId>,
     f: impl Fn(&Session, ClipId) -> std::result::Result<AudioTarget, Refused>,
 ) -> crate::Result<Vec<(AudioTarget, Vec<ClipId>)>> {
-    let mut picked = clips;
+    // a clip listed twice is one target (it would be relinked twice)
+    let mut picked: Vec<ClipId> = Vec::with_capacity(clips.len());
+    for c in clips {
+        if !picked.contains(&c) {
+            picked.push(c);
+        }
+    }
     picked.sort_by_key(|c| f(s, *c).map_or(1, |t| u8::from(!t.audio_track)));
     let mut out: Vec<(AudioTarget, Vec<ClipId>)> = Vec::new();
     for c in picked {
