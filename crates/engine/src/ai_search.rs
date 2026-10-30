@@ -674,8 +674,15 @@ pub fn poll(s: &mut Session) {
             Ok(_) => "Applied".into(),
             Err(e) => e.clone(),
         };
-        *lock(&job.result) =
-            Some(r.map(|_| filmcraft_export::Report { path: String::new(), frames: 0, seconds: 0.0, bytes: 0, render_fps: 0.0, extra_files: Vec::new() }));
+        *lock(&job.result) = Some(r.map(|_| filmcraft_export::Report {
+            path: String::new(),
+            frames: 0,
+            seconds: 0.0,
+            bytes: 0,
+            render_fps: 0.0,
+            extra_files: Vec::new(),
+            warnings: Vec::new(),
+        }));
         job.progress.finished.store(true, Ordering::Relaxed);
     }
 }
