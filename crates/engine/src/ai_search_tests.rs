@@ -62,6 +62,7 @@ fn fixture_with(name: &str, hits_for: impl Fn(ItemId, ItemId) -> Value, steps: u
     s.project = std::sync::Arc::new(p);
     s.ai.cache_root = Some(dir.join("cache"));
     s.ai.media_root = Some(dir.join("media"));
+    s.ai.token = Some("test".into());
     s.ai.limits = Limits { poll_interval: Duration::from_millis(5), max_poll_failures: 3, io_timeout: Duration::from_secs(2), ..Default::default() };
     // the canned index meta names item ids; the ids are known only now: rewrite the script's ids
     let mut sc = script(hits_for(a, b), steps);
