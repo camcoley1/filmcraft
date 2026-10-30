@@ -64,6 +64,9 @@ pub(super) fn fixture(name: &str, script: Script) -> Fixture {
     s.state.selection = vec![clip];
     let cache = cache_dir(name);
     s.ai.cache_root = Some(cache.clone());
+    // tests never write under the real data directory or read the real helper's token file
+    s.ai.media_root = Some(cache.join("media"));
+    s.ai.token = Some("test".into());
     s.ai.limits = Limits { poll_interval: Duration::from_millis(5), max_poll_failures: 3, io_timeout: Duration::from_secs(2), ..Default::default() };
     let helper = FakeHelper::start(script).unwrap();
     let _ = s.execute("ai.connect", json!({"port": helper.port()}));

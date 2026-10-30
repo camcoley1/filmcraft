@@ -75,6 +75,9 @@ pub struct AiState {
     pub jobs: Vec<PendingAi>,
     /// Where an unsaved project's AI media go (`<this>/AI Media/…`); `None` = the data directory.
     pub media_root: Option<PathBuf>,
+    /// The token sent to the helper; `None` = read the helper's token file at each request (a
+    /// restarted helper writes a new one). Tests set one so they never read the real file.
+    pub token: Option<String>,
     /// When the helper was last asked (background hosts ask again every [`REPROBE`], so a helper
     /// started later, or one whose models became ready, is seen without a click).
     pub last_probe: Option<web_time::Instant>,
@@ -96,6 +99,7 @@ impl Default for AiState {
             stamp: None,
             jobs: Vec::new(),
             media_root: None,
+            token: None,
             last_probe: None,
         }
     }
@@ -368,7 +372,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
 pub fn refresh(s: &mut Session, announce: bool) {
     s.ai.last_probe = Some(web_time::Instant::now());
     if s.sidecar.is_none() {
-        s.sidecar = tcp_client(s.ai.port, s.ai.limits);
+        s.sidecar = tcp_client(s.ai.port, s.ai.limits, s.ai.token.clone());
     }
     let Some(client) = s.sidecar.clone() else {
         s.ai.hello = Some(Err(NOT_CONNECTED.into()));
@@ -427,12 +431,16 @@ fn poll_probe(s: &mut Session) {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn tcp_client(port: u16, limits: Limits) -> Option<Arc<dyn SidecarClient>> {
-    Some(Arc::new(filmcraft_sidecar::TcpClient::new(port, limits)))
+fn tcp_client(port: u16, limits: Limits, token: Option<String>) -> Option<Arc<dyn SidecarClient>> {
+    let client = filmcraft_sidecar::TcpClient::new(port, limits);
+    Some(Arc::new(match token {
+        Some(t) => client.with_token(t),
+        None => client,
+    }))
 }
 
 #[cfg(target_arch = "wasm32")]
-fn tcp_client(_: u16, _: Limits) -> Option<Arc<dyn SidecarClient>> {
+fn tcp_client(_: u16, _: Limits, _: Option<String>) -> Option<Arc<dyn SidecarClient>> {
     None
 }
 
