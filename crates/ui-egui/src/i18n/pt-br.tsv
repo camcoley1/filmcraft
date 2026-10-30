@@ -3648,7 +3648,17 @@
 	New grade version (a copy of this one)	Nova versão da correção (cópia desta)
 	Delete this grade version	Excluir esta versão da correção
 	Node on (off: bypassed)	Nó ativado (desativado: ignorado)
-	Add a node after this one	Adicionar um nó depois deste
-	Remove this node	Remover este nó
-	Move this node earlier	Mover este nó para antes
-	Move this node later	Mover este nó para depois
+	Mask	Máscara
+	Turn On	Ativar
+	Remove Node	Remover nó
+	+ Node	+ Nó
+	− Node	− Nó
+	Node Mix	Mixagem do nó
+	None (the whole frame)	Nenhuma (o quadro inteiro)
+	Draw a mask on the Lumetri effect first	Desenhe primeiro uma máscara no efeito Lumetri
+	Add a node after {node}	Adicionar um nó depois de {node}
+	Remove {node}	Remover {node}
+	Move {node} earlier	Mover {node} para antes
+	Move {node} later	Mover {node} para depois
+	How much of {node}'s result is used	Quanto do resultado de {node} é usado
+	Limited to the mask {m}	Limitado à máscara {m}

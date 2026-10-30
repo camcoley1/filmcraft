@@ -3676,7 +3676,17 @@
 	New grade version (a copy of this one)	Neue Grading-Version (eine Kopie dieser)
 	Delete this grade version	Diese Grading-Version löschen
 	Node on (off: bypassed)	Knoten an (aus: umgangen)
-	Add a node after this one	Einen Knoten nach diesem hinzufügen
-	Remove this node	Diesen Knoten entfernen
-	Move this node earlier	Diesen Knoten nach vorne verschieben
-	Move this node later	Diesen Knoten nach hinten verschieben
+	Mask	Maske
+	Turn On	Einschalten
+	Remove Node	Knoten entfernen
+	+ Node	+ Knoten
+	− Node	− Knoten
+	Node Mix	Knoten-Mischung
+	None (the whole frame)	Keine (das ganze Bild)
+	Draw a mask on the Lumetri effect first	Zeichnen Sie zuerst eine Maske auf dem Lumetri-Effekt
+	Add a node after {node}	Einen Knoten nach {node} hinzufügen
+	Remove {node}	{node} entfernen
+	Move {node} earlier	{node} nach vorne verschieben
+	Move {node} later	{node} nach hinten verschieben
+	How much of {node}'s result is used	Wie viel vom Ergebnis von {node} verwendet wird
+	Limited to the mask {m}	Auf die Maske {m} begrenzt

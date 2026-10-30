@@ -3647,7 +3647,17 @@
 	New grade version (a copy of this one)	Nouvelle version d'étalonnage (copie de celle-ci)
 	Delete this grade version	Supprimer cette version d'étalonnage
 	Node on (off: bypassed)	Nœud actif (inactif : contourné)
-	Add a node after this one	Ajouter un nœud après celui-ci
-	Remove this node	Supprimer ce nœud
-	Move this node earlier	Déplacer ce nœud plus tôt
-	Move this node later	Déplacer ce nœud plus tard
+	Mask	Masque
+	Turn On	Activer
+	Remove Node	Supprimer le nœud
+	+ Node	+ Nœud
+	− Node	− Nœud
+	Node Mix	Mélange du nœud
+	None (the whole frame)	Aucun (toute l'image)
+	Draw a mask on the Lumetri effect first	Dessinez d'abord un masque sur l'effet Lumetri
+	Add a node after {node}	Ajouter un nœud après {node}
+	Remove {node}	Supprimer {node}
+	Move {node} earlier	Déplacer {node} plus tôt
+	Move {node} later	Déplacer {node} plus tard
+	How much of {node}'s result is used	Part du résultat de {node} utilisée
+	Limited to the mask {m}	Limité au masque {m}

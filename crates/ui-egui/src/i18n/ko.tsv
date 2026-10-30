@@ -3666,7 +3666,17 @@
 	New grade version (a copy of this one)	새 그레이드 버전(이 버전의 복사본)
 	Delete this grade version	이 그레이드 버전 삭제
 	Node on (off: bypassed)	노드 켜기(끄기: 우회)
-	Add a node after this one	이 노드 뒤에 노드 추가
-	Remove this node	이 노드 제거
-	Move this node earlier	이 노드를 앞으로 이동
-	Move this node later	이 노드를 뒤로 이동
+	Mask	마스크
+	Turn On	켜기
+	Remove Node	노드 제거
+	+ Node	+ 노드
+	− Node	− 노드
+	Node Mix	노드 믹스
+	None (the whole frame)	없음(프레임 전체)
+	Draw a mask on the Lumetri effect first	먼저 Lumetri 효과에 마스크를 그리세요
+	Add a node after {node}	{node} 뒤에 노드 추가
+	Remove {node}	{node} 제거
+	Move {node} earlier	{node} 앞으로 이동
+	Move {node} later	{node} 뒤로 이동
+	How much of {node}'s result is used	{node} 결과를 얼마나 사용할지
+	Limited to the mask {m}	마스크 {m}(으)로 제한됨

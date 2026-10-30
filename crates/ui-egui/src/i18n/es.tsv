@@ -3689,7 +3689,17 @@
 	New grade version (a copy of this one)	Nueva versión del etalonaje (copia de esta)
 	Delete this grade version	Eliminar esta versión del etalonaje
 	Node on (off: bypassed)	Nodo activado (desactivado: omitido)
-	Add a node after this one	Añadir un nodo después de este
-	Remove this node	Quitar este nodo
-	Move this node earlier	Mover este nodo antes
-	Move this node later	Mover este nodo después
+	Mask	Máscara
+	Turn On	Activar
+	Remove Node	Quitar nodo
+	+ Node	+ Nodo
+	− Node	− Nodo
+	Node Mix	Mezcla del nodo
+	None (the whole frame)	Ninguna (todo el fotograma)
+	Draw a mask on the Lumetri effect first	Dibuje primero una máscara en el efecto Lumetri
+	Add a node after {node}	Añadir un nodo después de {node}
+	Remove {node}	Quitar {node}
+	Move {node} earlier	Mover {node} antes
+	Move {node} later	Mover {node} después
+	How much of {node}'s result is used	Cuánto del resultado de {node} se usa
+	Limited to the mask {m}	Limitado a la máscara {m}

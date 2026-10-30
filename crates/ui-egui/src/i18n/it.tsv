@@ -3671,7 +3671,17 @@
 	New grade version (a copy of this one)	Nuova versione della correzione (copia di questa)
 	Delete this grade version	Elimina questa versione della correzione
 	Node on (off: bypassed)	Nodo attivo (disattivo: escluso)
-	Add a node after this one	Aggiungi un nodo dopo questo
-	Remove this node	Rimuovi questo nodo
-	Move this node earlier	Sposta questo nodo prima
-	Move this node later	Sposta questo nodo dopo
+	Mask	Maschera
+	Turn On	Attiva
+	Remove Node	Rimuovi nodo
+	+ Node	+ Nodo
+	− Node	− Nodo
+	Node Mix	Mix del nodo
+	None (the whole frame)	Nessuna (l'intero fotogramma)
+	Draw a mask on the Lumetri effect first	Disegna prima una maschera sull'effetto Lumetri
+	Add a node after {node}	Aggiungi un nodo dopo {node}
+	Remove {node}	Rimuovi {node}
+	Move {node} earlier	Sposta {node} prima
+	Move {node} later	Sposta {node} dopo
+	How much of {node}'s result is used	Quanto del risultato di {node} viene usato
+	Limited to the mask {m}	Limitato alla maschera {m}

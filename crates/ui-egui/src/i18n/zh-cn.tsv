@@ -3664,7 +3664,17 @@
 	New grade version (a copy of this one)	新调色版本（此版本的副本）
 	Delete this grade version	删除此调色版本
 	Node on (off: bypassed)	节点开启（关闭：绕过）
-	Add a node after this one	在此节点后添加节点
-	Remove this node	移除此节点
-	Move this node earlier	将此节点前移
-	Move this node later	将此节点后移
+	Mask	蒙版
+	Turn On	打开
+	Remove Node	移除节点
+	+ Node	+ 节点
+	− Node	− 节点
+	Node Mix	节点混合
+	None (the whole frame)	无（整个画面）
+	Draw a mask on the Lumetri effect first	请先在 Lumetri 效果上绘制蒙版
+	Add a node after {node}	在 {node} 之后添加节点
+	Remove {node}	移除 {node}
+	Move {node} earlier	将 {node} 前移
+	Move {node} later	将 {node} 后移
+	How much of {node}'s result is used	{node} 的结果使用多少
+	Limited to the mask {m}	限定在蒙版 {m} 内

@@ -3645,7 +3645,17 @@
 	New grade version (a copy of this one)	Versi grade baru (salinan versi ini)
 	Delete this grade version	Hapus versi grade ini
 	Node on (off: bypassed)	Node aktif (mati: dilewati)
-	Add a node after this one	Tambah node setelah node ini
-	Remove this node	Hapus node ini
-	Move this node earlier	Pindahkan node ini lebih awal
-	Move this node later	Pindahkan node ini lebih akhir
+	Mask	Mask
+	Turn On	Aktifkan
+	Remove Node	Hapus Node
+	+ Node	+ Node
+	− Node	− Node
+	Node Mix	Campuran Node
+	None (the whole frame)	Tidak ada (seluruh bingkai)
+	Draw a mask on the Lumetri effect first	Gambar mask pada efek Lumetri terlebih dahulu
+	Add a node after {node}	Tambahkan node setelah {node}
+	Remove {node}	Hapus {node}
+	Move {node} earlier	Pindahkan {node} lebih awal
+	Move {node} later	Pindahkan {node} lebih akhir
+	How much of {node}'s result is used	Seberapa banyak hasil {node} yang dipakai
+	Limited to the mask {m}	Dibatasi pada mask {m}

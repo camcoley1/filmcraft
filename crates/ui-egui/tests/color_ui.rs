@@ -368,3 +368,49 @@ fn lumetri_rows_keep_their_width_when_the_clip_name_is_long() {
     let long = d.element("lumetri.param.hdr_white").expect("hdr_white row");
     assert_eq!(short, long, "a long clip name must not move or widen the control rows");
 }
+
+/// The Lumetri node strip (M8d): `+ Node` adds a node after the selected one, a chip's context
+/// menu renames, masks, bypasses and removes it, and Node Mix sets the selected node's mix.
+#[test]
+fn node_strip_buttons_and_chip_menu() {
+    let mut d = Driver::demo();
+    d.ok("ui.set", json!({"workspace": "Color"}));
+    d.frames(3);
+    let clip = select_first_clip(&mut d);
+    d.exec("effects.apply", json!({"clips": [clip], "effect": "lumetri"}));
+    d.frames(2);
+    d.click("lumetri.node.add");
+    let nodes = |d: &mut Driver| d.exec("color.nodes", json!({"clip": clip}))["nodes"].as_array().unwrap().clone();
+    assert_eq!(nodes(&mut d).len(), 2);
+    // the chip menu
+    d.ok("ui.click", json!({"id": "lumetri.node.1", "button": "right"}));
+    d.frames(2);
+    let ids = d.ids("lumetri.node.1.");
+    for id in ["lumetri.node.1.rename", "lumetri.node.1.mask", "lumetri.node.1.bypass", "lumetri.node.1.removeNode"] {
+        assert!(ids.iter().any(|i| i == id), "{id} missing: {ids:?}");
+    }
+    d.click("lumetri.node.1.bypass");
+    assert_eq!(nodes(&mut d)[1]["enabled"], false);
+    // Rename… puts a field in place of the chip
+    d.ok("ui.click", json!({"id": "lumetri.node.1", "button": "right"}));
+    d.frames(2);
+    d.click("lumetri.node.1.rename");
+    assert!(d.ids("lumetri.rename.").iter().any(|i| i == "lumetri.rename.field"));
+    d.click("lumetri.rename.field");
+    d.ok("ui.key", json!({"key": "A", "modifiers": {"command": true}}));
+    d.ok("ui.type", json!({"text": "Skin"}));
+    d.frames(1);
+    d.click("lumetri.rename.apply");
+    assert_eq!(nodes(&mut d)[1]["label"], "Skin");
+    assert!(d.ids("lumetri.rename.").is_empty(), "the field is gone");
+    // and Rename… in the version dropdown
+    d.click("lumetri.version");
+    d.click("lumetri.version.rename");
+    d.click("lumetri.rename.field");
+    d.ok("ui.key", json!({"key": "A", "modifiers": {"command": true}}));
+    d.ok("ui.type", json!({"text": "Day"}));
+    d.ok("ui.key", json!({"key": "Enter"}));
+    d.frames(2);
+    assert_eq!(d.exec("color.nodes", json!({"clip": clip}))["versions"], json!(["Day"]));
+    d.snapshot("lumetri-node-strip", Some("lumetri.node"));
+}

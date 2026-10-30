@@ -3688,7 +3688,17 @@
 	New grade version (a copy of this one)	新しいグレードバージョン（このバージョンのコピー）
 	Delete this grade version	このグレードバージョンを削除
 	Node on (off: bypassed)	ノードオン（オフ：バイパス）
-	Add a node after this one	このノードの後にノードを追加
-	Remove this node	このノードを削除
-	Move this node earlier	このノードを前に移動
-	Move this node later	このノードを後ろに移動
+	Mask	マスク
+	Turn On	オンにする
+	Remove Node	ノードを削除
+	+ Node	+ ノード
+	− Node	− ノード
+	Node Mix	ノードのミックス
+	None (the whole frame)	なし（フレーム全体）
+	Draw a mask on the Lumetri effect first	先に Lumetri エフェクトにマスクを描いてください
+	Add a node after {node}	{node} の後にノードを追加
+	Remove {node}	{node} を削除
+	Move {node} earlier	{node} を前に移動
+	Move {node} later	{node} を後ろに移動
+	How much of {node}'s result is used	{node} の結果をどれだけ使うか
+	Limited to the mask {m}	マスク {m} に限定
