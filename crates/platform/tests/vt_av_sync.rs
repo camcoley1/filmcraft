@@ -128,8 +128,9 @@ fn onset(a: &[f32]) -> Option<usize> {
     a.iter().position(|v| v.abs() > 0.05)
 }
 
-/// The MP4 / QuickTime tracks as written: the video's B-frame timing (edit list start and how many
-/// samples are reordered) and the audio's edit list start (AAC priming), in their own timescales.
+/// The MP4 / QuickTime tracks as written: the video's B-frame timing (edit list start, and how many
+/// times a sample in decoding order is presented before the one decoded just before it: real
+/// reordering) and the audio's edit list start (AAC priming), in their own timescales.
 fn track_timing(path: &str) -> (i64, usize, i64, u32) {
     let bytes = std::fs::read(path).unwrap();
     let f = filmcraft_isobmff::open(&bytes[..]).unwrap();
@@ -137,7 +138,7 @@ fn track_timing(path: &str) -> (i64, usize, i64, u32) {
     let v = &f.tracks[f.track_of_kind(filmcraft_isobmff::TrackKind::Video).unwrap()];
     let a = &f.tracks[f.track_of_kind(filmcraft_isobmff::TrackKind::Audio).unwrap()];
     let start = edit(v);
-    let reordered = v.samples.iter().filter(|s| s.pts - s.dts != start).count();
+    let reordered = v.samples.windows(2).filter(|w| w[1].pts < w[0].pts).count();
     (start, reordered, edit(a), a.timescale)
 }
 
@@ -200,9 +201,11 @@ fn flash_and_click_stay_in_sync() {
                     // offsets that differ from it), and in decoding order without
                     let (v_start, reordered, a_start, a_scale) = track_timing(&path);
                     if b_frames {
-                        assert!(v_start > 0 && reordered > 0, "{name}: not reordered (edit start {v_start}, {reordered} reordered samples)");
+                        assert!(v_start > 0, "{name}: no B-frame delay (edit start {v_start})");
+                        assert!(reordered > 0, "{name}: no presentation-time inversion in decoding order");
                     } else {
-                        assert_eq!((v_start, reordered), (0, 0), "{name}: reordered without B-frames");
+                        assert_eq!(v_start, 0, "{name}: an edit start without B-frames");
+                        assert_eq!(reordered, 0, "{name}: presentation times out of order without B-frames");
                     }
 
                     // audio: the burst's onset after the edit list, from the decoded audio's own origin
