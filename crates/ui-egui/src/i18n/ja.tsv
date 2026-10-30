@@ -3664,3 +3664,31 @@
 	changed since indexed	インデックス後に変更
 	Search by content (AI)	内容で検索 (AI)
 	Index Project for Search	検索用にプロジェクトをインデックス化
+
+# M8d: Lumetri node graph and grade versions
+	List Color Nodes	カラーノードの一覧
+	Select Color Node	カラーノードを選択
+	Add Color Node	カラーノードを追加
+	Remove Color Node	カラーノードを削除
+	Move Color Node	カラーノードを移動
+	Set Color Node Mix	カラーノードのミックス
+	Bypass Color Node	カラーノードをバイパス
+	Rename Color Node	カラーノードの名前を変更
+	Set Color Node Mask	カラーノードのマスク
+	New Grade Version	新しいグレードバージョン
+	Switch Grade Version	グレードバージョンを切り替え
+	Rename Grade Version	グレードバージョンの名前を変更
+	Delete Grade Version	グレードバージョンを削除
+	Copy Grade	グレードをコピー
+	Paste Grade	グレードをペースト
+	Reset Grade	グレードをリセット
+	Color Grade	カラーグレード
+	Grade	グレード
+	Node {n}	ノード {n}
+	New grade version (a copy of this one)	新しいグレードバージョン（このバージョンのコピー）
+	Delete this grade version	このグレードバージョンを削除
+	Node on (off: bypassed)	ノードオン（オフ：バイパス）
+	Add a node after this one	このノードの後にノードを追加
+	Remove this node	このノードを削除
+	Move this node earlier	このノードを前に移動
+	Move this node later	このノードを後ろに移動

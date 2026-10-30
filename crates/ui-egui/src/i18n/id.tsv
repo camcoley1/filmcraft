@@ -3621,3 +3621,31 @@
 	changed since indexed	berubah sejak diindeks
 	Search by content (AI)	Cari berdasarkan isi (AI)
 	Index Project for Search	Indeks proyek untuk pencarian
+
+# M8d: Lumetri node graph and grade versions
+	List Color Nodes	Daftar Node Warna
+	Select Color Node	Pilih Node Warna
+	Add Color Node	Tambah Node Warna
+	Remove Color Node	Hapus Node Warna
+	Move Color Node	Pindahkan Node Warna
+	Set Color Node Mix	Campuran Node Warna
+	Bypass Color Node	Lewati Node Warna
+	Rename Color Node	Ganti Nama Node Warna
+	Set Color Node Mask	Mask Node Warna
+	New Grade Version	Versi Grade Baru
+	Switch Grade Version	Ganti Versi Grade
+	Rename Grade Version	Ganti Nama Versi Grade
+	Delete Grade Version	Hapus Versi Grade
+	Copy Grade	Salin Grade
+	Paste Grade	Tempel Grade
+	Reset Grade	Atur Ulang Grade
+	Color Grade	Grade Warna
+	Grade	Grade
+	Node {n}	Node {n}
+	New grade version (a copy of this one)	Versi grade baru (salinan versi ini)
+	Delete this grade version	Hapus versi grade ini
+	Node on (off: bypassed)	Node aktif (mati: dilewati)
+	Add a node after this one	Tambah node setelah node ini
+	Remove this node	Hapus node ini
+	Move this node earlier	Pindahkan node ini lebih awal
+	Move this node later	Pindahkan node ini lebih akhir

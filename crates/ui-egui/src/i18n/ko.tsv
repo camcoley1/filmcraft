@@ -3642,3 +3642,31 @@
 	changed since indexed	색인 이후 변경됨
 	Search by content (AI)	내용으로 검색 (AI)
 	Index Project for Search	검색용 프로젝트 색인
+
+# M8d: Lumetri node graph and grade versions
+	List Color Nodes	색상 노드 목록
+	Select Color Node	색상 노드 선택
+	Add Color Node	색상 노드 추가
+	Remove Color Node	색상 노드 제거
+	Move Color Node	색상 노드 이동
+	Set Color Node Mix	색상 노드 혼합
+	Bypass Color Node	색상 노드 우회
+	Rename Color Node	색상 노드 이름 바꾸기
+	Set Color Node Mask	색상 노드 마스크
+	New Grade Version	새 그레이드 버전
+	Switch Grade Version	그레이드 버전 전환
+	Rename Grade Version	그레이드 버전 이름 바꾸기
+	Delete Grade Version	그레이드 버전 삭제
+	Copy Grade	그레이드 복사
+	Paste Grade	그레이드 붙여넣기
+	Reset Grade	그레이드 초기화
+	Color Grade	색상 그레이드
+	Grade	그레이드
+	Node {n}	노드 {n}
+	New grade version (a copy of this one)	새 그레이드 버전(이 버전의 복사본)
+	Delete this grade version	이 그레이드 버전 삭제
+	Node on (off: bypassed)	노드 켜기(끄기: 우회)
+	Add a node after this one	이 노드 뒤에 노드 추가
+	Remove this node	이 노드 제거
+	Move this node earlier	이 노드를 앞으로 이동
+	Move this node later	이 노드를 뒤로 이동

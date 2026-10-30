@@ -3624,3 +3624,31 @@
 	changed since indexed	alterado desde a indexação
 	Search by content (AI)	Buscar por conteúdo (IA)
 	Index Project for Search	Indexar o projeto para pesquisa
+
+# M8d: Lumetri node graph and grade versions
+	List Color Nodes	Listar nós de cor
+	Select Color Node	Selecionar nó de cor
+	Add Color Node	Adicionar nó de cor
+	Remove Color Node	Remover nó de cor
+	Move Color Node	Mover nó de cor
+	Set Color Node Mix	Mistura do nó de cor
+	Bypass Color Node	Ignorar nó de cor
+	Rename Color Node	Renomear nó de cor
+	Set Color Node Mask	Máscara do nó de cor
+	New Grade Version	Nova versão da correção
+	Switch Grade Version	Trocar versão da correção
+	Rename Grade Version	Renomear versão da correção
+	Delete Grade Version	Excluir versão da correção
+	Copy Grade	Copiar correção
+	Paste Grade	Colar correção
+	Reset Grade	Redefinir correção
+	Color Grade	Correção de cor
+	Grade	Correção
+	Node {n}	Nó {n}
+	New grade version (a copy of this one)	Nova versão da correção (cópia desta)
+	Delete this grade version	Excluir esta versão da correção
+	Node on (off: bypassed)	Nó ativado (desativado: ignorado)
+	Add a node after this one	Adicionar um nó depois deste
+	Remove this node	Remover este nó
+	Move this node earlier	Mover este nó para antes
+	Move this node later	Mover este nó para depois

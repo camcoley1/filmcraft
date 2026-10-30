@@ -3652,3 +3652,31 @@
 	changed since indexed	seit der Indexierung geändert
 	Search by content (AI)	Nach Inhalt suchen (KI)
 	Index Project for Search	Projekt für die Suche indexieren
+
+# M8d: Lumetri node graph and grade versions
+	List Color Nodes	Farbknoten auflisten
+	Select Color Node	Farbknoten auswählen
+	Add Color Node	Farbknoten hinzufügen
+	Remove Color Node	Farbknoten entfernen
+	Move Color Node	Farbknoten verschieben
+	Set Color Node Mix	Mischung des Farbknotens
+	Bypass Color Node	Farbknoten umgehen
+	Rename Color Node	Farbknoten umbenennen
+	Set Color Node Mask	Maske des Farbknotens
+	New Grade Version	Neue Grading-Version
+	Switch Grade Version	Grading-Version wechseln
+	Rename Grade Version	Grading-Version umbenennen
+	Delete Grade Version	Grading-Version löschen
+	Copy Grade	Grading kopieren
+	Paste Grade	Grading einfügen
+	Reset Grade	Grading zurücksetzen
+	Color Grade	Grading
+	Grade	Grading
+	Node {n}	Knoten {n}
+	New grade version (a copy of this one)	Neue Grading-Version (eine Kopie dieser)
+	Delete this grade version	Diese Grading-Version löschen
+	Node on (off: bypassed)	Knoten an (aus: umgangen)
+	Add a node after this one	Einen Knoten nach diesem hinzufügen
+	Remove this node	Diesen Knoten entfernen
+	Move this node earlier	Diesen Knoten nach vorne verschieben
+	Move this node later	Diesen Knoten nach hinten verschieben

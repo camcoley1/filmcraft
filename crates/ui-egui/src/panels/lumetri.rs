@@ -7,6 +7,12 @@
 //! `lumetri.param.<id>` (`hdr_white`, `hdr_specular`, `curves_hdr_range`, `hsl_denoise`,
 //! `hsl_blur`); Color Match: `lumetri.match.comparisonView` (toggles the Program monitor's
 //! Comparison View, whose reference frame Apply Match then uses).
+//!
+//! Node strip (M8d, `filmcraft_project::color_graph`): under the header, the clip's grade versions
+//! (`lumetri.version`, `lumetri.version.add`, `lumetri.version.delete`) and its serial nodes as
+//! chips (`lumetri.node.<i>` selects, `lumetri.node.<i>.enabled` bypasses), with the selected
+//! node's Mix (`lumetri.node.mix`) and add / remove / move (`lumetri.node.add`, `.remove`,
+//! `.left`, `.right`). Every section below edits the selected node.
 
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use filmcraft_project::{ClipId, EffectInstance, ParamValue};
@@ -64,6 +70,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             });
         });
     });
+    node_strip(&mut bui, app, clip, &e, &t);
     let set = |actions: &mut Actions, param: &str, v: Value| actions.push(json!({"clip": clip.0, "effect": idx, "param": param, "value": v}));
     let mut sections: Vec<&'static str> = Vec::new();
     let mut lut_actions: Vec<(&'static str, Value)> = Vec::new();
@@ -329,6 +336,106 @@ fn lut_combo(ui: &mut egui::Ui, app: &mut FilmcraftApp, e: &EffectInstance, para
 }
 
 /// A section header; returns (expanded, switch clicked). `on` is the section's enable switch.
+/// The grade versions and the node chips of the clip's Lumetri (see the module docs). Commands
+/// run after the strip is drawn; each is one undo step (a Mix drag: when it ends).
+fn node_strip(ui: &mut egui::Ui, app: &mut FilmcraftApp, clip: ClipId, e: &EffectInstance, t: &Tokens) {
+    use filmcraft_project::color_graph as cg;
+    let mut run: Vec<(&'static str, Value)> = Vec::new();
+    let mut auto: Vec<(String, Rect, String)> = Vec::new();
+    let (versions, active) = cg::versions(e);
+    let nodes = cg::active_nodes(e);
+    let graph = cg::graph(e).and_then(cg::ColorGraph::active_version);
+    let selected = graph.map_or(0, cg::GradeVersion::selected);
+    let label_of =
+        |i: usize| graph.and_then(|v| v.nodes.get(i)).map(|n| n.label.clone()).filter(|l| !l.is_empty()).unwrap_or_else(|| tlf!("Node {n}", n = i + 1));
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_sized(vec2(48.0, 20.0), egui::Label::new(egui::RichText::new(tl!("Grade")).color(t.text_dim)));
+        let mut sel = active;
+        let combo =
+            egui::ComboBox::from_id_salt("lumetri-version").selected_text(versions.get(active).cloned().unwrap_or_default()).width(70.0).show_ui(ui, |ui| {
+                for (i, v) in versions.iter().enumerate() {
+                    ui.selectable_value(&mut sel, i, v);
+                }
+            });
+        auto.push(("lumetri.version".into(), combo.response.rect, "Grade version".into()));
+        if sel != active {
+            run.push(("color.version.switch", json!({"clip": clip.0, "version": sel})));
+        }
+        let add = ui.small_button("+").on_hover_text(tl!("New grade version (a copy of this one)"));
+        auto.push(("lumetri.version.add".into(), add.rect, "New grade version".into()));
+        if add.clicked() {
+            run.push(("color.version.add", json!({"clip": clip.0})));
+        }
+        if versions.len() > 1 {
+            let del = ui.small_button("−").on_hover_text(tl!("Delete this grade version"));
+            auto.push(("lumetri.version.delete".into(), del.rect, "Delete grade version".into()));
+            if del.clicked() {
+                run.push(("color.version.delete", json!({"clip": clip.0, "version": active})));
+            }
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        for (i, n) in nodes.iter().enumerate() {
+            let mut on = n.enabled;
+            let cb = ui.checkbox(&mut on, "").on_hover_text(tl!("Node on (off: bypassed)"));
+            auto.push((format!("lumetri.node.{i}.enabled"), cb.rect, format!("Node {} on", i + 1)));
+            if cb.changed() {
+                run.push(("color.bypassNode", json!({"clip": clip.0, "node": i, "bypass": !on})));
+            }
+            let text = egui::RichText::new(label_of(i)).color(if n.enabled { t.text } else { t.text_faint });
+            let chip = ui.selectable_label(i == selected, text);
+            auto.push((format!("lumetri.node.{i}"), chip.rect, format!("Node {}", i + 1)));
+            if chip.clicked() && i != selected {
+                run.push(("color.selectNode", json!({"clip": clip.0, "node": i})));
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.add_sized(vec2(48.0, 20.0), egui::Label::new(egui::RichText::new(tl!("Mix")).color(t.text_dim)));
+        // a drag shows its value as it goes and is applied (one undo step) when it ends
+        let temp = ui.id().with(("lumetri-node-mix", clip.0, selected));
+        let model = nodes.get(selected).map_or(100.0, |n| n.mix * 100.0);
+        let mut v = ui.data(|d| d.get_temp::<f64>(temp)).unwrap_or(model);
+        let r = ui.add(egui::DragValue::new(&mut v).range(0.0..=100.0).speed(0.5).suffix(" %"));
+        auto.push(("lumetri.node.mix".into(), r.rect, "Node mix".into()));
+        if r.dragged() && r.changed() {
+            ui.data_mut(|d| d.insert_temp(temp, v));
+        } else if r.drag_stopped() || (r.changed() && !r.dragged()) {
+            ui.data_mut(|d| d.remove::<f64>(temp));
+            run.push(("color.setNodeMix", json!({"clip": clip.0, "node": selected, "mix": v / 100.0})));
+        }
+        let mut button = |ui: &mut egui::Ui, text: &str, tip: &str, id: &str, enabled: bool| {
+            let b = ui.add_enabled(enabled, egui::Button::new(text).small()).on_hover_text(tip);
+            auto.push((format!("lumetri.node.{id}"), b.rect, tip.to_string()));
+            b.clicked()
+        };
+        if button(ui, "+", tl!("Add a node after this one"), "add", nodes.len() < cg::MAX_NODES) {
+            run.push(("color.addNode", json!({"clip": clip.0})));
+        }
+        if button(ui, "−", tl!("Remove this node"), "remove", nodes.len() > 1) {
+            run.push(("color.removeNode", json!({"clip": clip.0, "node": selected})));
+        }
+        if button(ui, "◀", tl!("Move this node earlier"), "left", selected > 0) {
+            run.push(("color.moveNode", json!({"clip": clip.0, "from": selected, "to": selected - 1})));
+        }
+        if button(ui, "▶", tl!("Move this node later"), "right", selected + 1 < nodes.len()) {
+            run.push(("color.moveNode", json!({"clip": clip.0, "from": selected, "to": selected + 1})));
+        }
+    });
+    ui.separator();
+    for (id, r, label) in auto {
+        if r.is_positive() {
+            app.auto.add(&id, r, &label);
+        }
+    }
+    for (id, p) in run {
+        if let Err(err) = app.session.execute(id, p) {
+            app.ui.status = err.to_string();
+        }
+    }
+}
+
 fn section(ui: &mut egui::Ui, app: &mut FilmcraftApp, name: &str, on: bool) -> (bool, bool) {
     let t = app.tokens;
     let key = format!("lumetri2:{name}");

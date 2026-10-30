@@ -3640,3 +3640,31 @@
 	changed since indexed	索引后已更改
 	Search by content (AI)	按内容搜索 (AI)
 	Index Project for Search	为搜索索引项目
+
+# M8d: Lumetri node graph and grade versions
+	List Color Nodes	列出颜色节点
+	Select Color Node	选择颜色节点
+	Add Color Node	添加颜色节点
+	Remove Color Node	移除颜色节点
+	Move Color Node	移动颜色节点
+	Set Color Node Mix	颜色节点混合
+	Bypass Color Node	绕过颜色节点
+	Rename Color Node	重命名颜色节点
+	Set Color Node Mask	颜色节点蒙版
+	New Grade Version	新调色版本
+	Switch Grade Version	切换调色版本
+	Rename Grade Version	重命名调色版本
+	Delete Grade Version	删除调色版本
+	Copy Grade	复制调色
+	Paste Grade	粘贴调色
+	Reset Grade	重置调色
+	Color Grade	调色
+	Grade	调色
+	Node {n}	节点 {n}
+	New grade version (a copy of this one)	新调色版本（此版本的副本）
+	Delete this grade version	删除此调色版本
+	Node on (off: bypassed)	节点开启（关闭：绕过）
+	Add a node after this one	在此节点后添加节点
+	Remove this node	移除此节点
+	Move this node earlier	将此节点前移
+	Move this node later	将此节点后移

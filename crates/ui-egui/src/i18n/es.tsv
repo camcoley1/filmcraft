@@ -3665,3 +3665,31 @@
 	changed since indexed	cambiado desde la indexación
 	Search by content (AI)	Buscar por contenido (IA)
 	Index Project for Search	Indexar el proyecto para la búsqueda
+
+# M8d: Lumetri node graph and grade versions
+	List Color Nodes	Listar nodos de color
+	Select Color Node	Seleccionar nodo de color
+	Add Color Node	Añadir nodo de color
+	Remove Color Node	Quitar nodo de color
+	Move Color Node	Mover nodo de color
+	Set Color Node Mix	Mezcla del nodo de color
+	Bypass Color Node	Omitir nodo de color
+	Rename Color Node	Renombrar nodo de color
+	Set Color Node Mask	Máscara del nodo de color
+	New Grade Version	Nueva versión del etalonaje
+	Switch Grade Version	Cambiar versión del etalonaje
+	Rename Grade Version	Renombrar versión del etalonaje
+	Delete Grade Version	Eliminar versión del etalonaje
+	Copy Grade	Copiar etalonaje
+	Paste Grade	Pegar etalonaje
+	Reset Grade	Restablecer etalonaje
+	Color Grade	Etalonaje
+	Grade	Etalonaje
+	Node {n}	Nodo {n}
+	New grade version (a copy of this one)	Nueva versión del etalonaje (copia de esta)
+	Delete this grade version	Eliminar esta versión del etalonaje
+	Node on (off: bypassed)	Nodo activado (desactivado: omitido)
+	Add a node after this one	Añadir un nodo después de este
+	Remove this node	Quitar este nodo
+	Move this node earlier	Mover este nodo antes
+	Move this node later	Mover este nodo después

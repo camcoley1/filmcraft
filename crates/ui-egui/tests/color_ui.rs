@@ -227,6 +227,10 @@ fn apply_match_from_the_color_wheels_section() {
     let e = lumetri(&mut d, clip);
     assert!(e["params"]["wheel_highlights"]["value"].as_str().unwrap() != "Vec2(Vec2 { x: 0.0, y: 0.0 })", "{e}");
     // the button runs the same command (here with the default reference inside the clip: refused, reported in the status line)
+    // the node strip at the top of the panel puts the button below the fold: scroll to it
+    let [x, y, w, h] = d.element("panel.LumetriColor").unwrap();
+    d.ok("ui.scroll", json!({"x": x + w / 2.0, "y": y + h / 2.0, "dy": -300.0}));
+    d.frames(2);
     d.click("lumetri.match.apply");
     let ui = d.ok("ui.inspect", json!({}));
     assert!(ui.to_string().contains("reference frame is inside"), "{ui}");

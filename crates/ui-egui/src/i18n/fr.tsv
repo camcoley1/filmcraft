@@ -3623,3 +3623,31 @@
 	changed since indexed	modifié depuis l'indexation
 	Search by content (AI)	Rechercher par contenu (IA)
 	Index Project for Search	Indexer le projet pour la recherche
+
+# M8d: Lumetri node graph and grade versions
+	List Color Nodes	Lister les nœuds de couleur
+	Select Color Node	Sélectionner un nœud de couleur
+	Add Color Node	Ajouter un nœud de couleur
+	Remove Color Node	Supprimer un nœud de couleur
+	Move Color Node	Déplacer un nœud de couleur
+	Set Color Node Mix	Mélange du nœud de couleur
+	Bypass Color Node	Contourner un nœud de couleur
+	Rename Color Node	Renommer un nœud de couleur
+	Set Color Node Mask	Masque du nœud de couleur
+	New Grade Version	Nouvelle version de l'étalonnage
+	Switch Grade Version	Changer de version d'étalonnage
+	Rename Grade Version	Renommer la version d'étalonnage
+	Delete Grade Version	Supprimer la version d'étalonnage
+	Copy Grade	Copier l'étalonnage
+	Paste Grade	Coller l'étalonnage
+	Reset Grade	Réinitialiser l'étalonnage
+	Color Grade	Étalonnage
+	Grade	Étalonnage
+	Node {n}	Nœud {n}
+	New grade version (a copy of this one)	Nouvelle version d'étalonnage (copie de celle-ci)
+	Delete this grade version	Supprimer cette version d'étalonnage
+	Node on (off: bypassed)	Nœud actif (inactif : contourné)
+	Add a node after this one	Ajouter un nœud après celui-ci
+	Remove this node	Supprimer ce nœud
+	Move this node earlier	Déplacer ce nœud plus tôt
+	Move this node later	Déplacer ce nœud plus tard

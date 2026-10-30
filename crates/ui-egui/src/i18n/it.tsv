@@ -3647,3 +3647,31 @@
 	changed since indexed	modificato dopo l'indicizzazione
 	Search by content (AI)	Cerca per contenuto (IA)
 	Index Project for Search	Indicizza il progetto per la ricerca
+
+# M8d: Lumetri node graph and grade versions
+	List Color Nodes	Elenca nodi colore
+	Select Color Node	Seleziona nodo colore
+	Add Color Node	Aggiungi nodo colore
+	Remove Color Node	Rimuovi nodo colore
+	Move Color Node	Sposta nodo colore
+	Set Color Node Mix	Miscela del nodo colore
+	Bypass Color Node	Escludi nodo colore
+	Rename Color Node	Rinomina nodo colore
+	Set Color Node Mask	Maschera del nodo colore
+	New Grade Version	Nuova versione della correzione
+	Switch Grade Version	Cambia versione della correzione
+	Rename Grade Version	Rinomina versione della correzione
+	Delete Grade Version	Elimina versione della correzione
+	Copy Grade	Copia correzione
+	Paste Grade	Incolla correzione
+	Reset Grade	Ripristina correzione
+	Color Grade	Correzione colore
+	Grade	Correzione
+	Node {n}	Nodo {n}
+	New grade version (a copy of this one)	Nuova versione della correzione (copia di questa)
+	Delete this grade version	Elimina questa versione della correzione
+	Node on (off: bypassed)	Nodo attivo (disattivo: escluso)
+	Add a node after this one	Aggiungi un nodo dopo questo
+	Remove this node	Rimuovi questo nodo
+	Move this node earlier	Sposta questo nodo prima
+	Move this node later	Sposta questo nodo dopo
