@@ -48,7 +48,10 @@ fn a_new_item_at_twice_the_rate_is_placed_over_the_same_range() {
     let req = f.helper.started()[0].clone();
     // the 6 frames played plus the next one
     assert_eq!((req.inputs.len(), req.params["factor"].as_u64()), (7, Some(2)));
-    assert!(same(&clip_of(&f, clip), &before), "the original clip is untouched");
+    // the original is only turned off (the copy replaces it in the picture, not composited over it)
+    let mut off = before.clone();
+    off.enabled = false;
+    assert!(same(&clip_of(&f, clip), &off), "the original is turned off and otherwise untouched");
     let q = f.s.active_sequence().unwrap().clone();
     assert_eq!(q.video_tracks.len(), tracks + 1);
     let copy = q.video_tracks.last().unwrap().items[0].clone();
@@ -75,6 +78,33 @@ fn a_new_item_at_twice_the_rate_is_placed_over_the_same_range() {
     assert_eq!(f.s.history.undo.last().unwrap().0, "Interpolate Frames");
     f.s.execute("edit.undo", json!({})).unwrap();
     assert_eq!(f.s.active_sequence().unwrap().video_tracks.len(), tracks);
+    assert!(same(&clip_of(&f, clip), &before), "undo turns the original back on");
+}
+
+#[test]
+fn the_placed_copy_keeps_animated_masks_on_their_frames() {
+    use filmcraft_project::mask::{Mask, MaskPath};
+    let (mut f, clip, _) = helper("in-mask");
+    let seq = f.s.state.active_sequence.unwrap();
+    let r24 = FrameRate::FPS_24;
+    // a mask whose feather is keyframed at source frame 4 (media time)
+    f.s.edit("Mask", |pr, _| {
+        let it = pr.sequence_mut(seq).unwrap().video_tracks[0].items.iter_mut().find(|i| i.id == clip).unwrap();
+        let mut m = Mask::new("Mask (1)", MaskPath::ellipse(filmcraft_geom::Vec2::new(32.0, 18.0), filmcraft_geom::Vec2::new(8.0, 8.0)));
+        m.feather.keyframes.push(filmcraft_project::keyframe::Keyframe::new(r24.tick_of(4), filmcraft_project::ParamValue::Float(20.0)));
+        it.effect_mut("opacity").unwrap().masks.push(m);
+        Ok(())
+    })
+    .unwrap();
+    f.s.execute("ai.interpolate", json!({"place": true, "wait": true})).unwrap();
+    let q = f.s.active_sequence().unwrap();
+    let copy = q.video_tracks.last().unwrap().items[0].clone();
+    let k = &copy.effect("opacity").unwrap().masks[0].feather.keyframes[0];
+    // the new media starts at source frame 2: the keyframe moves by that time, so it lands on the
+    // same picture at the same timeline time
+    assert_eq!(k.time, r24.tick_of(4) - r24.tick_of(2));
+    let original = clip_of(&f, clip);
+    assert_eq!(original.effect("opacity").unwrap().masks[0].feather.keyframes[0].time, r24.tick_of(4), "the original keeps its own");
 }
 
 #[test]

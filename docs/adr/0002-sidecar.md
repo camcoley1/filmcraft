@@ -85,7 +85,10 @@ AI features run in **`craft-ai`**, a separate Python process installed by craft-
 12. **Licences.** AGENTS.md section 2 applies to the helper too: every model's code **and weights**
     must be permissively licensed (MIT, Apache-2.0, BSD, ISC). Each is listed with both licences in
     `craft-suite/sidecar/LICENSES.md` before it is added; AGPL (Ultralytics YOLO) and
-    non-commercial weights are out.
+    non-commercial weights are out. Training data: data known to be non-commercial or for academic
+    research only rules a model out (Demucs, the DIV2K-trained upscalers); data whose terms are
+    unknown is accepted only as a recorded assumption for the project owner to confirm (the
+    Practical-RIFE row), never assumed permissive.
 
 13. **A feature may call a hosted service through the helper (M8f, Generative Extend).** Only the
     helper talks to the network, with the user's own key (`FAL_KEY` or `~/.config/craft-ai/fal.env`,

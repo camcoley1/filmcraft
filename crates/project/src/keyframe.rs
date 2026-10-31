@@ -142,7 +142,8 @@ impl Interpolation {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Keyframe {
-    /// Time relative to the start of the track item (clip time).
+    /// Media time of the clip's source (what `TrackItem::effect_time_at` gives for a timeline
+    /// time), so a keyframe stays on its frame of the media when the clip is moved or trimmed.
     pub time: Tick,
     pub value: ParamValue,
     /// Interpolation of the segment leaving this keyframe.

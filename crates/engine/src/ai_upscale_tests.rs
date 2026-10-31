@@ -199,3 +199,167 @@ fn upscale_refuses_masks_and_says_why_it_is_disabled() {
     h.s.state.selection = vec![];
     assert_eq!(reason(&h.s, "ai.upscale"), "select a video clip in the timeline");
 }
+
+fn edit_clip(f: &mut Fixture, clip: ClipId, edit: impl FnOnce(&mut filmcraft_project::TrackItem)) {
+    let seq = f.s.state.active_sequence.unwrap();
+    f.s.edit("Edit", |pr, _| {
+        edit(pr.sequence_mut(seq).unwrap().video_tracks[0].items.iter_mut().find(|i| i.id == clip).unwrap());
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn edit_media(f: &mut Fixture, item: ItemId, edit: impl FnOnce(&mut filmcraft_project::MediaClip)) {
+    f.s.edit("Edit", |pr, _| {
+        if let Some(filmcraft_project::ItemKind::Media(m)) = pr.item_mut(item).map(|i| &mut i.kind) {
+            edit(m);
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn the_anchor_follows_with_scale_to_frame_size_a_missing_motion_is_added_and_a_turned_off_one_refused() {
+    use filmcraft_project::ParamValue;
+    // Scale to Frame Size: the fit follows the new size, so Scale stays; the anchor (source
+    // pixels) is multiplied, its keyframes too; the alpha interpretation is carried over
+    let (mut f, clip, item) = helper("up-fit", nearest);
+    edit_media(&mut f, item, |m| m.interpret.ignore_alpha = true);
+    edit_clip(&mut f, clip, |it| {
+        it.scale_to_frame = true;
+        let m = it.effect_mut("motion").unwrap();
+        m.param_mut("scale").unwrap().value = ParamValue::Float(80.0);
+        let a = m.param_mut("anchor").unwrap();
+        a.value = ParamValue::Vec2(filmcraft_geom::Vec2::new(10.0, 5.0));
+        a.keyframes.push(filmcraft_project::keyframe::Keyframe::new(FrameRate::FPS_24.tick_of(3), ParamValue::Vec2(filmcraft_geom::Vec2::new(12.0, 6.0))));
+    });
+    f.s.execute("ai.upscale", json!({"factor": 4, "wait": true})).unwrap();
+    let after = clip_of(&f, clip);
+    assert!(after.scale_to_frame);
+    assert_eq!(after.effect("motion").unwrap().f64_at("scale", Tick::ZERO), 80.0, "Scale untouched under the fit");
+    let a = after.effect("motion").unwrap().param("anchor").unwrap();
+    assert_eq!(a.value, ParamValue::Vec2(filmcraft_geom::Vec2::new(40.0, 20.0)));
+    let k = &a.keyframes[0];
+    assert_eq!(k.value, ParamValue::Vec2(filmcraft_geom::Vec2::new(48.0, 24.0)));
+    let m = f.s.project.item(after.item).and_then(|i| i.as_media()).unwrap();
+    assert!(m.interpret.ignore_alpha && !m.interpret.invert_alpha, "Ignore Alpha carried to the result");
+
+    // a clip without a Motion effect gets one at 100 / factor %
+    let (mut g, clip, _) = helper("up-nomotion", nearest);
+    edit_clip(&mut g, clip, |it| it.effects.retain(|e| e.effect != "motion"));
+    g.s.execute("ai.upscale", json!({"factor": 2, "wait": true})).unwrap();
+    let after = clip_of(&g, clip);
+    let m = after.effect("motion").expect("Motion added");
+    assert!(m.enabled && m.f64_at("scale", Tick::ZERO) == 50.0);
+
+    // Motion turned off: its 100 % would show the result larger; refused before anything runs
+    let (mut h, clip, item) = helper("up-motionoff", nearest);
+    edit_clip(&mut h, clip, |it| it.effect_mut("motion").unwrap().enabled = false);
+    let e = h.s.execute("ai.upscale", json!({"wait": true})).unwrap_err().to_string();
+    assert!(e.contains("Motion is turned off"), "{e}");
+    assert!(h.helper.started().is_empty() && clip_of(&h, clip).item == item);
+}
+
+#[test]
+fn effects_in_source_pixels_and_unsafe_sources_are_refused_before_anything_runs() {
+    let (mut f, clip, item) = helper("up-fx", nearest);
+    let refused = |f: &mut Fixture, want: &str| {
+        let e = f.s.execute("ai.upscale", json!({"wait": true})).unwrap_err().to_string();
+        assert!(e.contains(want), "{want}: {e}");
+        assert!(f.helper.started().is_empty());
+    };
+    let add = |f: &mut Fixture, id: &str, set: &[(&str, f64)]| {
+        let mut e = filmcraft_project::find_effect(id).unwrap().instance();
+        for (k, v) in set {
+            e.param_mut(k).unwrap().value = filmcraft_project::ParamValue::Float(*v);
+        }
+        edit_clip(f, clip, |it| it.effects.push(e));
+    };
+    add(&mut f, "gaussian_blur", &[("blurriness", 8.0)]);
+    refused(&mut f, "Gaussian Blur");
+    // turned off, it is ignored; Lumetri with Sharpen is pixel-space
+    edit_clip(&mut f, clip, |it| it.effects.iter_mut().filter(|e| e.effect == "gaussian_blur").for_each(|e| e.enabled = false));
+    add(&mut f, "lumetri", &[("sharpen", 20.0)]);
+    refused(&mut f, "Sharpen");
+    // colour work only (Lumetri without Sharpen, Brightness & Contrast): accepted
+    edit_clip(&mut f, clip, |it| {
+        for e in it.effects.iter_mut().filter(|e| e.effect == "lumetri") {
+            e.param_mut("sharpen").unwrap().value = filmcraft_project::ParamValue::Float(0.0);
+        }
+    });
+    add(&mut f, "brightness_contrast", &[("brightness", 10.0)]);
+    // a colour space set in Interpret Footage, an image-sequence source: refused
+    edit_media(&mut f, item, |m| m.interpret.color_space = Some(filmcraft_color::ColorSpace::Rec2020));
+    refused(&mut f, "Interpret Footage sets a colour space");
+    edit_media(&mut f, item, |m| {
+        m.interpret.color_space = None;
+        m.info.kind = filmcraft_media::MediaKind::ImageSequence;
+    });
+    refused(&mut f, "image-sequence sources");
+    edit_media(&mut f, item, |m| m.info.kind = filmcraft_media::MediaKind::Movie);
+    // with proxies on, the full-resolution frames are decoded, not the (smaller) proxy's
+    let proxy = f.cache.join("proxy.y4m");
+    std::fs::write(&proxy, b"YUV4MPEG2 W32 H18 F24:1 Ip A1:1 C420jpeg\n").unwrap();
+    edit_media(&mut f, item, |m| m.proxy = Some(filmcraft_project::MediaRef::File { path: proxy.to_string_lossy().to_string() }));
+    f.s.media.set_use_proxies(true);
+    let r = f.s.execute("ai.upscale", json!({"wait": true})).unwrap();
+    assert_eq!(r["applied"], true, "{r}");
+    let png = std::fs::read(&f.helper.started()[0].inputs[0]).ok();
+    assert!(png.is_none(), "inputs are removed once the helper is done");
+    assert_eq!(clip_of(&f, clip).effects.iter().filter(|e| e.effect == "brightness_contrast").count(), 1);
+}
+
+#[test]
+fn too_long_a_job_is_refused_and_a_failed_job_leaves_no_frames() {
+    let (mut f, _, _) = helper("up-cost", nearest);
+    f.s.ai.limits.timeout = std::time::Duration::from_millis(100);
+    let e = f.s.execute("ai.upscale", json!({"factor": 4})).unwrap_err().to_string();
+    assert!(e.contains("more than a job may run"), "{e}");
+    assert!(f.helper.started().is_empty());
+    let e = super::check_cost("Clip", super::MAX_JOB_BYTES + 1, 1.0, std::time::Duration::from_secs(10)).unwrap_err().to_string();
+    assert!(e.contains("GB of disk"), "{e}");
+    assert_eq!(super::duration_text(3.0 * 3600.0 + 1200.0), "about 3 h 20 min");
+
+    // a result the job's thread rejects (one frame short): no frame stays in the cache or in the
+    // project's AI media folder
+    let (mut g, clip, item) = helper("up-leftovers", short);
+    let r = g.s.execute("ai.upscale", json!({})).unwrap();
+    let (id, dir) = (r["job"].as_u64().unwrap(), std::path::PathBuf::from(r["outDir"].as_str().unwrap()));
+    finish(&mut g.s, id);
+    assert!(job_error(&g.s, id).is_some_and(|e| e.contains("up-src-000005.png")), "{:?}", job_error(&g.s, id));
+    let pngs = std::fs::read_dir(&dir).map(|d| d.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "png")).count()).unwrap_or(0);
+    assert_eq!(pngs, 0, "no frames left in {}", dir.display());
+    let media = g.cache.join("media");
+    let left = walk_pngs(&media);
+    assert_eq!(left, 0, "no frames left in the AI media folder");
+    assert_eq!(clip_of(&g, clip).item, item);
+}
+
+fn walk_pngs(dir: &std::path::Path) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    rd.flatten().map(|e| if e.path().is_dir() { walk_pngs(&e.path()) } else { usize::from(e.path().extension().is_some_and(|x| x == "png")) }).sum()
+}
+
+#[test]
+fn applying_reads_no_files() {
+    // the job's thread opens the result; once it is ready the frames can vanish from disk and the
+    // apply (on the UI thread) still works, because it only edits the project
+    let (mut f, clip, item) = helper("up-noio", nearest);
+    let id = f.s.execute("ai.upscale", json!({})).unwrap()["job"].as_u64().unwrap();
+    let t0 = std::time::Instant::now();
+    while f.s.ai.jobs.iter().all(|j| j.outcome.lock().unwrap().is_none()) {
+        assert!(t0.elapsed() < std::time::Duration::from_secs(30), "never ready");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let dir = f.s.ai.jobs[0].media.clone().unwrap();
+    let moved = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect::<Vec<_>>();
+    let parked = f.cache.join("parked");
+    std::fs::create_dir_all(&parked).unwrap();
+    for p in &moved {
+        std::fs::rename(p, parked.join(p.file_name().unwrap())).unwrap();
+    }
+    finish(&mut f.s, id);
+    assert_eq!(job_error(&f.s, id), None);
+    assert_ne!(clip_of(&f, clip).item, item);
+}
