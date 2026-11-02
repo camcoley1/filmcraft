@@ -370,7 +370,8 @@ fn lumetri_rows_keep_their_width_when_the_clip_name_is_long() {
 }
 
 /// The Lumetri node strip (M8d): `+ Node` adds a node after the selected one, a chip's context
-/// menu renames, masks, bypasses and removes it, and Node Mix sets the selected node's mix.
+/// menu lists Rename…, Mask, Bypass and Remove Node (Bypass and Rename… are driven here), and the
+/// version list's Rename… renames the version.
 #[test]
 fn node_strip_buttons_and_chip_menu() {
     let mut d = Driver::demo();

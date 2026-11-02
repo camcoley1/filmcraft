@@ -13,7 +13,8 @@
 //! chips (`lumetri.node.<i>` selects, `lumetri.node.<i>.enabled` bypasses; its context menu
 //! renames it (`lumetri.node.<i>.rename`: a field `lumetri.rename.field` with
 //! `lumetri.rename.apply` / `.cancel` takes the chip's place), limits it to one of the effect's masks
-//! (`lumetri.node.<i>.mask`, `.mask.none`, `.mask.<k>`), bypasses or removes it), followed by
+//! (`lumetri.node.<i>.mask`, `.mask.none`, `.mask.<k>`), bypasses (`lumetri.node.<i>.bypass`) or
+//! removes it (`lumetri.node.<i>.removeNode`)), followed by
 //! `+ Node` / `− Node` / move earlier / later for the selected node (`lumetri.node.add`, `.remove`,
 //! `.left`, `.right`), and its Node Mix (`lumetri.node.mix`). The version dropdown's entries are
 //! `lumetri.version.<i>`, followed by Rename… (`lumetri.version.rename`) for the active version. Every section below edits the selected node.
@@ -443,7 +444,8 @@ fn node_strip(ui: &mut egui::Ui, app: &mut FilmcraftApp, clip: ClipId, e: &Effec
             };
             auto.push((format!("lumetri.node.{i}"), chip.rect, format!("Node {}", i + 1)));
             if chip.clicked() && i != selected {
-                run.push(("color.selectNode", json!({"clip": clip.0, "node": i})));
+                // clicking through the nodes is one undo step
+                run.push(("color.selectNode", json!({"clip": clip.0, "node": i, "merge": true})));
             }
             chip.context_menu(|ui| {
                 let rn = ui.button(tl!("Rename…"));
@@ -508,15 +510,23 @@ fn node_strip(ui: &mut egui::Ui, app: &mut FilmcraftApp, clip: ClipId, e: &Effec
     });
     ui.horizontal(|ui| {
         ui.add_sized(vec2(64.0, 20.0), egui::Label::new(egui::RichText::new(tl!("Node Mix")).color(t.text_dim)));
-        // live while dragging: consecutive Mix changes of a node merge into one undo step
+        // live while dragging
         let model = nodes.get(selected).map_or(100.0, |n| n.mix * 100.0);
         let mut v = model;
         let r = ui
             .add(egui::DragValue::new(&mut v).range(0.0..=100.0).speed(0.5).suffix(" %"))
             .on_hover_text(tlf!("How much of {node}'s result is used", node = label_of(selected)));
         auto.push(("lumetri.node.mix".into(), r.rect, "Node mix".into()));
+        // a drag is one undo step, a new one each drag (its first change begins it, even when the
+        // press itself changed nothing); a typed value is its own
+        let fresh = ui.id().with(("lumetri-mix-drag", clip.0));
+        if r.drag_started() {
+            ui.data_mut(|d| d.insert_temp(fresh, true));
+        }
+        let dragging = r.dragged() || r.drag_started();
         if r.changed() && (v - model).abs() > 1e-9 {
-            run.push(("color.setNodeMix", json!({"clip": clip.0, "node": selected, "mix": v / 100.0})));
+            let begin = ui.data_mut(|d| d.remove_temp::<bool>(fresh)).unwrap_or(false);
+            run.push(("color.setNodeMix", json!({"clip": clip.0, "node": selected, "mix": v / 100.0, "merge": dragging, "begin": begin || !dragging})));
         }
     });
     ui.separator();

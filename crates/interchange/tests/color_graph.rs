@@ -137,3 +137,66 @@ fn otio_refuses_a_grade_over_the_caps_and_says_so() {
     assert!(lumetris(&imp).is_empty(), "no grade cut short");
     assert!(rep.to_string().contains("could not be read") && rep.to_string().contains("at most 32"), "{rep}");
 }
+
+/// Every object of the JSON tree, depth first.
+fn objects(v: &mut serde_json::Value, f: &mut dyn FnMut(&mut serde_json::Map<String, serde_json::Value>)) {
+    match v {
+        serde_json::Value::Object(m) => {
+            f(m);
+            m.values_mut().for_each(|x| objects(x, f));
+        }
+        serde_json::Value::Array(a) => a.iter_mut().for_each(|x| objects(x, f)),
+        _ => {}
+    }
+}
+
+#[test]
+fn otio_track_and_master_stacks_keep_the_effects_that_read() {
+    let (p, s) = project(two_plain_nodes);
+    let (bytes, _) = export(&p, s, Format::Otio, &ExportOptions::default()).unwrap();
+    let mut v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let good = serde_json::to_value(filmcraft_project::find_effect("gaussian_blur").unwrap().instance()).unwrap();
+    let mut bad = serde_json::to_value(lumetris(&import(&bytes, Format::Otio, None).unwrap().0).remove(0)).unwrap();
+    let node = bad["color"]["versions"][0]["nodes"][0].clone();
+    bad["color"]["versions"][0]["nodes"] = serde_json::Value::Array(vec![node; cg::MAX_NODES + 1]);
+    let (mut masters, mut tracks) = (0, 0);
+    objects(&mut v, &mut |m| {
+        if m.contains_key("master_effects") {
+            m.insert("master_effects".into(), serde_json::json!([good, bad]));
+            masters += 1;
+        } else if m.contains_key("volume_db") && m.contains_key("effects") {
+            m.insert("effects".into(), serde_json::json!([good, bad]));
+            tracks += 1;
+        }
+    });
+    assert!(masters == 1 && tracks > 0, "{masters} {tracks}");
+    let (imp, rep) = import(&serde_json::to_vec(&v).unwrap(), Format::Otio, None).unwrap();
+    let q = imp.project.sequence(only_seq(&imp)).unwrap();
+    // the stacks keep what reads; the grade over the cap is reported, not imported
+    assert_eq!(q.master_effects.iter().map(|e| e.effect.as_str()).collect::<Vec<_>>(), vec!["gaussian_blur"]);
+    let stacks: Vec<usize> = q.video_tracks.iter().chain(&q.audio_tracks).map(|t| t.effects.len()).collect();
+    assert!(stacks.iter().all(|n| *n == 1), "{stacks:?}");
+    let msg = rep.to_string();
+    assert!(msg.contains("(master)") && msg.contains("track \"") && msg.contains("at most 32"), "{msg}");
+}
+
+#[test]
+fn a_bypassed_nodes_mix_and_mask_are_reported_as_lost() {
+    for format in [Format::Fcpxml, Format::Fcp7Xml] {
+        let (p, s) = project(|e| {
+            two_plain_nodes(e);
+            e.masks.push(filmcraft_project::Mask::new("face", filmcraft_project::MaskPath::rect(0.0, 0.0, 50.0, 50.0)));
+            cg::set_mix(e, 1, 0.5).unwrap();
+            cg::set_mask(e, 1, Some("face")).unwrap();
+            cg::set_enabled(e, 1, false).unwrap();
+        });
+        let (imp, rep, _) = through(&p, s, format);
+        let msg = rep.to_string();
+        assert!(msg.contains("node Mix") && msg.contains("node masks"), "{format:?}: a bypassed node's Mix and mask are lost too: {msg}");
+        // turning the exported node back on gives the full node, not the 50 % one inside the mask
+        let got = lumetris(&imp);
+        let off = got.iter().find(|e| !e.enabled).expect("the bypassed node, disabled");
+        assert!(off.color.is_none() && off.masks.is_empty(), "{format:?}");
+        assert_eq!(exposure(off), -0.25);
+    }
+}

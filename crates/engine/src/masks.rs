@@ -191,8 +191,10 @@ fn edit_mask<R>(s: &mut Session, p: &Value, label: &str, f: impl FnOnce(&mut Mas
         let m = e.masks.get_mut(mi).ok_or_else(|| bad(label, format!("no mask {mi}")))?;
         let old = m.name.clone();
         let r = f(m, mt)?;
-        // Lumetri nodes limited to the mask follow its rename (M8d)
-        if let Some(new) = e.masks.get(mi).map(|m| m.name.clone()).filter(|n| *n != old) {
+        // Lumetri nodes limited to the mask follow its rename (M8d), unless another mask keeps the
+        // old name (the nodes name that one, the first of the name, and stay with it)
+        let still = e.masks.iter().enumerate().any(|(i, m)| i != mi && m.name == old);
+        if let Some(new) = e.masks.get(mi).map(|m| m.name.clone()).filter(|n| *n != old && !still) {
             filmcraft_project::color_graph::rename_mask(e, &old, Some(&new));
         }
         Ok(r)

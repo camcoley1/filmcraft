@@ -643,10 +643,10 @@ pub(crate) fn exported_effects<'a>(ti: &'a TrackItem, report: &mut Report) -> Ve
         }
         let nodes = cg::active_nodes(e);
         let mut lost = Vec::new();
-        if nodes.iter().any(|n| n.enabled && n.mix < 1.0) {
+        if nodes.iter().any(|n| n.mix < 1.0) {
             lost.push("node Mix");
         }
-        if nodes.iter().any(|n| n.enabled && n.mask.is_some()) {
+        if nodes.iter().any(|n| n.mask.is_some()) {
             lost.push("node masks");
         }
         if !cg::effect_wide_masks(e).is_empty() {

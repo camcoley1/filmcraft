@@ -215,12 +215,12 @@ fn clicking_through_nodes_and_dragging_mix_are_one_undo_step_each() {
     let selected = |s: &mut Session| s.execute("color.nodes", json!({})).unwrap()["nodes"].as_array().unwrap().iter().position(|n| n["selected"] == true);
     assert_eq!(selected(&mut s), Some(2));
     for n in [0, 1, 0, 2, 1] {
-        s.execute("color.selectNode", json!({"node": n})).unwrap();
+        s.execute("color.selectNode", json!({"node": n, "merge": true})).unwrap();
     }
     s.execute("edit.undo", json!({})).unwrap();
     assert_eq!(selected(&mut s), Some(2), "one undo returns to the node selected before the clicks");
-    for m in [0.9, 0.7, 0.5, 0.3] {
-        s.execute("color.setNodeMix", json!({"node": 2, "mix": m})).unwrap();
+    for (k, m) in [0.9, 0.7, 0.5, 0.3].into_iter().enumerate() {
+        s.execute("color.setNodeMix", json!({"node": 2, "mix": m, "merge": true, "begin": k == 0})).unwrap();
     }
     assert_eq!(cg::active_nodes(&lumetri(&s, c))[2].mix, 0.3);
     s.execute("edit.undo", json!({})).unwrap();
@@ -243,46 +243,69 @@ fn node_masks_follow_mask_renames_and_removal() {
 }
 
 /// Keyframe upkeep: a keyframed node that is not selected must come out of every edit exactly as
-/// it does when it is the selected node (whose parameters are the effect's own).
+/// it does when it is the selected node (whose parameters are the effect's own). Each case also
+/// says whether the edit moves the keyframes at all (`moves`), so every case checks something:
+/// the moving ones fail if the other nodes stop following; speed changes and slips keep keyframes
+/// in media time for every node and must leave them where they were.
 #[test]
 fn keyframes_of_other_nodes_follow_every_edit() {
-    use filmcraft_time::Tick;
+    use filmcraft_time::{FrameRate, Tick};
     type Edit = fn(&mut Session, ClipId, ClipId) -> ClipId;
-    let edits: [(&str, Edit); 6] = [
-        ("paste attributes", |s, a, b| {
+    let edits: [(&str, bool, Edit); 8] = [
+        ("paste attributes", true, |s, a, b| {
             s.execute("timeline.select", json!({"clips": [a.0]})).unwrap();
             s.execute("edit.copy", json!({})).unwrap();
             s.execute("edit.pasteAttributes", json!({"clips": [b.0]})).unwrap();
             b
         }),
-        ("paste grade", |s, a, b| {
+        ("paste grade", true, |s, a, b| {
             s.execute("color.copyGrade", json!({"clip": a.0})).unwrap();
             s.execute("color.pasteGrade", json!({"clips": [b.0]})).unwrap();
             b
         }),
-        ("preset with keyframes", |s, a, b| {
+        ("preset with keyframes", true, |s, a, b| {
             let li = s.active_sequence().unwrap().find_item(a).unwrap().1.effects.iter().position(|e| e.effect == "lumetri").unwrap();
             s.execute("presets.save", json!({"clip": a.0, "name": "grade-k", "keyframes": "anchorIn", "effects": [li]})).unwrap();
             s.execute("presets.apply", json!({"preset": "grade-k", "clips": [b.0]})).unwrap();
             b
         }),
-        ("preset without keyframes", |s, a, b| {
+        ("preset without keyframes (baked)", true, |s, a, b| {
             let li = s.active_sequence().unwrap().find_item(a).unwrap().1.effects.iter().position(|e| e.effect == "lumetri").unwrap();
             s.execute("presets.save", json!({"clip": a.0, "name": "grade-still", "keyframes": "none", "effects": [li]})).unwrap();
             s.execute("presets.apply", json!({"preset": "grade-still", "clips": [b.0]})).unwrap();
             b
         }),
-        ("speed change", |s, a, _| {
+        ("media start shift (relink / project manager)", true, |s, a, _| {
+            let item = s.active_sequence().unwrap().find_item(a).unwrap().1.item;
+            s.edit("Shift", |p, _| {
+                p.shift_media_time(item, Tick(254_016_000_000 / 4));
+                Ok(())
+            })
+            .unwrap();
+            a
+        }),
+        ("source timecode rebase (interchange)", true, |s, a, _| {
+            let item = s.active_sequence().unwrap().find_item(a).unwrap().1.item;
+            s.edit("Rebase", |p, _| {
+                filmcraft_interchange::rebase_source_timecode(p, item, 48, FrameRate::FPS_24);
+                Ok(())
+            })
+            .unwrap();
+            a
+        }),
+        ("speed change", false, |s, a, _| {
             s.execute("clip.speedDuration", json!({"clips": [a.0], "speed": 200})).unwrap();
             a
         }),
-        ("slip", |s, a, _| {
+        ("slip", false, |s, a, _| {
             s.execute("timeline.slip", json!({"clip": a.0, "deltaFrames": 12})).unwrap();
             a
         }),
     ];
-    // node 0 keyframed (exposure 0 -> 1 over the clip); `keyed_selected`: node 0 is the selected one
-    let run = |edit: Edit, keyed_selected: bool| -> Vec<(Tick, Option<f64>)> {
+    // node 0 keyframed (exposure 0 -> 1 over the clip); `keyed_selected`: node 0 is the selected
+    // one. Returns the keyframes (time, value) before and after the edit, plus the static value.
+    type Keys = Vec<(Tick, Option<f64>)>;
+    let run = |edit: Edit, keyed_selected: bool| -> (Keys, Keys) {
         let mut s = demo();
         let (a, b) = clips(&mut s);
         s.execute("color.addNode", json!({"clip": a.0})).unwrap();
@@ -295,22 +318,88 @@ fn keyframes_of_other_nodes_follow_every_edit() {
         s.execute("effects.toggleAnimation", json!({"clip": a.0, "effect": li, "param": "exposure", "time": k1.0})).unwrap();
         s.execute("effects.setParam", json!({"clip": a.0, "effect": li, "param": "exposure", "value": 0.0, "time": k1.0})).unwrap();
         s.execute("effects.setParam", json!({"clip": a.0, "effect": li, "param": "exposure", "value": 1.0, "time": k2.0})).unwrap();
+        let keys = |s: &Session, c: ClipId| -> Keys {
+            let e = lumetri(s, c);
+            let p = e.param("exposure").unwrap();
+            let mut out: Keys = p.keyframes.iter().map(|k| (k.time, k.value.as_f64())).collect();
+            out.push((Tick(-1), p.value.as_f64()));
+            out
+        };
+        let before = keys(&s, a);
+        assert_eq!(before.len(), 3, "two keyframes set");
         if !keyed_selected {
             s.execute("color.selectNode", json!({"clip": a.0, "node": 1})).unwrap();
         }
         let c = edit(&mut s, a, b);
         s.execute("color.selectNode", json!({"clip": c.0, "node": 0})).unwrap();
-        let e = lumetri(&s, c);
-        let p = e.param("exposure").unwrap();
-        let mut out: Vec<(Tick, Option<f64>)> = p.keyframes.iter().map(|k| (k.time, k.value.as_f64())).collect();
-        out.push((Tick(-1), p.value.as_f64()));
-        out
+        (before, keys(&s, c))
     };
-    for (name, edit) in edits {
-        let selected = run(edit, true);
-        let other = run(edit, false);
+    for (name, moves, edit) in edits {
+        let (before, selected) = run(edit, true);
+        let (_, other) = run(edit, false);
         assert_eq!(other, selected, "{name}: the unselected node's keyframes went their own way");
+        assert_eq!(selected != before, moves, "{name}: keyframes {} expected to move: {before:?} -> {selected:?}", if moves { "were" } else { "were not" });
     }
+}
+
+/// Paste Grade moves the grade's keyframes from the copied clip's media time to the target's.
+#[test]
+fn paste_grade_shifts_the_keyframes_of_every_node() {
+    use filmcraft_time::Tick;
+    let mut s = demo();
+    let (a, b) = clips(&mut s);
+    // b's media starts one second later than a's
+    s.execute("timeline.slip", json!({"clip": b.0, "deltaFrames": -24})).unwrap();
+    let si = |s: &Session, c: ClipId| s.active_sequence().unwrap().find_item(c).unwrap().1.source_in;
+    let shift = si(&s, b).0 - si(&s, a).0;
+    assert_ne!(shift, 0, "the clips' media start at different times");
+    // node 0 keyframed, node 1 selected
+    s.execute("color.addNode", json!({"clip": a.0})).unwrap();
+    s.execute("color.selectNode", json!({"clip": a.0, "node": 0})).unwrap();
+    let li = s.active_sequence().unwrap().find_item(a).unwrap().1.effects.iter().position(|e| e.effect == "lumetri").unwrap();
+    let it = s.active_sequence().unwrap().find_item(a).unwrap().1.clone();
+    let t = it.start + Tick(254_016_000_000 / 2);
+    s.execute("effects.toggleAnimation", json!({"clip": a.0, "effect": li, "param": "exposure", "time": t.0})).unwrap();
+    s.execute("effects.setParam", json!({"clip": a.0, "effect": li, "param": "exposure", "value": 0.7, "time": t.0})).unwrap();
+    let at_a: Vec<Tick> = lumetri(&s, a).param("exposure").unwrap().keyframes.iter().map(|k| k.time).collect();
+    s.execute("color.selectNode", json!({"clip": a.0, "node": 1})).unwrap();
+    s.execute("color.copyGrade", json!({"clip": a.0})).unwrap();
+    s.execute("color.pasteGrade", json!({"clips": [b.0]})).unwrap();
+    s.execute("color.selectNode", json!({"clip": b.0, "node": 0})).unwrap();
+    let at_b: Vec<Tick> = lumetri(&s, b).param("exposure").unwrap().keyframes.iter().map(|k| k.time).collect();
+    assert_eq!(at_b, at_a.iter().map(|k| Tick(k.0 + shift)).collect::<Vec<_>>(), "a keyframe at media time t lands at t + the start difference");
+}
+
+#[test]
+fn merging_is_opt_in_and_per_sequence() {
+    let mut s = demo();
+    let (c, _) = clips(&mut s);
+    s.execute("color.addNode", json!({})).unwrap();
+    let mix = |s: &Session| cg::active_nodes(&lumetri(s, c))[1].mix;
+    // two separate calls without `merge` are two undo steps
+    s.execute("color.setNodeMix", json!({"node": 1, "mix": 0.8})).unwrap();
+    s.execute("color.setNodeMix", json!({"node": 1, "mix": 0.6})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(mix(&s), 0.8);
+    // a drag (merge) after them is its own step, and `begin` starts the next drag anew
+    s.execute("color.setNodeMix", json!({"node": 1, "mix": 0.5, "merge": true, "begin": true})).unwrap();
+    s.execute("color.setNodeMix", json!({"node": 1, "mix": 0.4, "merge": true})).unwrap();
+    s.execute("color.setNodeMix", json!({"node": 1, "mix": 0.3, "merge": true, "begin": true})).unwrap();
+    s.execute("color.setNodeMix", json!({"node": 1, "mix": 0.2, "merge": true})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(mix(&s), 0.4, "the second drag undoes alone");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(mix(&s), 0.8, "then the first drag");
+    // an unrelated edit between merged edits ends the merge
+    s.execute("color.setNodeMix", json!({"node": 1, "mix": 0.5, "merge": true, "begin": true})).unwrap();
+    s.execute("color.setNodeLabel", json!({"node": 0, "label": "Base"})).unwrap();
+    s.execute("color.setNodeMix", json!({"node": 1, "mix": 0.1, "merge": true})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(mix(&s), 0.5);
+    // version and name together are refused for switch / delete
+    s.execute("color.version.add", json!({})).unwrap();
+    assert!(s.execute("color.version.switch", json!({"version": 0, "name": "B"})).is_err());
+    assert!(s.execute("color.version.delete", json!({"version": 1, "name": "A"})).is_err());
 }
 
 #[test]

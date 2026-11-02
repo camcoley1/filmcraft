@@ -360,6 +360,10 @@ fn hostile_lumetri_graphs_in_a_project_file() {
         Ok(_) => panic!("a graph over the caps was opened"),
     };
     assert!(err.contains("at most 32"), "{err}");
+    // and names the clip and its sequence
+    let clip = p.sequence(ItemId(21)).unwrap().video_tracks[0].items[0].name.clone();
+    let seq = p.item(ItemId(21)).unwrap().name.clone();
+    assert!(err.contains(&format!("`{clip}` in sequence `{seq}`")), "{err}");
     // an empty version is repaired, the valid one is kept
     let effects = v["project"]["items"]["21"]["kind"]["Sequence"]["video_tracks"][0]["items"][0]["effects"].as_array_mut().unwrap();
     let lum = effects.iter_mut().find(|e| e["effect"] == "lumetri").unwrap();

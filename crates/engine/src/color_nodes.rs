@@ -5,8 +5,9 @@
 //! `color.version.add` and `color.pasteGrade` give a clip without Lumetri Color one, in the same
 //! undo step; the others need it there already and change nothing when they fail.
 //! Nodes and versions are 0-based indices; a version can also be named (`version: "B"`).
-//! Every edit is one undo step (consecutive node selections of a clip, and consecutive Mix
-//! changes of one node, merge into one); `color.copyGrade` only fills the session's grade
+//! Every edit is one undo step; with `merge: true` (the node strip's clicks and Mix drags)
+//! consecutive node selections of a clip, or Mix changes of one node, share one, and `begin`
+//! starts a new one; `color.copyGrade` only fills the session's grade
 //! clipboard. Node Mix is a plain value, not keyframable.
 
 use filmcraft_project::color_graph as cg;
@@ -36,7 +37,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             run: list,
             journal: false,
         },
-        spec("color.selectNode", "Select Color Node", &[], r#"{"clip":id?,"node":n}"#, |s, p| {
+        spec("color.selectNode", "Select Color Node", &[], r#"{"clip":id?,"node":n,"merge":bool?,"begin":bool?}"#, |s, p| {
             node_edit(s, p, "color.selectNode", "Select Color Node", cg::select_node)
         }),
         spec("color.addNode", "Add Color Node", MENU, r#"{"clip":id?,"after":n?,"label":str?}"#, add_node),
@@ -44,7 +45,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             node_edit(s, p, "color.removeNode", "Remove Color Node", cg::remove_node)
         }),
         spec("color.moveNode", "Move Color Node", &[], r#"{"clip":id?,"from":n,"to":n}"#, move_node),
-        spec("color.setNodeMix", "Set Color Node Mix", &[], r#"{"clip":id?,"node":n,"mix":0..1}"#, set_mix),
+        spec("color.setNodeMix", "Set Color Node Mix", &[], r#"{"clip":id?,"node":n,"mix":0..1,"merge":bool?,"begin":bool?}"#, set_mix),
         spec("color.bypassNode", "Bypass Color Node", &[], r#"{"clip":id?,"node":n,"bypass":bool?}"#, bypass),
         spec("color.setNodeLabel", "Rename Color Node", &[], r#"{"clip":id?,"node":n,"label":str}"#, set_label),
         spec("color.setNodeMask", "Set Color Node Mask", &[], r#"{"clip":id?,"node":n,"mask":str|""}"#, set_mask),
@@ -185,10 +186,20 @@ fn node_edit(
     let i = index_p(p, "node", cmd)?;
     let mut st = step(cmd, label);
     if cmd == "color.selectNode" {
-        // clicking through the nodes is one undo step
-        st.merge = Some(format!("color.selectNode:{}", target(s, p, cmd)?.0.0));
+        // the strip's clicks through the nodes: one undo step (`merge`)
+        let key = format!("color.selectNode:{}", target(s, p, cmd)?.0.0);
+        st.merge = merge_p(s, p, key);
     }
     edit(s, p, st, |e| f(e, i))
+}
+
+/// `merge: true` shares one undo step with the previous edit of the same `key` (nothing else in
+/// between); `begin: true` starts a new one. Without `merge` an edit is its own undo step.
+fn merge_p(s: &mut Session, p: &Value, key: String) -> Option<String> {
+    if bool_p(p, "begin").unwrap_or(false) {
+        s.history.merge_key = None;
+    }
+    bool_p(p, "merge").unwrap_or(false).then_some(key)
 }
 
 fn add_node(s: &mut Session, p: &Value) -> Result<Value> {
@@ -208,8 +219,9 @@ fn move_node(s: &mut Session, p: &Value) -> Result<Value> {
 fn set_mix(s: &mut Session, p: &Value) -> Result<Value> {
     let i = index_p(p, "node", "color.setNodeMix")?;
     let mix = f64_p(p, "mix").ok_or_else(|| bad("color.setNodeMix", "need `mix` (0..1)"))?;
-    // a drag of the Mix field is one undo step
-    let merge = Some(format!("color.setNodeMix:{}:{i}", target(s, p, "color.setNodeMix")?.0.0));
+    // a drag of the Mix field is one undo step (the strip passes `merge`, and `begin` as it starts)
+    let key = format!("color.setNodeMix:{}:{i}", target(s, p, "color.setNodeMix")?.0.0);
+    let merge = merge_p(s, p, key);
     edit(s, p, Step { merge, ..step("color.setNodeMix", "Set Color Node Mix") }, |e| cg::set_mix(e, i, mix))
 }
 
@@ -251,6 +263,9 @@ fn version_p(s: &Session, p: &Value, cmd: &'static str, name_selects: bool) -> R
         let (names, _) = find_lumetri(s, p).map(|(_, e)| cg::versions(&e)).unwrap_or_default();
         names.iter().position(|n| n == name).map(Some).ok_or_else(|| bad(cmd, format!("no grade version `{name}`")))
     };
+    if name_selects && p.get("version").is_some() && p.get("name").is_some() {
+        return Err(bad(cmd, "give `version` or `name`, not both"));
+    }
     match p.get("version") {
         Some(Value::String(name)) => by_name(name),
         Some(_) => index_p(p, "version", cmd).map(Some),

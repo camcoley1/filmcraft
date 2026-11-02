@@ -237,13 +237,50 @@ pub fn decode(bytes: &[u8]) -> Result<Loaded, FormatError> {
     check_supported(found)?;
     if found == SCHEMA_VERSION {
         // Fast path: deserialize straight into the model.
-        let env: EnvelopeIn = serde_json::from_slice(bytes).map_err(|e| FormatError::Corrupt(e.to_string()))?;
+        let env: EnvelopeIn = serde_json::from_slice(bytes).map_err(|e| FormatError::Corrupt(with_grade_owner(e.to_string(), bytes)))?;
         return validate_loaded(env.loaded(found));
     }
     let doc: Value = serde_json::from_slice(bytes).map_err(|e| FormatError::Corrupt(e.to_string()))?;
     let doc = migrate_with(MIGRATIONS, doc, found)?;
-    let env: EnvelopeIn = serde_json::from_value(doc).map_err(|e| FormatError::Corrupt(format!("after upgrading from schema v{found}: {e}")))?;
+    let env: EnvelopeIn =
+        serde_json::from_value(doc).map_err(|e| FormatError::Corrupt(with_grade_owner(format!("after upgrading from schema v{found}: {e}"), bytes)))?;
     validate_loaded(env.loaded(found))
+}
+
+/// A Lumetri grade over the node or version caps refuses the file (it is never cut short): name
+/// the clips (or tracks) holding such grades, and their sequences, so the file can be fixed.
+fn with_grade_owner(msg: String, bytes: &[u8]) -> String {
+    use filmcraft_project::color_graph::{MAX_NODES, MAX_VERSIONS};
+    if !msg.contains("a Lumetri grade has more than") {
+        return msg;
+    }
+    let Ok(doc) = serde_json::from_slice::<Value>(bytes) else { return msg };
+    let over = |e: &Value| {
+        let versions = e.pointer("/color/versions").and_then(Value::as_array);
+        versions.is_some_and(|v| v.len() > MAX_VERSIONS || v.iter().any(|v| v.get("nodes").and_then(Value::as_array).is_some_and(|n| n.len() > MAX_NODES)))
+    };
+    // every object with an `effects` list holding such a grade, named by its own `name`
+    fn walk(v: &Value, seq: &str, over: &dyn Fn(&Value) -> bool, out: &mut Vec<String>) {
+        match v {
+            Value::Object(m) => {
+                let effects = m.get("effects").or_else(|| m.get("master_effects")).and_then(Value::as_array);
+                if effects.is_some_and(|e| e.iter().any(over)) && out.len() < 5 {
+                    let name = m.get("name").and_then(Value::as_str).unwrap_or("");
+                    out.push(format!("`{name}` in sequence `{seq}`"));
+                }
+                m.values().for_each(|x| walk(x, seq, over, out));
+            }
+            Value::Array(a) => a.iter().for_each(|x| walk(x, seq, over, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for item in doc.pointer("/project/items").and_then(Value::as_object).into_iter().flat_map(|m| m.values()) {
+        if let Some(sequence) = item.pointer("/kind/Sequence") {
+            walk(sequence, item.get("name").and_then(Value::as_str).unwrap_or(""), &over, &mut out);
+        }
+    }
+    if out.is_empty() { msg } else { format!("{msg} ({})", out.join(", ")) }
 }
 
 /// Refuse only values that would overflow or exhaust memory later (`Sequence::check_bounds`);

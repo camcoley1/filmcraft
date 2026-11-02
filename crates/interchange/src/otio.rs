@@ -340,6 +340,24 @@ fn effects_from(v: Option<&Value>) -> Option<Vec<EffectInstance>> {
     read_effects(v?).ok()
 }
 
+/// An effect stack from FilmCraft's metadata (a clip's, a track's or the master's): every effect
+/// that reads, and a warning naming `owner` for each one that does not (for example a Lumetri grade
+/// over the node or version caps), so one bad effect never empties the stack silently.
+fn read_stack(v: Option<&Value>, report: &mut Report, owner: &str) -> Option<Vec<EffectInstance>> {
+    let list = v?.as_array()?;
+    let mut out = Vec::new();
+    for e in list {
+        match read_effects(&Value::Array(vec![e.clone()])) {
+            Ok(mut one) => out.append(&mut one),
+            Err(err) => {
+                let name = e.get("effect").and_then(Value::as_str).unwrap_or("effect");
+                report.warn(format!("{owner}: its FilmCraft effect \"{name}\" could not be read and was not imported ({err})"));
+            }
+        }
+    }
+    Some(out)
+}
+
 /// FilmCraft's effects metadata, or why it cannot be read (for example a Lumetri grade over the
 /// node or version caps, which is refused rather than cut short).
 fn read_effects(v: &Value) -> std::result::Result<Vec<EffectInstance>, String> {
@@ -452,7 +470,7 @@ impl Imp<'_, '_> {
         if let Some(m) = meta {
             seq.start_timecode = m.get("start_timecode").and_then(Value::as_i64).unwrap_or(0);
             seq.master_volume_db = m.get("master_volume_db").and_then(Value::as_f64).unwrap_or(0.0);
-            seq.master_effects = effects_from(m.get("master_effects")).unwrap_or_default();
+            seq.master_effects = read_stack(m.get("master_effects"), self.report, &format!("sequence \"{name}\" (master)")).unwrap_or_default();
         }
         seq.markers = self.markers(stack);
         for t in stack.get("children").and_then(Value::as_array).into_iter().flatten() {
@@ -489,7 +507,8 @@ impl Imp<'_, '_> {
             if let Some(c) = m.get("channels").and_then(|c| serde_json::from_value(c.clone()).ok()) {
                 track.channels = c;
             }
-            track.effects = effects_from(m.get("effects")).unwrap_or_default();
+            let owner = format!("track \"{}\"", track.name);
+            track.effects = read_stack(m.get("effects"), self.report, &owner).unwrap_or_default();
         }
         if t.get("markers").and_then(Value::as_array).is_some_and(|m| !m.is_empty()) {
             let ms = self.markers(t);
@@ -593,10 +612,9 @@ impl Imp<'_, '_> {
         if let Some(l) = m.get("label").and_then(|l| serde_json::from_value::<Label>(l.clone()).ok()) {
             ti.label = l;
         }
-        match m.get("effects").map(read_effects) {
-            Some(Ok(effects)) => ti.effects = effects,
-            Some(Err(e)) => self.report.warn(format!("clip \"{}\": its FilmCraft effects could not be read and were not imported ({e})", ti.name)),
-            None => {}
+        let owner = format!("clip \"{}\"", ti.name);
+        if let Some(effects) = read_stack(m.get("effects"), self.report, &owner) {
+            ti.effects = effects;
         }
         if let Some(l) = m.get("link").and_then(Value::as_u64) {
             let next = self.b.link_id();
