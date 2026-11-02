@@ -86,7 +86,10 @@ AI features run in **`craft-ai`**, a separate Python process installed by craft-
     must be permissively licensed (MIT, Apache-2.0, BSD, ISC). Each is listed with both licences in
     `craft-suite/sidecar/LICENSES.md` before it is added; AGPL (Ultralytics YOLO) and
     non-commercial weights are out.
-13. **Copyleft exception (decided 2026-10-30).** LGPL is allowed only inside the separate craft-ai
+13. **Copyleft exception (decided 2026-10-30 by Claude, the project lead, on Cameron's behalf;
+    pending Cameron's confirmation, as `craft-suite/sidecar/LICENSES.md` records; so are the
+    readings that the DeepFilterNet and OpenAI CLIP weights are covered by their repositories'
+    permissive licences).** LGPL is allowed only inside the separate craft-ai
     helper process, dynamically loaded, unmodified and replaceable by the user: python-soxr
     (LGPL-2.1-or-later, pulled in by librosa for beats) and the FFmpeg libraries inside the
     opencv-python-headless wheel (LGPL-2.1, used to read video). Nothing LGPL is ever linked into

@@ -98,6 +98,10 @@ fn start(s: &mut Session, t: AudioTarget, label: &str, bpb: u64, context: Value,
     let (stream, channels, offset, samples, end) = (t.stream, t.channels.clone(), t.offset, t.samples, t.end);
     let mut context = context;
     context["offset"] = json!(t.offset_ticks().0);
+    // the decoded audio's length: the helper's times must lie inside it
+    let length =
+        t.samples.checked_mul(super::audio::ticks_per_sample(t.rate)).ok_or_else(|| EngineError::Other(format!("{}: the range is too long", t.name)))?;
+    context["length"] = json!(length);
     let spec = super::JobSpec {
         kind: "beats",
         label,
@@ -152,6 +156,10 @@ fn read_result(pj: &super::PendingAi, files: &[std::path::PathBuf]) -> Result<(V
     std::io::Read::read_to_string(&mut file, &mut text).map_err(|e| EngineError::Other(format!("beats.json: {e}")))?;
     let v: Value = serde_json::from_str(&text).map_err(|e| EngineError::Other(format!("beats.json: {e}")))?;
     let offset = pj.context.get("offset").and_then(Value::as_i64).unwrap_or(0);
+    let length =
+        pj.context.get("length").and_then(Value::as_i64).filter(|l| *l > 0).ok_or_else(|| EngineError::Other("the job's context is damaged".into()))?;
+    // one sample of slack for the helper's rounding
+    let limit = length.saturating_add(super::audio::ticks_per_sample(RATE));
     let times = |k: &str| -> Result<Vec<Tick>> {
         let a = v.get(k).and_then(Value::as_array).ok_or_else(|| EngineError::Other(format!("beats.json: no {k}")))?;
         if a.len() > MAX_BEATS {
@@ -163,7 +171,12 @@ fn read_result(pj: &super::PendingAi, files: &[std::path::PathBuf]) -> Result<(V
                 .as_f64()
                 .filter(|s| s.is_finite() && *s >= 0.0 && *s <= MAX_SECONDS * 2.0)
                 .ok_or_else(|| EngineError::Other(format!("beats.json: a bad time in {k}")))?;
-            out.push(Tick(offset + (s * TICKS_PER_SECOND as f64).round() as i64));
+            let rel = (s * TICKS_PER_SECOND as f64).round() as i64;
+            if rel > limit {
+                return Err(EngineError::Other(format!("beats.json: {k} at {s:.3} s is past the {:.3} s analysed", length as f64 / TICKS_PER_SECOND as f64)));
+            }
+            let at = offset.checked_add(rel).ok_or_else(|| EngineError::Other("beats.json: a time is out of the media's range".into()))?;
+            out.push(Tick(at));
         }
         out.sort();
         out.dedup();
@@ -171,6 +184,9 @@ fn read_result(pj: &super::PendingAi, files: &[std::path::PathBuf]) -> Result<(V
     };
     let beats = times("beats")?;
     let downbeats = times("downbeats")?;
+    if let Some(d) = downbeats.iter().find(|d| beats.binary_search(d).is_err()) {
+        return Err(EngineError::Other(format!("beats.json: the downbeat at {:.3} s is not a beat", (d.0 - offset) as f64 / TICKS_PER_SECOND as f64)));
+    }
     Ok((beats, downbeats))
 }
 

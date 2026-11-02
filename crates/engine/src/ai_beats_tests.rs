@@ -443,3 +443,63 @@ fn hostile_beat_parameters_are_refused() {
     }
     assert!(f.helper.started().is_empty());
 }
+
+/// Helper times past the analysed audio, or a downbeat that is not a beat: refused, nothing changes.
+#[test]
+fn malformed_beat_results_change_nothing() {
+    fn late(_: &JobRequest) -> Vec<(String, Vec<u8>)> {
+        let v = json!({"tempo": 120.0, "beats": [0.25, 0.75, 500.0], "downbeats": [0.25], "beatsPerBar": 4, "downbeatsEstimated": true});
+        vec![("beats.json".into(), serde_json::to_vec(&v).unwrap())]
+    }
+    fn stray(_: &JobRequest) -> Vec<(String, Vec<u8>)> {
+        let v = json!({"tempo": 120.0, "beats": [0.25, 0.75, 1.25], "downbeats": [0.25, 1.0], "beatsPerBar": 4, "downbeatsEstimated": true});
+        vec![("beats.json".into(), serde_json::to_vec(&v).unwrap())]
+    }
+    for (name, write, why) in [("bt-late", late as filmcraft_sidecar::fake::Writer, "past the"), ("bt-stray", stray, "is not a beat")] {
+        let (mut f, clip, _) = with_audio(name, Script { features: vec!["beats".into()], result: ResultMode::Custom(write), ..Default::default() }, 48_000);
+        let seq = f.s.state.active_sequence.unwrap();
+        f.s.edit("Unlink", |pr, _| {
+            for t in pr.sequence_mut(seq).unwrap().all_tracks_mut() {
+                for it in &mut t.items {
+                    it.link = None;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        f.s.state.selection = vec![clip];
+        super::super::ensure_project_id(&mut f.s);
+        let before = snapshot(&f.s);
+        for (cmd, p) in [("ai.beatGrid", json!({"wait": true})), ("ai.musicFit", json!({"seconds": 20.0, "wait": true}))] {
+            let e = f.s.execute(cmd, p).unwrap_err().to_string();
+            assert!(e.contains(why), "{name} {cmd}: {e}");
+            assert_eq!(snapshot(&f.s), before, "{name} {cmd}");
+        }
+    }
+}
+
+/// Media whose duration is near the end of the tick range, played at its end: the helper's times
+/// are added to the offset without overflow, and the markers land where the beats are.
+#[test]
+fn beats_near_the_end_of_the_tick_range() {
+    let (mut f, clip) = session("bt-huge");
+    let seq = f.s.state.active_sequence.unwrap();
+    let item = f.s.active_sequence().unwrap().find_item(clip).unwrap().1.item;
+    let end = i64::MAX - 7 * S;
+    f.s.edit("Huge", |pr, _| {
+        if let Some(filmcraft_project::ItemKind::Media(m)) = pr.item_mut(item).map(|i| &mut i.kind) {
+            m.info.duration = Tick(end);
+        }
+        let it = pr.sequence_mut(seq).unwrap().audio_tracks[0].items.iter_mut().find(|i| i.id == clip).unwrap();
+        it.source_in = Tick(end - 4 * S);
+        Ok(())
+    })
+    .unwrap();
+    f.s.execute("ai.beatGrid", json!({"wait": true})).unwrap();
+    let q = f.s.active_sequence().unwrap();
+    let it = q.find_item(clip).unwrap().1;
+    assert!(!q.markers.is_empty());
+    for m in &q.markers {
+        assert!(m.start >= it.start && m.start < it.end(), "{:?}", m.start);
+    }
+}
