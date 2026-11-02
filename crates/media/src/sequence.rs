@@ -221,6 +221,13 @@ impl MediaSource for ImageSequenceSource {
     }
 }
 
+/// Decode one frame file of a sequence exactly as the sequence would, but strictly: an error for a
+/// file that does not decode (the sequence itself shows a neighbouring frame in its place). For
+/// checking a sequence's files before they are used.
+pub fn decode_file(name: &str, bytes: &[u8]) -> Result<VideoFrame> {
+    decode_frame(name, bytes).map(|r| r.0)
+}
+
 /// Decode one frame file: OpenEXR, Radiance HDR and DNG camera raw as linear floats (DNG with its metadata, for
 /// the sequence's timing), every other format through the still decoders as RGBA8. Returns the
 /// frame, whether it has alpha, and its pixel format for the media info.

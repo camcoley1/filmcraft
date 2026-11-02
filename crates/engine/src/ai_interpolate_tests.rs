@@ -137,3 +137,69 @@ fn the_model_state_and_the_selection_gate_the_command() {
     g.s.state.selection = vec![];
     assert_eq!(reason(&g.s, "ai.interpolate"), "select a video clip in the timeline");
 }
+
+/// Like [`repeat`], but output frame 1 is a truncated PNG (frame 0 is fine).
+fn corrupt_second(req: &JobRequest) -> Vec<(String, Vec<u8>)> {
+    let mut out = repeat(req);
+    if let Some((_, b)) = out.get_mut(1) {
+        b.truncate(b.len() / 2);
+    }
+    out
+}
+
+#[test]
+fn placement_is_refused_in_a_transition_and_the_copy_goes_directly_above_its_track() {
+    // a clip in a transition: placing a copy on another track would lose it
+    let (mut f, clip, _) = helper("in-tr");
+    f.s.execute("sequence.applyVideoTransition", json!({"clip": clip.0, "edge": "out", "frames": 6})).unwrap();
+    let e = f.s.execute("ai.interpolate", json!({"place": true, "wait": true})).unwrap_err().to_string();
+    assert!(e.contains("transition"), "{e}");
+    assert!(f.helper.started().is_empty());
+    // without `place` it is fine (only the new item)
+    f.s.execute("ai.interpolate", json!({"wait": true})).unwrap();
+
+    // a "title" on the track above: after placing, it is still above the copy
+    let (mut g, clip, item) = helper("in-order");
+    let seq = g.s.state.active_sequence.unwrap();
+    if g.s.active_sequence().unwrap().video_tracks.len() < 2 {
+        g.s.execute("sequence.addTracks", json!({"video": 1})).unwrap();
+    }
+    let title =
+        g.s.edit("Title", |pr, _| {
+            let r = FrameRate::FPS_24;
+            let it = pr
+                .make_track_item(
+                    item,
+                    filmcraft_project::TrackKind::Video,
+                    Tick(3 * filmcraft_time::TICKS_PER_SECOND),
+                    filmcraft_time::TimeRange::new(Tick::ZERO, r.tick_of(6)),
+                    r,
+                )
+                .unwrap();
+            let id = it.id;
+            pr.sequence_mut(seq).unwrap().video_tracks[1].items.push(it);
+            Ok(id)
+        })
+        .unwrap();
+    g.s.state.selection = vec![clip];
+    g.s.execute("ai.interpolate", json!({"place": true, "wait": true})).unwrap();
+    let q = g.s.active_sequence().unwrap();
+    let index_of = |c: ClipId| q.video_tracks.iter().position(|t| t.items.iter().any(|i| i.id == c)).unwrap();
+    let copy = q.video_tracks.iter().flat_map(|t| &t.items).find(|i| i.name.ends_with("(2x)")).unwrap().id;
+    assert_eq!(index_of(clip), 0);
+    assert_eq!(index_of(copy), 1, "directly above the clip's own track");
+    assert_eq!(index_of(title), 2, "what was above the clip stays above the copy");
+}
+
+#[test]
+fn every_result_frame_is_decoded_before_anything_is_applied() {
+    let (mut f, clip, item) =
+        with_video("in-corrupt", Script { features: vec!["interpolate".into()], result: ResultMode::Custom(corrupt_second), ..Default::default() });
+    // the job gives the project its id when it starts; everything else must stay as it is
+    super::super::ensure_project_id(&mut f.s);
+    let before = snapshot(&f.s);
+    let e = f.s.execute("ai.interpolate", json!({"wait": true})).unwrap_err().to_string();
+    assert!(e.contains("mid-000001.png does not decode"), "{e}");
+    assert_eq!(snapshot(&f.s), before, "nothing applied");
+    assert_eq!(clip_of(&f, clip).item, item);
+}

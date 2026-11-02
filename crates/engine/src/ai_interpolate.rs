@@ -10,11 +10,13 @@
 //! frames as an image sequence at `factor` x the source rate (same pixel aspect), in a bin
 //! "Interpolated: <clip>"; frame `k * factor` of it is source frame `first + k`, so its media time is
 //! the source's minus the exact time of the first frame. With `place`, a copy of the clip on a new
-//! video track above plays it over the same timeline range (same start, duration, speed and
+//! video track inserted directly above the clip's own track (so titles and adjustment layers above
+//! it stay above it) plays it over the same timeline range (same start, duration, speed and
 //! direction; source In, effect and mask keyframes and markers moved by that time), so sequence
 //! time is unchanged, and the original is turned off in the same step (otherwise the two would be
-//! composited together wherever the copy is not opaque or a transition meets the original); undo
-//! turns it back on. The result is checked and opened on the job's thread, so applying it only
+//! composited together wherever the copy is not opaque); undo turns it back on. A clip in a
+//! transition is not placed (the transition belongs to the original's track and would no longer
+//! show): `place` is refused for it before anything runs. The result is checked and opened on the job's thread, so applying it only
 //! edits the project. Refused before anything runs: what [`super::video`] refuses, frames larger
 //! than [`MAX_SIZE`], more than [`MAX_FRAMES`] frames, and a job whose frames would take more than
 //! [`super::upscale::MAX_JOB_BYTES`] of disk or more time than a job may run
@@ -77,6 +79,12 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let place = bool_p(p, "place").unwrap_or(false);
     let t = pick(s, p, target)?;
     let factor = factor_p(p, t.rate, cmd)?;
+    if place && in_transition(s, t.clip) {
+        return Err(EngineError::Other(format!(
+            "{}: the clip is in a transition, which a copy on another track would lose; remove the transition, or interpolate without `place`",
+            t.name
+        )));
+    }
     if t.size.0 > MAX_SIZE.0 || t.size.1 > MAX_SIZE.1 {
         return Err(EngineError::Other(format!("{}: frames up to {}x{} are interpolated, not {}x{}", t.name, MAX_SIZE.0, MAX_SIZE.1, t.size.0, t.size.1)));
     }
@@ -109,6 +117,13 @@ pub(crate) fn run(s: &mut Session, p: &Value) -> Result<Value> {
         media: true,
     };
     super::start_job(s, spec, wait)
+}
+
+/// Whether clip `c` of the active sequence starts or ends a transition on its track.
+fn in_transition(s: &Session, c: ClipId) -> bool {
+    s.active_sequence()
+        .and_then(|q| q.find_item(c).and_then(|(t, _)| q.track(t)))
+        .is_some_and(|t| t.transitions.iter().any(|tr| tr.from == Some(c) || tr.to == Some(c)))
 }
 
 /// The result's frame count and rate: `factor` frames per source frame.
@@ -151,7 +166,16 @@ pub(crate) fn apply(s: &mut Session, pj: &super::PendingAi, files: &[std::path::
             if !placed {
                 return Ok(());
             }
-            let added = s.execute("sequence.addTracks", json!({"video": 1, "audio": 0}))?;
+            if in_transition(s, clip) {
+                return Err(EngineError::Other("the clip is now in a transition, which a copy on another track would lose".into()));
+            }
+            // directly above the clip's own track: what was above it stays above the copy
+            let above = s
+                .project
+                .sequence(seq)
+                .and_then(|q| q.find_item(clip).and_then(|(t, _)| q.video_tracks.iter().position(|v| v.id == t)))
+                .ok_or_else(|| EngineError::Other("the clip is gone".into()))?;
+            let added = s.execute("sequence.addTracks", json!({"video": 1, "audio": 0, "videoAfter": above + 1}))?;
             let track = added["video"]
                 .as_array()
                 .and_then(|a| a.first())

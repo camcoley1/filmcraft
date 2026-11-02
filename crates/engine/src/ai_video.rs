@@ -9,9 +9,9 @@
 //! would silently repeat frames. So are sources whose colour cannot go through 8-bit sRGB PNG
 //! unchanged (PQ, HLG or linear transfer, or a colour space set in Interpret Footage).
 //!
-//! The result is checked and opened on the job's thread ([`prepare_sequence`]: every file, the
-//! numbered sequence and its first frame), so applying it ([`import_prepared`]) only edits the
-//! project.
+//! The result is checked and opened on the job's thread ([`prepare_sequence`]: every file decoded
+//! strictly and its size checked, then the numbered sequence opened), so applying it
+//! ([`import_prepared`]) only edits the project.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -218,7 +218,15 @@ pub(crate) fn prepare_sequence(
         }
         let name = format!("{prefix}{k:06}.png");
         let f = by_name.get(&name).ok_or_else(|| format!("the helper wrote no {name}"))?;
-        filmcraft_sidecar::open_result(f, dir, max_bytes).map_err(|e| e.to_string())?;
+        // every frame decoded here, strictly: the sequence reader would show a neighbour in the
+        // place of one that does not decode
+        let mut file = filmcraft_sidecar::open_result(f, dir, max_bytes).map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, max_bytes), &mut bytes).map_err(|e| format!("{name}: {e}"))?;
+        let frame = filmcraft_media::sequence::decode_file(&name, &bytes).map_err(|e| format!("{name} does not decode: {e}"))?;
+        if (frame.width, frame.height) != size {
+            return Err(format!("{name} is {}x{}, not {}x{}", frame.width, frame.height, size.0, size.1));
+        }
         first.get_or_insert_with(|| f.to_string_lossy().to_string());
     }
     let path = first.ok_or("the helper wrote no frames")?;
