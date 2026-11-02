@@ -348,8 +348,9 @@ fn paste_grade_shifts_the_keyframes_of_every_node() {
     use filmcraft_time::Tick;
     let mut s = demo();
     let (a, b) = clips(&mut s);
-    // b's media starts one second later than a's
-    s.execute("timeline.slip", json!({"clip": b.0, "deltaFrames": -24})).unwrap();
+    // b's media starts one second later than a's (trim its tail first so the slip has media to use)
+    s.execute("timeline.trim", json!({"clip": b.0, "edge": "out", "deltaFrames": -24})).unwrap();
+    s.execute("timeline.slip", json!({"clip": b.0, "deltaFrames": 24})).unwrap();
     let si = |s: &Session, c: ClipId| s.active_sequence().unwrap().find_item(c).unwrap().1.source_in;
     let shift = si(&s, b).0 - si(&s, a).0;
     assert_ne!(shift, 0, "the clips' media start at different times");
