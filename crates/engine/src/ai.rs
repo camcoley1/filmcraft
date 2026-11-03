@@ -7,7 +7,8 @@
 //! | `ai.reframe` | Clip ▸ AI | M6a: [`reframe`] |
 //! | `ai.stems` | Clip ▸ AI | M6b: [`stems`] |
 //! | `ai.enhanceSpeech` | Clip ▸ AI | M6c: [`enhance`] |
-//! | `ai.upscale` `ai.interpolate` | Clip ▸ AI | M6f |
+//! | `ai.upscale` | Clip ▸ AI | M6f: [`upscale`] (a classical scaler, not AI-enhanced, for now) |
+//! | `ai.interpolate` | Clip ▸ AI | M6f: [`interpolate`] |
 //! | `ai.generativeExtend` | Clip ▸ AI | M8f, in [`crate::ai_extend`] |
 //! | `ai.beatGrid` `ai.musicFit` | Sequence ▸ AI | M6d: [`beats`] |
 //! | `ai.indexProject` `ai.search {query}` | Clip ▸ AI / (Project panel search) | M6e, in [`crate::ai_search`] |
@@ -200,6 +201,8 @@ pub struct Ready {
     pub result: JobResult,
     pub files: Vec<PathBuf>,
     pub report: filmcraft_export::Report,
+    /// What the job's thread prepared from the result for the apply step ([`finisher`]).
+    pub prepared: Option<Box<dyn std::any::Any + Send>>,
 }
 
 /// A running AI job.
@@ -215,6 +218,8 @@ pub struct PendingAi {
     /// Where the result files go when they become project media ([`JobSpec::media`]): decided
     /// when the job starts; the job's thread moves them there before the result is applied.
     pub media: Option<PathBuf>,
+    /// [`Ready::prepared`], handed over when the result is applied.
+    pub prepared: Option<Box<dyn std::any::Any + Send>>,
 }
 
 impl PendingAi {
@@ -240,45 +245,13 @@ pub(crate) fn helper_ready(s: &Session, feature: &str) -> std::result::Result<()
         Some(Err(why)) => Err(why.clone()),
         Some(Ok(h)) if !h.has(feature) => Err(match h.states.get(feature) {
             Some(st) if st.state == "checking" => format!("the AI helper is checking the {feature} model…"),
+            // a locally made model: the reason says how to make it
+            Some(st) if st.state == "needs model" => format!("{feature} needs its model: {}", st.reason.as_deref().unwrap_or("see the helper's log")),
             Some(st) => format!("{feature} is unavailable in the AI helper: {}", st.reason.as_deref().unwrap_or(&st.state)),
             None => format!("the AI helper (version {}) does not provide `{feature}` yet", h.version),
         }),
         Some(Ok(_)) => Ok(()),
     }
-}
-
-/// What a feature works on.
-#[derive(Clone, Copy)]
-enum Needs {
-    Clips,
-}
-
-fn feature_enabled(s: &Session, feature: &str, milestone: &str, needs: Needs) -> std::result::Result<(), String> {
-    helper_ready(s, feature)?;
-    match needs {
-        Needs::Clips => {
-            has_seq(s)?;
-            if s.state.selection.is_empty() {
-                return Err("select a clip in the timeline".into());
-            }
-        }
-    }
-    Err(format!("not built yet (arrives in {milestone})"))
-}
-
-macro_rules! feature {
-    ($id:literal, $label:literal, [$($m:literal),*], $feature:literal, $milestone:literal, $needs:expr, $params:literal) => {
-        CommandSpec {
-            id: $id,
-            label: $label,
-            menu: &[$($m),*],
-            shortcut: None,
-            params: $params,
-            enabled: |s| feature_enabled(s, $feature, $milestone, $needs),
-            run: |_, _| Err(EngineError::Other(format!("{} is not built yet (arrives in {})", $label, $milestone))),
-            journal: true,
-        }
-    };
 }
 
 pub(crate) fn commands() -> Vec<CommandSpec> {
@@ -324,16 +297,26 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             run: stems::run,
             journal: true,
         },
-        feature!("ai.upscale", "Upscale…", ["Clip", "AI"], "upscale", "M6f", Needs::Clips, r#"{"clips":[id]?,"factor":2|4=2,"wait":bool=false}"#),
-        feature!(
-            "ai.interpolate",
-            "Interpolate Frames…",
-            ["Clip", "AI"],
-            "interpolate",
-            "M6f",
-            Needs::Clips,
-            r#"{"clips":[id]?,"factor":2|4=2,"wait":bool=false}"#
-        ),
+        CommandSpec {
+            id: "ai.upscale",
+            label: "High-Quality Upscale (not AI-enhanced)…",
+            menu: &["Clip", "AI"],
+            shortcut: None,
+            params: upscale::PARAMS,
+            enabled: upscale::enabled,
+            run: upscale::run,
+            journal: true,
+        },
+        CommandSpec {
+            id: "ai.interpolate",
+            label: "Interpolate Frames…",
+            menu: &["Clip", "AI"],
+            shortcut: None,
+            params: interpolate::PARAMS,
+            enabled: interpolate::enabled,
+            run: interpolate::run,
+            journal: true,
+        },
         CommandSpec {
             id: "ai.beatGrid",
             label: "Add Beat Markers",
@@ -659,8 +642,28 @@ pub struct JobSpec<'a> {
 /// See [`JobSpec::prepare`].
 pub type Prepare = Box<dyn FnOnce(&std::path::Path, &dyn Fn() -> bool, &mut dyn FnMut(f64)) -> std::result::Result<Vec<String>, String> + Send>;
 
+/// Work a feature does on the job's thread once its result files are in place (moved into the
+/// project's AI media folder for [`JobSpec::media`]), so that applying them reads no files on the
+/// UI thread: it gets the files, the job's context, the host's services and whether to stop.
+type Finisher = fn(&[PathBuf], &Value, &dyn crate::Services, &dyn Fn() -> bool) -> std::result::Result<Box<dyn std::any::Any + Send>, String>;
+
+/// The [`Finisher`] of a job kind.
+fn finisher(kind: &str) -> Option<Finisher> {
+    match kind {
+        "upscale" => Some(upscale::finish),
+        "interpolate" => Some(interpolate::finish),
+        _ => None,
+    }
+}
+
+/// Kinds whose job folder holds frames that are useless once the job failed or stopped.
+fn frame_kind(kind: &str) -> bool {
+    matches!(kind, "upscale" | "interpolate")
+}
+
 pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
     let JobSpec { kind, label, clips, params, context, timeout, prepare, loose, media } = spec;
+    let (finish, finish_context, services) = (finisher(kind), context.clone(), s.services.clone());
     let client = s.sidecar.clone().ok_or_else(|| EngineError::Other(NOT_CONNECTED.into()))?;
     helper_ready(s, kind).map_err(EngineError::Other)?;
     let wait = wait && !s.ai.background;
@@ -765,6 +768,36 @@ pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
             }
             (r, _) => r,
         };
+        // the feature's own preparation of the result, still off the UI thread
+        let mut prepared = None;
+        let r = match (r, finish) {
+            (Ok((result, files)), Some(f)) => {
+                *lock(&prog.status) = "Checking the result".into();
+                match f(&files, &finish_context, &*services, &cancelled) {
+                    Ok(p) => {
+                        prepared = Some(p);
+                        Ok((result, files))
+                    }
+                    Err(e) => {
+                        // media files go back to the job folder in the cache, as for a dropped result
+                        if let Some(dir) = &to {
+                            for f in files.iter().filter(|f| f.starts_with(dir)) {
+                                if let Some(name) = f.file_name() {
+                                    let _ = move_file(f, &PathBuf::from(&req.out_dir).join(name), &|| false, &mut |_| {});
+                                }
+                            }
+                            remove_media_dir(dir);
+                        }
+                        Err(if cancelled() { SidecarError::Cancelled } else { SidecarError::Local(format!("checking the result: {e}")) })
+                    }
+                }
+            }
+            (r, _) => r,
+        };
+        // frames of a job that did not finish are never used: not left to fill the cache
+        if r.is_err() && frame_kind(&req.kind) {
+            video::remove_frames(Path::new(&req.out_dir));
+        }
         match r {
             // finished by `poll` once the result is applied (or dropped)
             Ok((result, files)) => {
@@ -779,7 +812,7 @@ pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
                     extra_files: Vec::new(),
                     warnings: Vec::new(),
                 };
-                *lock(&out) = Some(Ready { result, files, report });
+                *lock(&out) = Some(Ready { result, files, report, prepared });
                 return;
             }
             Err(SidecarError::Cancelled) => {
@@ -796,7 +829,7 @@ pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
     let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
     let (prog, res) = (job.progress.clone(), job.result.clone());
     s.jobs.push(job);
-    s.ai.jobs.push(PendingAi { job: id, kind, label: label.to_string(), fingerprint, out_dir: out_dir.clone(), outcome, context, media });
+    s.ai.jobs.push(PendingAi { job: id, kind, label: label.to_string(), fingerprint, out_dir: out_dir.clone(), outcome, context, media, prepared: None });
     if wait || cfg!(target_arch = "wasm32") {
         run();
         poll(s);
@@ -823,7 +856,7 @@ pub fn start_job(s: &mut Session, spec: JobSpec, wait: bool) -> Result<Value> {
 /// [`HEARTBEAT`]; bounded).
 fn remove_partial_inputs(dir: &Path) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for e in rd.flatten().take(1000) {
+    for e in rd.flatten().take(1_000_000) {
         let p = e.path();
         if p.file_name().is_some_and(|n| n != HEARTBEAT) && std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file()) {
             let _ = std::fs::remove_file(p);
@@ -880,6 +913,7 @@ pub fn poll(s: &mut Session) {
             Err(m)
         } else {
             relocate(s, &mut pj, &mut ready.files);
+            pj.prepared = ready.prepared.take();
             match apply(s, &pj, &ready.result, &ready.files) {
                 Ok(()) => {
                     // applied: the project's media were moved out of it ([`JobSpec::media`]); the
@@ -1097,6 +1131,8 @@ fn apply(s: &mut Session, pj: &PendingAi, result: &JobResult, files: &[PathBuf])
         "generativeExtend" => crate::ai_extend::apply(s, pj, result, files),
         "enhance" => enhance::apply(s, pj, files),
         "beats" => beats::apply(s, pj, files),
+        "upscale" => upscale::apply(s, pj, files),
+        "interpolate" => interpolate::apply(s, pj, files),
         k => Err(EngineError::Other(format!("results of `{k}` jobs cannot be applied yet"))),
     }
 }
@@ -1167,10 +1203,16 @@ pub(crate) mod audio;
 pub mod beats;
 #[path = "ai_enhance.rs"]
 pub mod enhance;
+#[path = "ai_interpolate.rs"]
+pub mod interpolate;
 #[path = "ai_reframe.rs"]
 pub mod reframe;
 #[path = "ai_stems.rs"]
 pub mod stems;
+#[path = "ai_upscale.rs"]
+pub mod upscale;
+#[path = "ai_video.rs"]
+pub(crate) mod video;
 
 #[cfg(test)]
 #[path = "ai_tests.rs"]

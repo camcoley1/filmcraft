@@ -667,8 +667,13 @@ pub fn import_streamed(s: &mut Session, path: &str, bin: Option<filmcraft_projec
 /// Sequence): one movie item at Settings ▸ Media ▸ Indeterminate Media Timebase. Returns the item,
 /// the frame count and the missing frame numbers (relative to the first).
 pub fn import_image_sequence(s: &mut Session, path: &str, bin: Option<filmcraft_project::BinId>) -> Result<(ItemId, usize, Vec<usize>)> {
-    let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
     let rate = crate::settings::timebase_rate(&s.prefs.media.indeterminate_timebase);
+    import_image_sequence_at(s, path, bin, rate)
+}
+
+/// [`import_image_sequence`] at frame rate `rate` (AI results that keep their source's timing).
+pub fn import_image_sequence_at(s: &mut Session, path: &str, bin: Option<filmcraft_project::BinId>, rate: FrameRate) -> Result<(ItemId, usize, Vec<usize>)> {
+    let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
     let frames = crate::media_pool::image_sequence_frames(path, &*s.services)?;
     let missing: Vec<usize> = frames.iter().enumerate().filter(|(_, f)| f.is_none()).map(|(i, _)| i).collect();
     let src = crate::media_pool::open_image_sequence(path, &*s.services, rate, &name)?;

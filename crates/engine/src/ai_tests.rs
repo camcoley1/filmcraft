@@ -143,13 +143,20 @@ fn the_ai_commands_sit_in_existing_menus() {
 }
 
 #[test]
-fn handshake_reports_the_helper_and_features_wait_for_their_milestone() {
-    let mut f = fixture("hello", Script { features: vec!["echo".into(), "upscale".into()], ..Default::default() });
+fn handshake_reports_the_helper_and_gates_each_feature_by_it() {
+    let mut f = fixture("hello", Script { features: vec!["echo".into(), "search".into(), "reframe".into()], ..Default::default() });
     let st = f.s.execute("ai.status", json!({})).unwrap();
     assert_eq!(st["connected"], true, "{st}");
-    assert_eq!(st["features"], json!(["echo", "upscale"]));
-    assert_eq!(reason(&f.s, "ai.upscale"), "not built yet (arrives in M6f)");
-    assert!(reason(&f.s, "ai.stems").contains("does not provide `stems`"));
+    assert_eq!(st["features"], json!(["echo", "search", "reframe"]));
+    // a feature the helper offers is gated only by the helper and the selection
+    assert!(f.s.is_enabled("ai.reframe"), "{:?}", (crate::find_command("ai.reframe").unwrap().enabled)(&f.s));
+    // search finds transcript words without the helper, so it is always enabled
+    assert!(f.s.is_enabled("ai.search"));
+    // one it does not offer says so, whichever milestone built it
+    for id in ["ai.stems", "ai.upscale", "ai.interpolate", "ai.generativeExtend"] {
+        let feature = id.trim_start_matches("ai.");
+        assert!(reason(&f.s, id).contains(&format!("does not provide `{feature}`")), "{id}: {}", reason(&f.s, id));
+    }
     assert!(f.s.is_enabled("ai.echo"));
     f.s.state.selection.clear();
     assert_eq!(reason(&f.s, "ai.echo"), "select a clip in the timeline");

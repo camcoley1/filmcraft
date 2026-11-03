@@ -85,7 +85,10 @@ AI features run in **`craft-ai`**, a separate Python process installed by craft-
 12. **Licences.** AGENTS.md section 2 applies to the helper too: every model's code **and weights**
     must be permissively licensed (MIT, Apache-2.0, BSD, ISC). Each is listed with both licences in
     `craft-suite/sidecar/LICENSES.md` before it is added; AGPL (Ultralytics YOLO) and
-    non-commercial weights are out.
+    non-commercial weights are out. Training data: data known to be non-commercial or for academic
+    research only rules a model out (Demucs, the DIV2K-trained upscalers); data whose terms are
+    unknown is accepted only as a recorded assumption for the project owner to confirm (the
+    Practical-RIFE row), never assumed permissive.
 13. **Copyleft exception (decided 2026-10-30 by Claude, the project lead, on Cameron's behalf;
     pending Cameron's confirmation, as `craft-suite/sidecar/LICENSES.md` records; so are the
     readings that the DeepFilterNet and OpenAI CLIP weights are covered by their repositories'
@@ -98,7 +101,7 @@ AI features run in **`craft-ai`**, a separate Python process installed by craft-
     `craft-suite/sidecar/LICENSES.md` ("Copyleft exception") with its licence, how it is loaded
     and how to replace it.
 
-13. **A feature may call a hosted service through the helper (M8f, Generative Extend).** Only the
+14. **A feature may call a hosted service through the helper (M8f, Generative Extend).** Only the
     helper talks to the network, with the user's own key (`FAL_KEY` or `~/.config/craft-ai/fal.env`,
     never put in a project, a job folder, a log or a result; the helper's error messages are fixed
     phrases, scrubbed of anything key-like); the feature is offered only while a key is present.
@@ -123,3 +126,9 @@ AI features run in **`craft-ai`**, a separate Python process installed by craft-
 - Each feature (M6a reframe, M6b stems, M6c speech enhance, M6d beat grid and music fit, M6e search,
   M6f upscale and interpolate) is its own sub-milestone with its own acceptance tests against a
   scripted fake helper (`filmcraft_sidecar::fake`) and a real-helper smoke script.
+- M6f upscale ships without a learned model: no super-resolution model with permissively licensed
+  weights and training data was found (Real-ESRGAN and the DIV2K-trained family are rejected for
+  now, see `craft-suite/sidecar/LICENSES.md`), so `ai.upscale` runs a classical scaler in the
+  helper (Lanczos-3, edge-aware unsharp, clamped) and says so in its label, "High-Quality Upscale
+  (not AI-enhanced)". The helper's `backend` parameter takes a learned model later without engine
+  changes.

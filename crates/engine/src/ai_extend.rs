@@ -6,7 +6,7 @@
 //! paid service and sends the frame off this computer, so a new request runs only with
 //! `confirm: true` (or once `dontAskAgain` was given with it in this project: Project Settings
 //! `generative_extend_no_confirm`); without it the command fails with a message naming the model
-//! and the estimated cost ([`quote`]), and the desktop app asks in a dialog (ADR 0002 item 13). On the
+//! and the estimated cost ([`quote`]), and the desktop app asks in a dialog (ADR 0002 item 14). On the
 //! job's thread FilmCraft takes the clip's last source frame (first with `side: "start"`; the raw
 //! source frame, before the clip's Motion and effects), scales it to cover the sequence's frame
 //! size (long side at most 1280 pixels) and writes it as a PNG; the helper sends it with the
